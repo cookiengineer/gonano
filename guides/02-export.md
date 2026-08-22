@@ -6,6 +6,10 @@ formats:
 1. **`.gn`** — gonano's native checkpoint (used for gonano deployment).
 2. **`.gguf`** — the GGUF container format, for interop/archival.
 
+> **Setup.** All commands below run from the repo root with
+> `export GOEXPERIMENT=simd`. See [00-quickstart.md](00-quickstart.md) for the
+> copy-pasteable ArchLinux install.
+
 > **Important architectural note.** GGUF is a *container*, not a model
 > definition. gonano's transformer is a **custom architecture** (rotary
 > embeddings, QK-normalization, ReLU² MLP, group-query attention, value

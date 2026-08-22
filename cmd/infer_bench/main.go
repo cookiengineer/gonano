@@ -57,7 +57,7 @@ func main() {
 		prompt = append(prompt, 1)
 	}
 
-	fmt.Printf("%-6s %-10s %-12s %-12s\n", "batch", "TTFT(ms)", "TPOT(ms)", "tok/s")
+	fmt.Printf("%-6s %-10s %-12s %-10s %-12s\n", "batch", "TTFT(ms)", "TPOT(ms)", "tok/s", "decode tok/s")
 	for _, bs := range parseBatchSizes(*batchSizes) {
 		meas := infer.Measure(engine, prompt, bs, *decodeTokens, 0, 0, 42)
 		var sum time.Duration
@@ -68,8 +68,17 @@ func main() {
 		if len(meas.StepTimes) > 0 {
 			tpot = sum / time.Duration(len(meas.StepTimes))
 		}
+		// Overall throughput includes the prefill (TTFT).
 		tokPerSec := float64(bs*meas.NumTokens) / (meas.TTFT + sum).Seconds()
-		fmt.Printf("%-6d %-10.2f %-12.3f %-12.0f\n", bs, meas.TTFT.Seconds()*1000, tpot.Seconds()*1000, tokPerSec)
+		// Pure decode throughput excludes the prefill and is the number to
+		// watch when serving (decode is memory-bandwidth-bound).
+		decodeStr := "-"
+		if sum > 0 {
+			decodeTokPerSec := float64(bs*len(meas.StepTimes)) / sum.Seconds()
+			decodeStr = fmt.Sprintf("%-12.0f", decodeTokPerSec)
+		}
+		fmt.Printf("%-6d %-10.2f %-12.3f %-10.0f %s\n",
+			bs, meas.TTFT.Seconds()*1000, tpot.Seconds()*1000, tokPerSec, decodeStr)
 	}
 }
 

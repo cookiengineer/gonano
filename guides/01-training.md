@@ -16,6 +16,11 @@ Every command below must run with the `simd` build experiment enabled (see
 export GOEXPERIMENT=simd
 ```
 
+> **New to the project / on ArchLinux?** Start with
+> [00-quickstart.md](00-quickstart.md) for the copy-pasteable install
+> (Go 1.27 + `GOEXPERIMENT=simd` + clone + smoke run). The rest of this guide
+> assumes you are in the repo root with `GOEXPERIMENT=simd` exported.
+
 ---
 
 ## 0. Prerequisites
@@ -219,8 +224,7 @@ Checkpoints are written to
 `base_train` currently trains from scratch. To resume, note the checkpoint step
 and restart with a higher `--num-iterations` — the scaling laws are
 deterministic, so re-running with the same `--depth` reproduces the same
-hyperparameters. Full resume-from-step is on the roadmap (see
-`docs/implementation-plan.md`, P6).
+hyperparameters. Full resume-from-step is on the roadmap.
 
 ---
 

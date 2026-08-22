@@ -3,6 +3,9 @@
 Where to look when something goes wrong. For every failure mode, this gives the
 symptom, the likely cause, and the exact file/function to inspect.
 
+> **Setup.** Run everything from the repo root with `GOEXPERIMENT=simd`. The
+> [00-quickstart.md](00-quickstart.md) covers the ArchLinux install.
+
 ---
 
 ## 1. Quick reference table

@@ -15,6 +15,9 @@ command line and from your own Go code (gonano is a library).
 Both are produced by the training guide. The base directory defaults to
 `~/.cache/gonano` and is overridable with `GONANO_BASE_DIR`.
 
+> **New to the project?** [00-quickstart.md](00-quickstart.md) walks through
+> install + a smoke run from a fresh ArchLinux host.
+
 ---
 
 ## 2. Chat from the command line
@@ -57,8 +60,9 @@ go run ./cmd/infer_bench \
   --batch-sizes 1,4,16 --decode-tokens 64
 ```
 
-Reports TTFT (time-to-first-token), TPOT (per-token), and tok/s per batch size.
-Decode is memory-bandwidth-bound, so larger batches give more tok/s until
+Reports TTFT (time-to-first-token), TPOT (per-token latency), overall `tok/s`,
+and pure decode `decode tok/s` per batch size. Decode is
+memory-bandwidth-bound, so larger batches give more tok/s until
 compute saturates — this is where goroutine-per-op parallelism (`parallel`)
 pays off.
 
