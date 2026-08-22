@@ -27,6 +27,7 @@ func main() {
 	deviceBatchSize := flag.Int("device-batch-size", 1, "per-step batch size")
 	totalBatchSize := flag.Int("total-batch-size", -1, "total batch tokens (-1 = auto)")
 	dataDir := flag.String("data-dir", "", "directory of .parquet text shards (empty = synthetic)")
+	dataFormat := flag.String("data-format", "parquet", "data format: parquet|markdown")
 	baseDir := flag.String("base-dir", "", "checkpoint/tokenizer directory (default ~/.cache/gonano)")
 	modelTag := flag.String("model-tag", "", "checkpoint directory name (default d<depth>)")
 	flag.Parse()
@@ -61,13 +62,23 @@ func main() {
 	// Data source.
 	var provider data.DocProvider
 	if *dataDir != "" {
-		paths := data.ListParquetFiles(*dataDir)
-		if len(paths) == 0 {
-			logger.Error("no parquet files found", "dir", *dataDir)
-			os.Exit(1)
+		switch *dataFormat {
+		case "markdown":
+			src := data.NewMarkdownSource(*dataDir, 128)
+			if src.NumFiles() == 0 {
+				logger.Error("no .md files found", "dir", *dataDir)
+				os.Exit(1)
+			}
+			provider = func() ([]string, data.State) { return src.Next() }
+		default: // parquet
+			paths := data.ListParquetFiles(*dataDir)
+			if len(paths) == 0 {
+				logger.Error("no parquet files found", "dir", *dataDir)
+				os.Exit(1)
+			}
+			src := data.NewParquetSource(paths, 128)
+			provider = func() ([]string, data.State) { return src.Next() }
 		}
-		src := data.NewParquetSource(paths, 128)
-		provider = func() ([]string, data.State) { return src.Next() }
 	} else {
 		logger.Warn("no --data-dir; training on synthetic documents")
 		provider = syntheticProvider()

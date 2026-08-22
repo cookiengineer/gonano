@@ -40,7 +40,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	meta, params, err := checkpoint.Load(*modelPath)
+	meta, params, err := checkpoint.LoadAny(*modelPath)
 	if err != nil {
 		logger.Error("load checkpoint", "err", err)
 		os.Exit(1)
