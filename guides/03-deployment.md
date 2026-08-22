@@ -186,4 +186,33 @@ For a long-running service:
   goroutines — the `parallel` pool sizes itself to `GOMAXPROCS`.
 - Measure with `infer.Measure` before and after changes.
 
+## 8. OpenAI-compatible API (`cmd/server`)
+
+A ready-made HTTP server exposes the standard OpenAI chat completions API:
+
+```bash
+go run ./cmd/server \
+  --model ~/.cache/gonano/base_checkpoints/d4/model_000200.gn \
+  --addr :8080
+```
+
+Endpoints:
+
+- `POST /v1/chat/completions` — non-streaming and streaming (`"stream": true`).
+  Accepts `model`, `messages` (roles `system`/`user`/`assistant`/`tool`),
+  `temperature`, `top_k`, `max_tokens`, `n`, `seed`, `tools`.
+- `GET /v1/models` — lists the served model.
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gonano","messages":[{"role":"user","content":"what is 2+2?"}]}'
+```
+
+Tool calls are executed **server-side** by the `server` package: the model
+emits `<|tool_start|>…<|tool_end|>`, the registered `infer.Tool` set runs it in
+Go, and the result is fed back. The built-in calculator is registered by
+default; `cmd/server` also demonstrates registering a custom `now` tool — add
+your own by implementing `infer.Tool` and calling `registry.Register`.
+
 Next: [Debugging guide](04-debugging.md).

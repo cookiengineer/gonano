@@ -58,12 +58,19 @@ func (r *Registry) Register(t Tool) { r.tools = append(r.tools, t) }
 
 // Execute runs the first tool that understands expr.
 func (r *Registry) Execute(expr string) (string, bool) {
+	_, result, ok := r.ExecuteTool(expr)
+	return result, ok
+}
+
+// ExecuteTool runs the first tool that understands expr and also returns the
+// tool's name (so callers can report which tool handled a call).
+func (r *Registry) ExecuteTool(expr string) (name, result string, ok bool) {
 	for _, t := range r.tools {
-		if result, ok := t.Call(expr); ok {
-			return result, true
+		if res, ok := t.Call(expr); ok {
+			return t.Name(), res, true
 		}
 	}
-	return "", false
+	return "", "", false
 }
 
 // NewCalculator returns a registry containing the built-in calculator tool.

@@ -96,6 +96,22 @@ The benchmark uses a synthetic prompt and never decodes text, so it works even
 without a trained tokenizer (it falls back to a byte-level tokenizer and logs a
 warning).
 
+## Serving (OpenAI-compatible API)
+
+Run an OpenAI-compatible HTTP server (chat completions, streaming, tool calls):
+
+```bash
+go run ./cmd/server --model ~/.cache/gonano/base_checkpoints/d4/model_000050.gn --addr :8080;
+
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gonano","messages":[{"role":"user","content":"what is 2+2?"}]}';
+```
+
+Tool calls are executed server-side in Go via the `server` package (the built-in
+calculator, plus any tools you register in `cmd/server`). See
+`guides/03-deployment.md` for the Go library usage.
+
 See `guides/00-quickstart.md` for a copy-pasteable ArchLinux setup, and `guides/` for the
 step-by-step training, export, deployment, and debugging guides.
 
@@ -111,6 +127,7 @@ step-by-step training, export, deployment, and debugging guides.
 | `data`              | Parquet reader, Snappy, HF-Hub download, Markdown source, BOS-aligned dataloaders                                |
 | `train`             | Scaling laws, schedulers, pretraining/SFT/RL loops                                                               |
 | `infer`             | KV-cache engine, sampler, calculator tool, benchmark                                                             |
+| `server`            | OpenAI-compatible HTTP API (chat completions, streaming, tool calls)                                             |
 | `eval`              | BPB, CORE, ChatCORE + `eval/tasks` (MMLU/GSM8K/ARC/HumanEval/SmolTalk)                                           |
 | `exec`              | Sandboxed Python execution (HumanEval)                                                                           |
 | `checkpoint`        | Versioned binary checkpoint save/load + GGUF export                                                              |

@@ -244,6 +244,19 @@ of the project never touches `simd` directly.
 3. `LoadModel` rebuilds a `model.Transformer` from a loaded metadata+params
    pair, and `LoadAny` auto-detects `.gn` vs `.gguf`.
 
+### 3.11 `server`
+
+1. `server.Server` wraps a model, tokenizer, `infer.Engine`, and an
+   `infer.Registry` of tools, exposing an OpenAI-compatible HTTP API
+   (`POST /v1/chat/completions`, `GET /v1/models`).
+
+2. `renderMessages` translates OpenAI `system`/`user`/`assistant`/`tool`
+   messages into the gonano token protocol; `generate` runs the engine and
+   parses `<|tool_start|>…<|tool_end|>` spans into structured `tool_calls`.
+
+3. Tool calls are executed server-side in Go by the registry, so a single
+   request can carry a complete tool-using turn.
+
 ---
 
 ## 4. Behind the scenes: one pretraining step
@@ -360,6 +373,7 @@ shows higher tokens-per-second at larger batch sizes.
 | Data loading | `data/dataloader.go`, `data/dataset.go` |
 | The training loop | `train/trainer.go`, `train/scaling.go` |
 | The inference engine | `infer/engine.go`, `infer/sampler.go` |
+| The OpenAI API server | `server/server.go`, `server/handler.go`, `cmd/server` |
 | Checkpoint/GGUF | `checkpoint/checkpoint.go`, `checkpoint/gguf.go` |
 
 For a from-scratch walkthrough, continue with
