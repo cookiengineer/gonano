@@ -118,8 +118,8 @@ func main() {
 2. **Replicate** — `model.PrefillFrom` clones the KV cache across `numSamples`
    rows (and expands the smear state).
 3. **Decode loop** — for each step, `infer.SampleNextToken` samples the next
-   token per row (temperature/top-k/argmax), the tool-use state machine
-   (`infer.UseCalculator`) handles `<|python_start|>…<|python_end|>`, and the
+   token per row (temperature/top-k/argmax), the tool-call state machine
+   (`infer.Engine.Tools`) handles `<|tool_start|>…<|tool_end|>`, and the
    next single-token column is forwarded against the cache.
 
 The KV cache lives in `model.KVBuffer` (`model/kvcache.go`).

@@ -3,18 +3,24 @@
 // split pattern. It also renders chat conversations into token id sequences.
 package tokenizer
 
-// SpecialTokens are the control tokens used to delimit documents and render
-// conversations, in the exact order nanochat assigns their ids.
+// SpecialTokens are the control tokens used to delimit documents, render
+// conversations, and mark tool calls. They are assigned ids in this order,
+// appended after the mergeable vocabulary.
+//
+// The tool-call vocabulary is language-agnostic: the assistant emits
+// <|tool_start|> … <|tool_end|> to invoke a tool, and the runtime replies with
+// <|tool_output_start|> … <|tool_output_end|>. The tool itself is executed by
+// Go code (see package infer), not by any particular scripting language.
 var SpecialTokens = []string{
 	"<|bos|>",
 	"<|user_start|>",
 	"<|user_end|>",
 	"<|assistant_start|>",
 	"<|assistant_end|>",
-	"<|python_start|>",
-	"<|python_end|>",
-	"<|output_start|>",
-	"<|output_end|>",
+	"<|tool_start|>",
+	"<|tool_end|>",
+	"<|tool_output_start|>",
+	"<|tool_output_end|>",
 }
 
 // splitPattern is the GPT-4/tiktoken split pattern, described in prose because

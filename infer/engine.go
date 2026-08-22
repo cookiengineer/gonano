@@ -9,23 +9,27 @@ import (
 // RowState tracks the state of one generation row, including forced tokens
 // (tool use) and completion status.
 type RowState struct {
-	currentTokens   []int
-	forcedTokens    []int
-	inPythonBlock   bool
-	pythonExprTokens []int
-	completed       bool
+	currentTokens  []int
+	forcedTokens   []int
+	inToolCall     bool
+	toolCallTokens []int
+	completed      bool
 }
 
 // Engine performs batched autoregressive generation with a KV cache and a
-// tool-use (calculator) state machine.
+// tool-call state machine.
 type Engine struct {
 	Model     *model.Transformer
 	Tokenizer *tokenizer.Tokenizer
+	// Tools is the registry used to execute tool calls. It defaults to the
+	// built-in calculator; register additional Go tools to extend it.
+	Tools *Registry
 }
 
-// NewEngine builds an inference engine over the given model and tokenizer.
+// NewEngine builds an inference engine over the given model and tokenizer. It
+// installs the built-in calculator tool.
 func NewEngine(m *model.Transformer, tok *tokenizer.Tokenizer) *Engine {
-	return &Engine{Model: m, Tokenizer: tok}
+	return &Engine{Model: m, Tokenizer: tok, Tools: NewCalculator()}
 }
 
 // Generate produces token columns for num_samples rows, seeded from the given
@@ -67,10 +71,10 @@ func (e *Engine) Generate(tokens []int, numSamples, maxTokens int, temperature f
 		}
 
 		special := func(name string) int { return e.Tokenizer.EncodeSpecial(name) }
-		pythonStart := special("<|python_start|>")
-		pythonEnd := special("<|python_end|>")
-		outputStart := special("<|output_start|>")
-		outputEnd := special("<|output_end|>")
+		toolStart := special("<|tool_start|>")
+		toolEnd := special("<|tool_end|>")
+		toolOutputStart := special("<|tool_output_start|>")
+		toolOutputEnd := special("<|tool_output_end|>")
 		assistantEnd := special("<|assistant_end|>")
 		bos := e.Tokenizer.BOSTokenID()
 
@@ -115,25 +119,25 @@ func (e *Engine) Generate(tokens []int, numSamples, maxTokens int, temperature f
 				if next == assistantEnd || next == bos {
 					s.completed = true
 				}
-				switch {
-				case next == pythonStart:
-					s.inPythonBlock = true
-					s.pythonExprTokens = nil
-				case next == pythonEnd && s.inPythonBlock:
-					s.inPythonBlock = false
-					if len(s.pythonExprTokens) > 0 {
-						expr := e.Tokenizer.Decode(s.pythonExprTokens)
-						if result := UseCalculator(expr); result != nil {
-							resultTokens := e.Tokenizer.Encode(*result)
-							s.forcedTokens = append(s.forcedTokens, outputStart)
-							s.forcedTokens = append(s.forcedTokens, resultTokens...)
-							s.forcedTokens = append(s.forcedTokens, outputEnd)
-						}
+			switch {
+			case next == toolStart:
+				s.inToolCall = true
+				s.toolCallTokens = nil
+			case next == toolEnd && s.inToolCall:
+				s.inToolCall = false
+				if len(s.toolCallTokens) > 0 {
+					expr := e.Tokenizer.Decode(s.toolCallTokens)
+					if result, ok := e.Tools.Execute(expr); ok {
+						resultTokens := e.Tokenizer.Encode(result)
+						s.forcedTokens = append(s.forcedTokens, toolOutputStart)
+						s.forcedTokens = append(s.forcedTokens, resultTokens...)
+						s.forcedTokens = append(s.forcedTokens, toolOutputEnd)
 					}
-					s.pythonExprTokens = nil
-				case s.inPythonBlock:
-					s.pythonExprTokens = append(s.pythonExprTokens, next)
 				}
+				s.toolCallTokens = nil
+			case s.inToolCall:
+				s.toolCallTokens = append(s.toolCallTokens, next)
+			}
 			}
 
 			if !yield(tokenColumn, tokenMask) {

@@ -65,7 +65,7 @@ func TestGSM8KEvaluateAndExtract(t *testing.T) {
 		{Question: "q", Answer: "Work: 12/60 = <<12/60=0.2>>0.2. #### 10"},
 	})
 	conv := g.GetExample(0)
-	// The answer contains python tool parts and a final text part.
+	// The answer contains tool-call parts and a final text part.
 	parts := conv.Messages[1].Parts
 	if len(parts) == 0 {
 		t.Fatal("expected tool parts")

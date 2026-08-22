@@ -65,6 +65,33 @@ func TestUseCalculatorRejects(t *testing.T) {
 	}
 }
 
+// echoTool is a tiny custom tool used to verify the registry is extensible
+// beyond the built-in calculator.
+type echoTool struct{}
+
+func (echoTool) Name() string                     { return "echo" }
+func (echoTool) Call(expr string) (string, bool)  { return expr, true }
+
+func TestToolRegistry(t *testing.T) {
+	reg := NewCalculator()
+	if got, ok := reg.Execute("1+2*3"); !ok || got != "7" {
+		t.Fatalf("calculator Execute = %q, %v; want 7, true", got, ok)
+	}
+	if got, ok := reg.Execute(`"hello world".count("l")`); !ok || got != "3" {
+		t.Fatalf("count Execute = %q, %v; want 3, true", got, ok)
+	}
+	// Unhandled expression: only the calculator is registered.
+	if _, ok := reg.Execute("hello"); ok {
+		t.Fatal("calculator should not handle plain text")
+	}
+
+	// Register a custom tool; it is consulted after the calculator.
+	reg.Register(echoTool{})
+	if got, ok := reg.Execute("hello"); !ok || got != "hello" {
+		t.Fatalf("custom tool = %q, %v; want hello, true", got, ok)
+	}
+}
+
 func testEngineModel() (*model.Transformer, *tokenizer.Tokenizer) {
 	cfg := model.Config{
 		SequenceLen: 16, VocabSize: 32, NumLayer: 2, NumHead: 2, NumKVHead: 2,

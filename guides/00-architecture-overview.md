@@ -216,8 +216,9 @@ of the project never touches `simd` directly.
 
 2. `SampleNextToken` implements argmax, temperature, and top-k sampling.
 
-3. `UseCalculator` is a safe arithmetic/`.count()` evaluator used by the tool
-   loop.
+3. The `Tool` interface and `Registry` execute tool calls; the built-in
+   `Calculator` handles arithmetic/`.count()`, and callers can register more
+   Go-implemented tools.
 
 4. `Measure` times TTFT and per-step decode latency.
 
@@ -300,10 +301,10 @@ Follow these steps to trace `cmd/chat_cli`.
    rows, and expands the smear state.
 
 5. In the decode loop, `SampleNextToken` picks the next token per row from the
-   last logits, the tool-use state machine rewrites any
-   `<|python_start|>…<|python_end|>` spans into calculator outputs, and the
-   resulting token column is forwarded again through `Forward` against the KV
-   cache.
+   last logits, the tool-call state machine rewrites any
+   `<|tool_start|>…<|tool_end|>` spans into tool outputs (via the registered
+   `infer.Tool` set), and the resulting token column is forwarded again
+   through `Forward` against the KV cache.
 
 6. The loop ends when every row emits `<|assistant_end|>` or the token budget
    is exhausted; `GenerateBatch` collects the final sequences, which

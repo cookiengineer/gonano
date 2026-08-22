@@ -25,7 +25,7 @@ symptom, the likely cause, and the exact file/function to inspect.
 | `checkpoint: truncated …` | file cut short / version mismatch | `checkpoint/checkpoint.go` |
 | GGUF rejected by a tool | not a stock arch, or corrupt | `checkpoint/gguf.go` |
 | Empty / garbage generation | temperature=0 with bad tokenizer, or model not trained | `infer/engine.go`, `infer/sampler.go`, `tokenizer` |
-| Calculator tool silent | expression unsupported | `infer/tooluse.go` (`UseCalculator`) |
+| Tool call silent | expression unsupported by any registered tool | `infer/tooluse.go` (`Tool`, `Registry`) |
 | HumanEval always 0% | `python3` missing on host | `exec/exec.go` (`Available`) |
 
 ---
@@ -189,9 +189,11 @@ forward/backward; if it NaNs later, it's the optimizer or learning rate.
 - **Top-k/temperature odd behavior** — `infer/sampler.go` (`sampleRow`,
   `maskTopK`, `kthLargest`). temperature ≤ 0 is argmax; top-k masks everything
   below the k-th logit.
-- **Tool use never fires** — `infer/engine.go` looks for `<|python_start|>` /
-  `<|python_end|>` and calls `infer.UseCalculator` (`infer/tooluse.go`), which
-  only accepts pure arithmetic or `"str".count("sub")` expressions.
+- **Tool use never fires** — `infer/engine.go` looks for `<|tool_start|>` /
+  `<|tool_end|>` and dispatches the enclosed text to the `infer.Tool` registry
+  (`infer/tooluse.go`), which by default contains only the calculator
+  (pure arithmetic or `"str".count("sub")` expressions). Register more tools
+  via `Registry.Register` to extend it.
 - **HumanEval 0%** — `exec.Available()` reports whether `python3` is on `PATH`;
   if not, `HumanEval.Evaluate` returns false (`eval/tasks/humaneval.go`).
 

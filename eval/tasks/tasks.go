@@ -111,8 +111,8 @@ func ExtractAnswer(completion string) string {
 	return m[1]
 }
 
-// GSM8K is the grade-school math dataset. Assistant messages contain Python
-// calculator tool calls.
+// GSM8K is the grade-school math dataset. Assistant messages contain tool
+// calls (the <<expr=result>> calculator syntax).
 type GSM8K struct {
 	examples []*tokenizer.Conversation
 }
@@ -152,8 +152,8 @@ func splitGSM8KAnswer(answer string) []tokenizer.MessagePart {
 		if idx := lastIndexByte(inner, '='); idx >= 0 {
 			expr, result = inner[:idx], inner[idx+1:]
 		}
-		parts = append(parts, tokenizer.MessagePart{Type: "python", Text: expr})
-		parts = append(parts, tokenizer.MessagePart{Type: "python_output", Text: result})
+		parts = append(parts, tokenizer.MessagePart{Type: "tool_call", Text: expr})
+		parts = append(parts, tokenizer.MessagePart{Type: "tool_output", Text: result})
 		last = loc[1]
 	}
 	if last < len(answer) {

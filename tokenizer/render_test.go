@@ -113,24 +113,24 @@ func TestRenderConversationToolUse(t *testing.T) {
 	conv := &Conversation{Messages: []Message{
 		{Role: "user", Content: "what is 2 plus 2"},
 		{Role: "assistant", Parts: []MessagePart{
-			{Type: "python", Text: "2+2"},
-			{Type: "python_output", Text: "4"},
+			{Type: "tool_call", Text: "2+2"},
+			{Type: "tool_output", Text: "4"},
 			{Type: "text", Text: "The answer is 4."},
 		}},
 	}}
 	ids, mask := tok.RenderConversation(conv, 2048)
 	decoded := tok.Decode(ids)
 	want := "<|bos|><|user_start|>what is 2 plus 2<|user_end|>" +
-		"<|assistant_start|><|python_start|>2+2<|python_end|>" +
-		"<|output_start|>4<|output_end|>The answer is 4.<|assistant_end|>"
+		"<|assistant_start|><|tool_start|>2+2<|tool_end|>" +
+		"<|tool_output_start|>4<|tool_output_end|>The answer is 4.<|assistant_end|>"
 	if decoded != want {
 		t.Fatalf("tool-use decoded = %q\nwant %q", decoded, want)
 	}
-	// Verify the python_output region is masked 0 while python and text are 1.
+	// Verify the tool_output region is masked 0 while tool_call and text are 1.
 	for i, id := range ids {
-		if id == tok.EncodeSpecial("<|output_start|>") || id == tok.EncodeSpecial("<|output_end|>") {
+		if id == tok.EncodeSpecial("<|tool_output_start|>") || id == tok.EncodeSpecial("<|tool_output_end|>") {
 			if mask[i] != 0 {
-				t.Fatalf("output special at %d mask = %d, want 0", i, mask[i])
+				t.Fatalf("tool output special at %d mask = %d, want 0", i, mask[i])
 			}
 		}
 	}

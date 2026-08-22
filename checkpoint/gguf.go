@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"github.com/cookiengineer/gonano/tensor"
+	"github.com/cookiengineer/gonano/tokenizer"
 )
 
 // GGUF export. GGUF is a self-describing container for tensor weights. gonano
@@ -64,8 +65,8 @@ func ExportGGUF(path string, meta Meta, params map[string]*tensor.Tensor) error 
 	header = ggufKVString(header, "nanochat.window_pattern", cfg.WindowPattern)
 	header = ggufKVU32(header, "nanochat.step", uint32(meta.Step))
 	header = ggufKVString(header, "tokenizer.ggml.model", "gpt2")
-	header = ggufKVU32(header, "tokenizer.ggml.bos_token_id", uint32(cfg.VocabSize-len(specialTokenNames())))
-	header = ggufKVArrayString(header, "nanochat.special_tokens", specialTokenNames())
+	header = ggufKVU32(header, "tokenizer.ggml.bos_token_id", uint32(cfg.VocabSize-len(tokenizer.SpecialTokens)))
+	header = ggufKVArrayString(header, "nanochat.special_tokens", tokenizer.SpecialTokens)
 	header = ggufKVU32(header, "nanochat.value_embedding_layers", uint32((cfg.NumLayer+1)/2))
 
 	// Tensor infos (offsets are patched after the aligned header length is
@@ -149,19 +150,4 @@ func ggufKVArrayString(b []byte, key string, v []string) []byte {
 func ggufString(b []byte, s string) []byte {
 	b = binary.LittleEndian.AppendUint64(b, uint64(len(s)))
 	return append(b, s...)
-}
-
-// specialTokenNames returns nanochat's special tokens.
-func specialTokenNames() []string {
-	return []string{
-		"<|bos|>",
-		"<|user_start|>",
-		"<|user_end|>",
-		"<|assistant_start|>",
-		"<|assistant_end|>",
-		"<|python_start|>",
-		"<|python_end|>",
-		"<|output_start|>",
-		"<|output_end|>",
-	}
 }

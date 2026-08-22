@@ -5,34 +5,82 @@ import (
 	"strings"
 )
 
-// UseCalculator evaluates a safe expression emitted by the model: either a
-// pure arithmetic expression or a string .count() operation. It returns the
-// result as a string, or nil if the expression is unsupported or invalid.
-//
-// This is a dependency-free Go reimplementation of nanochat's use_calculator:
-// there is no Python subprocess and no arbitrary code execution.
-func UseCalculator(expr string) *string {
+// Tool is a callable function the model can invoke through the tool-call
+// protocol: the assistant emits <|tool_start|> … <|tool_end|>, and the runtime
+// dispatches the enclosed text to a Tool and feeds its result back as
+// <|tool_output_start|> … <|tool_output_end|>.
+type Tool interface {
+	// Name returns the tool's identifier (used for logging/registration).
+	Name() string
+	// Call evaluates expr and reports whether it understood it. When ok is
+	// false the expression is passed on to the next tool.
+	Call(expr string) (result string, ok bool)
+}
+
+// Calculator is a safe arithmetic and string-counting tool. It evaluates pure
+// arithmetic expressions (no **, no function calls) and "literal".count("sub")
+// expressions. There is no arbitrary code execution: everything runs in Go.
+type Calculator struct{}
+
+func (Calculator) Name() string { return "calculator" }
+
+func (Calculator) Call(expr string) (string, bool) {
 	expr = strings.ReplaceAll(expr, ",", "")
 
 	if isArithmetic(expr) {
 		if strings.Contains(expr, "**") {
-			return nil
+			return "", false
 		}
 		if v, ok := evalArithmetic(expr); ok {
-			s := formatNumber(v)
-			return &s
+			return formatNumber(v), true
 		}
-		return nil
+		return "", false
 	}
 
 	if isCountExpression(expr) {
 		if n, ok := evalCount(expr); ok {
-			s := formatNumber(float64(n))
-			return &s
+			return formatNumber(float64(n)), true
 		}
+		return "", false
+	}
+	return "", false
+}
+
+// Registry dispatches an expression to the first registered tool that
+// understands it. Callers can register additional Go-implemented tools
+// (e.g. a unit converter or a weather lookup) to extend the model's abilities.
+type Registry struct {
+	tools []Tool
+}
+
+// Register adds a tool. Tools are consulted in registration order.
+func (r *Registry) Register(t Tool) { r.tools = append(r.tools, t) }
+
+// Execute runs the first tool that understands expr.
+func (r *Registry) Execute(expr string) (string, bool) {
+	for _, t := range r.tools {
+		if result, ok := t.Call(expr); ok {
+			return result, true
+		}
+	}
+	return "", false
+}
+
+// NewCalculator returns a registry containing the built-in calculator tool.
+func NewCalculator() *Registry {
+	r := &Registry{}
+	r.Register(Calculator{})
+	return r
+}
+
+// UseCalculator evaluates expr with the built-in calculator tool. It returns
+// nil if the expression is unsupported or invalid.
+func UseCalculator(expr string) *string {
+	result, ok := (Calculator{}).Call(expr)
+	if !ok {
 		return nil
 	}
-	return nil
+	return &result
 }
 
 func isArithmetic(expr string) bool {

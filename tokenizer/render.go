@@ -1,9 +1,9 @@
 package tokenizer
 
-// MessagePart is one part of an assistant message: plain text, a Python tool
-// call, or a Python tool output.
+// MessagePart is one part of an assistant message: plain text, a tool call, or
+// a tool output.
 type MessagePart struct {
-	Type string // "text", "python", "python_output"
+	Type string // "text", "tool_call", "tool_output"
 	Text string
 }
 
@@ -45,8 +45,8 @@ func (t *Tokenizer) RenderConversation(conv *Conversation, maxTokens int) ([]int
 	bos := t.BOSTokenID()
 	userStart, userEnd := t.EncodeSpecial("<|user_start|>"), t.EncodeSpecial("<|user_end|>")
 	assistantStart, assistantEnd := t.EncodeSpecial("<|assistant_start|>"), t.EncodeSpecial("<|assistant_end|>")
-	pythonStart, pythonEnd := t.EncodeSpecial("<|python_start|>"), t.EncodeSpecial("<|python_end|>")
-	outputStart, outputEnd := t.EncodeSpecial("<|output_start|>"), t.EncodeSpecial("<|output_end|>")
+	toolStart, toolEnd := t.EncodeSpecial("<|tool_start|>"), t.EncodeSpecial("<|tool_end|>")
+	toolOutputStart, toolOutputEnd := t.EncodeSpecial("<|tool_output_start|>"), t.EncodeSpecial("<|tool_output_end|>")
 
 	add([]int{bos}, 0)
 	for i, msg := range messages {
@@ -65,14 +65,14 @@ func (t *Tokenizer) RenderConversation(conv *Conversation, maxTokens int) ([]int
 				switch part.Type {
 				case "text":
 					add(t.Encode(part.Text), 1)
-				case "python":
-					add([]int{pythonStart}, 1)
+				case "tool_call":
+					add([]int{toolStart}, 1)
 					add(t.Encode(part.Text), 1)
-					add([]int{pythonEnd}, 1)
-				case "python_output":
-					add([]int{outputStart}, 0)
+					add([]int{toolEnd}, 1)
+				case "tool_output":
+					add([]int{toolOutputStart}, 0)
 					add(t.Encode(part.Text), 0)
-					add([]int{outputEnd}, 0)
+					add([]int{toolOutputEnd}, 0)
 				}
 			}
 		}
