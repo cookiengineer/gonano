@@ -55,6 +55,23 @@ go run ./cmd/base_train --depth 20 --data-dir ~/.cache/gonano/base_data --num-it
 go run ./cmd/base_train --depth 20 --data-dir ~/webdata-md --data-format markdown;
 ```
 
+Or use the one-command `trainer.sh` wrapper, which also sets up a tokenizer
+for you (training one, loading an existing one, or copying the bundled default):
+
+```bash
+# Markdown webdata (uses the bundled default tokenizer if none exists yet)
+./trainer.sh ~/webdata-md --format markdown --depth 20 --num-iterations 10000;
+
+# Parquet shards, training a fresh tokenizer on the data
+./trainer.sh ~/.cache/gonano/base_data --format parquet --train-tokenizer --depth 20;
+```
+
+`trainer.sh` wraps `cmd/trainer` (an end-to-end training CLI) and ships default
+tokenizers in `tokenizer/defaults/` — `markdown.json` (BPE tuned for Markdown)
+and `byte.json` (a byte-level fallback). The format-appropriate one is copied
+into place when no trained tokenizer exists; regenerate both with
+`go run ./cmd/tok_default`.
+
 Export weights to GGUF:
 
 ```bash
@@ -66,10 +83,7 @@ go run ./cmd/export --model ~/.cache/gonano/base_checkpoints/d20/model_010000.gn
 Measure inference latency and throughput across decode batch sizes:
 
 ```bash
-go run ./cmd/infer_bench \
-  --model ~/.cache/gonano/base_checkpoints/d4/model_000050.gn \
-  --batch-sizes 1,4,16 \
-  --decode-tokens 64;
+bash benchmark.sh;
 ```
 
 `infer_bench` prints, per batch size, the time-to-first-token (`TTFT`), the
@@ -77,6 +91,10 @@ per-token decode latency (`TPOT`), overall tokens/second (`tok/s`), and pure
 decode tokens/second (`decode tok/s`, excluding prefill). Decode is
 memory-bandwidth-bound, so tokens/second rises with batch size. The prompt
 length is clamped automatically to fit the model's context window.
+
+The benchmark uses a synthetic prompt and never decodes text, so it works even
+without a trained tokenizer (it falls back to a byte-level tokenizer and logs a
+warning).
 
 See `guides/00-quickstart.md` for a copy-pasteable ArchLinux setup, and `guides/` for the
 step-by-step training, export, deployment, and debugging guides.

@@ -36,8 +36,10 @@ func main() {
 
 	tok, err := tokenizer.LoadTokenizer(filepath.Join(*baseDir, "tokenizer", "tokenizer.json"))
 	if err != nil {
-		logger.Error("load tokenizer", "err", err)
-		os.Exit(1)
+		// The benchmark uses a synthetic prompt and never decodes text, so a
+		// real tokenizer is not required — fall back to a byte-level one.
+		logger.Warn("no tokenizer found; using a byte-level tokenizer for the benchmark", "err", err)
+		tok = byteTokenizer()
 	}
 	meta, params, err := checkpoint.LoadAny(*modelPath)
 	if err != nil {
@@ -95,4 +97,14 @@ func parseBatchSizes(s string) []int {
 	}
 	out = append(out, num)
 	return out
+}
+
+// byteTokenizer builds a byte-level BPE tokenizer (256 single-byte ranks plus
+// the standard special tokens), used only when no trained tokenizer exists.
+func byteTokenizer() *tokenizer.Tokenizer {
+	ranks := make(map[string]int, 256)
+	for i := 0; i < 256; i++ {
+		ranks[string([]byte{byte(i)})] = i
+	}
+	return tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
 }

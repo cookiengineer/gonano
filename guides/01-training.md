@@ -135,14 +135,25 @@ Train it on the same data you will train the model on:
 go run ./cmd/tok_train \
   --data-dir ~/.cache/gonano/base_data \
   --vocab-size 32768
-
-# (The tok_train command reads the "text" column of the Parquet shards.)
 ```
 
-For Markdown webdata, tok_train currently reads Parquet; to train the tokenizer
-on Markdown, write a short program using `tokenizer.SplitPieces` + `TrainBPE`
-(see `cmd/tok_train/main.go` for the pattern — it is ~10 lines to adapt to
-Markdown files).
+Or let `trainer.sh` handle the tokenizer for you — it trains one on the data,
+loads an existing one, or copies a bundled default (`tokenizer/defaults/`:
+`markdown.json` for Markdown, `byte.json` otherwise):
+
+```bash
+# Train a tokenizer on Markdown webdata and then train a model:
+./trainer.sh ~/webdata-md --format markdown --train-tokenizer --depth 4
+
+# Train a tokenizer on Parquet shards and then train a model:
+./trainer.sh ~/.cache/gonano/base_data --format parquet --train-tokenizer --depth 4
+
+# Use the bundled default tokenizer (no training) if none exists yet:
+./trainer.sh ~/webdata-md --format markdown --depth 4
+```
+
+The underlying primitive is `data.TrainTokenizer` (format-agnostic), which
+feeds `tokenizer.SplitPieces` + `tokenizer.TrainBPE`.
 
 Check the result:
 
