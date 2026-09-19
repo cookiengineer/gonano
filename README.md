@@ -18,6 +18,51 @@ GOEXPERIMENT=simd go test ./...;
 - Vector width is auto-selected from the CPU (128/256/512-bit; AVX-512 via `GODEBUG=simd=512`).
 - Numeric precision is **float32** everywhere; parallelism is goroutine-per-op via the `internal/parallel` package.
 
+## Features
+
+gonano is optimized for CPU long-context inference and batched decode. The table
+below summarizes the measured effect of each optimization. Values are speedups
+(`×`, higher is better; below `1×` means slower) for the two inference phases,
+split by decode batch size; each row is measured against the baseline named in
+its own row, so the cells are not one single end-to-end run.
+
+| Feature | Baseline | Prefill (TTFT) | Decode ×1 | Decode ×16 | Decode ×64 |
+|:--------|:---------|---------------:|----------:|-----------:|-----------:|
+| Goroutine-parallel kernels | 1 core, seq 64 | — | 1.01× | 2.26× | — |
+| Split-K flash decoding | 1 core, seq 1024 | 5.75× | 1.37× | 2.89× | — |
+| Vectorized SIMD `exp` | attention kernel, seq 1024 | 1.17× | — | — | — |
+| Rank-1 score-tile GEMM | attention kernel, seq 1024 | 1.25× | — | — | — |
+| HCA dense KV compression (÷4 sequence) | uncompressed, seq 4096 | 0.7–0.8× | 1.37× | 1.02× | 1.14× |
+| CSA sparse attention + hierarchical indexer | compression-only, seq 4096 | ~1.5× | 0.96× | 1.27× | 1.29× |
+| Compression + sparsity (recommended config) | uncompressed, seq 4096 | 1.05–1.23× | 1.31× | 1.29× | 1.48× |
+
+Architectural features that reduce memory rather than latency:
+
+- **Grouped-query / multi-query attention** (`--kv-head-ratio N`): one KV head
+  per `N` query heads. Ratio 3 cuts KV-cache size 3× (no throughput claim; KV
+  traffic is reduced proportionally).
+- **Partial RoPE** (`RotaryDims`, default 64): DeepSeek-style rotary embedding
+  applied only to the trailing head dimensions, with no throughput cost.
+- **Hierarchical sparse indexer**: coarse-to-fine block selection bounds the
+  number of entries scored per query, making deeper indexing constant-cost in
+  context length.
+
+Notes:
+
+- Benchmarks: 16-core AMD Ryzen 7 7840HS (AVX-512), Go 1.27.1,
+  `GOEXPERIMENT=simd`, `GOMAXPROCS=16`, float32. Reproduce with `benchmark.sh`
+  and `cmd/infer_bench`.
+- "attention kernel" rows are single-`AttentionForward` timings at
+  `seq 1024, head 128`; the other rows are end-to-end `infer_bench` timings.
+- `—` means that phase was not measured for that row, not that the effect is zero.
+- The HCA prefill cost is an implementation/prefill-load artifact at short
+  context; compression pays off in decode and becomes more favourable at longer
+  context, where sparsity is layered on top.
+- **Low-bit weights/KV were evaluated and rejected**: an int8 experiment was
+  slower than fp32 on this platform (the Go `simd` package has no vectorized
+  int8→float32 conversion, and decode is compute-bound, not bandwidth-bound), so
+  the backend is float32-only.
+
 ## Quickstart
 
 ```bash

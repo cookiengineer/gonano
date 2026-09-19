@@ -84,28 +84,6 @@ func TestLoadModel(tester *testing.T) {
 	}
 }
 
-func TestLoadModelPacksInt8QAT(tester *testing.T) {
-	config := model.Config{
-		SequenceLen: 16, VocabSize: 32, NumLayer: 2, NumHead: 2, NumKVHead: 2,
-		EmbedDim: 32, WindowPattern: "L", QAT: "int8",
-	}
-	transformer := model.NewTransformer(config)
-	transformer.InitWeights(tensors.NewRNG(7))
-
-	path := filepath.Join(tester.TempDir(), "model_000001.gn")
-	if err := Save(path, Meta{Step: 1, ModelConfig: config}, transformer.NamedParameters()); err != nil {
-		tester.Fatalf("Save: %v", err)
-	}
-	meta, gotParams, err := Load(path)
-	if err != nil {
-		tester.Fatalf("Load: %v", err)
-	}
-	reloaded := LoadModel(meta, gotParams)
-	if !reloaded.Int8InferenceEnabled() {
-		tester.Fatal("a QAT int8 checkpoint should be packed for int8 inference on load")
-	}
-}
-
 func TestFindLastStep(tester *testing.T) {
 	dir := tester.TempDir()
 	for _, step := range []int{1, 5, 42} {

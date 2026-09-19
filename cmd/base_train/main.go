@@ -24,7 +24,6 @@ func main() {
 	maxSeqLen := flag.Int("max-seq-len", 512, "context length")
 	kvHeadRatio := flag.Int("kv-head-ratio", 1, "query heads per key/value head (1 = MHA, >1 = GQA)")
 	compressionRatio := flag.Int("compression-ratio", 0, "HCA-style dense KV compression ratio (0/1 disables)")
-	qat := flag.String("qat", "", "quantization-aware training mode (\"\" or int8)")
 	sparseTopK := flag.Int("sparse-topk", 0, "CSA sparse attention top-k compressed blocks (0 disables)")
 	indexerDim := flag.Int("indexer-dim", 64, "lightning indexer per-head dimension")
 	indexerPool := flag.Int("indexer-pool", 0, "hierarchical indexer super-block size (0 disables)")
@@ -61,7 +60,6 @@ func main() {
 
 	configuration := model.ConfigForDepthRatio(*depth, tokenizer.VocabSize(), 64, 128, *maxSeqLen, "SSSL", *kvHeadRatio)
 	configuration.CompressionRatio = *compressionRatio
-	configuration.QAT = *qat
 	configuration.SparseTopK = *sparseTopK
 	configuration.IndexerDim = *indexerDim
 	configuration.IndexerPool = *indexerPool

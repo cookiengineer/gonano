@@ -23,10 +23,6 @@ type Config struct {
 	// compressed entry, and queries attend to strictly preceding compressed
 	// blocks. Zero or one disables compression.
 	CompressionRatio int `json:"compression_ratio,omitempty"`
-	// QAT selects quantization-aware training for the linear weights. The
-	// empty string disables it; "int8" uses per-row symmetric int8 fake
-	// quantization with a straight-through estimator.
-	QAT string `json:"qat,omitempty"`
 	// SparseTopK enables CSA-style sparse attention on compressed layers: each
 	// query attends only to the top-k compressed blocks selected by the
 	// lightning indexer. Zero disables sparsity (dense compressed attention).
@@ -127,9 +123,6 @@ func (config Config) Validate() {
 		if patternChar != 'L' && patternChar != 'S' && patternChar != 'l' && patternChar != 's' {
 			panic(fmt.Sprintf("model: invalid window pattern %q", config.WindowPattern))
 		}
-	}
-	if config.QAT != "" && config.QAT != "int8" {
-		panic(fmt.Sprintf("model: unsupported QAT mode %q", config.QAT))
 	}
 	if config.SparseTopK > 0 && config.Compression() <= 1 {
 		panic("model: SparseTopK requires CompressionRatio > 1")

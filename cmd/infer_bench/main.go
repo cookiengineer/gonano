@@ -22,7 +22,6 @@ func main() {
 	promptTokens := flag.Int("prompt-tokens", 128, "prompt length")
 	decodeTokens := flag.Int("decode-tokens", 64, "tokens to generate per row")
 	batchSizes := flag.String("batch-sizes", "1,4,16", "comma-separated batch sizes")
-	packInt8 := flag.Bool("int8", false, "pack linear weights to int8 for the quantized GEMM")
 	baseDir := flag.String("base-dir", "", "tokenizer directory (default ~/.cache/gonano)")
 	flag.Parse()
 
@@ -48,9 +47,6 @@ func main() {
 		os.Exit(1)
 	}
 	model := checkpoint.LoadModel(meta, params)
-	if *packInt8 {
-		model.PackInt8()
-	}
 	engine := inference.NewEngine(model, tokenizer)
 
 	// Clamp the prompt so prompt+decode fits the model context.

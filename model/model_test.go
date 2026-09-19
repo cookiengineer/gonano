@@ -4,7 +4,6 @@ import (
 	"math"
 	"testing"
 
-	"github.com/cookiengineer/gonano/model/layers"
 	"github.com/cookiengineer/gonano/tensors"
 )
 
@@ -244,47 +243,6 @@ func buildTestTransformer(t *testing.T) *Transformer {
 	model := NewTransformer(testConfig())
 	model.InitWeights(tensors.NewRNG(42))
 	return model
-}
-
-func TestInt8QuantizationModes(t *testing.T) {
-	config := testConfig()
-	config.QAT = "int8"
-	transformer := NewTransformer(config)
-	if transformer.lmHead.QuantMode != layers.QuantInt8 {
-		t.Fatal("lm_head should be int8-quantized")
-	}
-	if transformer.blocks[0].attention.queryProjection.QuantMode != layers.QuantInt8 {
-		t.Fatal("c_q should be int8-quantized")
-	}
-	if transformer.blocks[0].mlp.inputProjection.QuantMode != layers.QuantInt8 {
-		t.Fatal("mlp c_fc should be int8-quantized")
-	}
-}
-
-func TestQATCompressedTrainStepFinite(t *testing.T) {
-	config := testConfig()
-	config.QAT = "int8"
-	config.CompressionRatio = 2
-	transformer := NewTransformer(config)
-	transformer.InitWeights(tensors.NewRNG(42))
-	indexes, targets := tinyData()
-	logits, context := transformer.TrainForward(indexes)
-	for _, value := range logits.Data {
-		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
-			t.Fatalf("non-finite logit %v", value)
-		}
-	}
-	flattened := logits.Reshape(indexes.Numel(), config.VocabSize)
-	_, valid := tensors.CrossEntropyPerPosition(flattened, targets.Reshape(indexes.Numel()), -1)
-	gradLogits := tensors.CrossEntropyGrad(flattened, targets.Reshape(indexes.Numel()), -1, 1/float32(valid))
-	transformer.TrainBackward(context, gradLogits.Reshape(indexes.Shape[0], indexes.Shape[1], config.VocabSize))
-	for _, parameter := range transformer.Parameters() {
-		for _, value := range parameter.Grad {
-			if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
-				t.Fatalf("non-finite gradient")
-			}
-		}
-	}
 }
 
 func TestSparseSelectAllMatchesDense(t *testing.T) {

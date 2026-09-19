@@ -34,19 +34,3 @@ func MatMulTransposed(left, right *Tensor) *Tensor {
 	KernelBackend().MatMulTransposed(result.Data, left.Data, right.Data, rowCount, columnCount, innerCount)
 	return result
 }
-
-// MatMulTransposedInt8 computes result = left @ dequant(packed)^T, where left
-// is [rowCount, innerCount], packed is a per-row symmetric int8 weight matrix
-// [columnCount, innerCount], and scales holds one float32 per weight row.
-func MatMulTransposedInt8(left *Tensor, packed []int8, scales []float32, columnCount int) *Tensor {
-	if left.Rank() != 2 {
-		panic("tensors: MatMulTransposedInt8 requires a rank-2 left operand")
-	}
-	rowCount, innerCount := left.Shape[0], left.Shape[1]
-	if len(packed) != columnCount*innerCount {
-		panic("tensors: MatMulTransposedInt8 packed length mismatch")
-	}
-	result := New(rowCount, columnCount)
-	KernelBackend().MatMulTransposedInt8(result.Data, left.Data, packed, scales, rowCount, columnCount, innerCount)
-	return result
-}

@@ -69,55 +69,8 @@ func NewTransformer(config Config) *Transformer {
 			model.valueEmbeds[layerIndex] = layers.NewEmbedding(paddedVocabulary, config.NumKVHead*config.HeadDim())
 		}
 	}
-	if config.QAT == "int8" {
-		model.enableInt8Quantization()
-	}
 	return model
 }
-
-// linearLayers returns every linear layer in the model (lm_head and each
-// block's projections).
-func (model *Transformer) linearLayers() []*layers.Linear {
-	linears := []*layers.Linear{model.lmHead}
-	for _, block := range model.blocks {
-		linears = append(linears,
-			block.attention.queryProjection, block.attention.keyProjection,
-			block.attention.valueProjection, block.attention.outputProjection,
-			block.mlp.inputProjection, block.mlp.outputProjection,
-		)
-		if block.attention.valueEmbeddingGate != nil {
-			linears = append(linears, block.attention.valueEmbeddingGate)
-		}
-		if block.attention.compressor != nil {
-			linears = append(linears, block.attention.compressor.logitWeight)
-		}
-		if block.attention.indexer != nil {
-			linears = append(linears, block.attention.indexer.query, block.attention.indexer.key)
-		}
-	}
-	return linears
-}
-
-// enableInt8Quantization turns on int8 quantization-aware training for every
-// linear weight in the model. Master weights remain float32.
-func (model *Transformer) enableInt8Quantization() {
-	for _, linear := range model.linearLayers() {
-		linear.QuantMode = layers.QuantInt8
-	}
-}
-
-// PackInt8 quantizes every linear weight into the per-row int8 inference
-// representation, enabling the quantized GEMM. It is intended for inference
-// after training or loading a checkpoint.
-func (model *Transformer) PackInt8() {
-	for _, linear := range model.linearLayers() {
-		linear.PackInt8()
-	}
-}
-
-// Int8InferenceEnabled reports whether the model's linear weights are packed
-// for the int8 inference GEMM.
-func (model *Transformer) Int8InferenceEnabled() bool { return model.lmHead.Packed }
 
 // NumLayers returns the number of transformer blocks.
 func (model *Transformer) NumLayers() int { return model.Config.NumLayer }

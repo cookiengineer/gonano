@@ -144,11 +144,6 @@ func LoadModel(meta Meta, params map[string]*tensors.Tensor) *model.Transformer 
 			copy(target.Data, param.Data)
 		}
 	}
-	// When the checkpoint was trained with int8 QAT, build the packed int8
-	// inference weights so the quantized GEMM is used at serving time.
-	if meta.ModelConfig.QAT == "int8" {
-		transformer.PackInt8()
-	}
 	return transformer
 }
 
