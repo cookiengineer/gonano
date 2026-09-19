@@ -28,6 +28,7 @@ func main() {
 	indexerDim := flag.Int("indexer-dim", 64, "lightning indexer per-head dimension")
 	indexerPool := flag.Int("indexer-pool", 0, "hierarchical indexer super-block size (0 disables)")
 	indexerCandidates := flag.Int("indexer-candidates", 0, "hierarchical indexer candidate budget (0 = auto)")
+	reusePattern := flag.String("reuse-pattern", "", "cross-layer reuse pattern of F/R/U per layer (empty = all full)")
 	vocabSize := flag.Int("vocab-size", 32768, "vocabulary size")
 	numIterations := flag.Int("num-iterations", 50, "optimization steps")
 	deviceBatchSize := flag.Int("device-batch-size", 1, "per-step batch size")
@@ -64,6 +65,7 @@ func main() {
 	configuration.IndexerDim = *indexerDim
 	configuration.IndexerPool = *indexerPool
 	configuration.IndexerCandidates = *indexerCandidates
+	configuration.ReusePattern = *reusePattern
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 

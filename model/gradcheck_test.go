@@ -46,6 +46,26 @@ func tinyCompressedModel() *Transformer {
 	return model
 }
 
+// tinyReuseModel exercises cross-layer dense-compressed reuse: layer 0 is full
+// and layers 1-3 reuse its compressed KV. Dense compression is used because
+// sparse top-k selection is non-differentiable, which would invalidate a
+// finite-difference gradient check.
+func tinyReuseModel() *Transformer {
+	config := Config{
+		SequenceLen: 16, VocabSize: 16, NumLayer: 4, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L", CompressionRatio: 2, ReusePattern: "FRUU",
+	}
+	model := NewTransformer(config)
+	model.InitWeights(tensors.NewRNG(42))
+	perturb := tensors.NewRNG(123)
+	for _, parameter := range model.Parameters() {
+		for elementIndex := range parameter.Data {
+			parameter.Data[elementIndex] += perturb.NormFloat32() * 0.1
+		}
+	}
+	return model
+}
+
 func tinyData() (*tensors.Int32s, *tensors.Int32s) {
 	indexes := tensors.NewInt32sWithData([]int{1, 6}, []int32{1, 5, 2, 8, 3, 7})
 	targets := tensors.NewInt32sWithData([]int{1, 6}, []int32{5, 2, 8, 3, 7, 4})
@@ -76,6 +96,13 @@ func TestBackpropDirectionalGradientCheck(t *testing.T) {
 
 func TestBackpropDirectionalGradientCheckCompressed(t *testing.T) {
 	runDirectionalGradientCheck(t, tinyCompressedModel())
+}
+
+// TestBackpropDirectionalGradientCheckReuse verifies that the compressed
+// key/value gradients contributed by reindex/reuse layers reach the producing
+// layer's compressor.
+func TestBackpropDirectionalGradientCheckReuse(t *testing.T) {
+	runDirectionalGradientCheck(t, tinyReuseModel())
 }
 
 func runDirectionalGradientCheck(t *testing.T, model *Transformer) {

@@ -196,6 +196,80 @@ func testSparseCompressedEngineModel() (*model.Transformer, *tokenizer.Tokenizer
 	return transformer, tokenizerImpl
 }
 
+// testReuseEngineModel exercises cross-layer compressed reuse during
+// autoregressive inference: layer 0 is full, layer 1 reindexes, and layers 2-3
+// reuse the shared compressed KV and selection.
+func testReuseEngineModel() (*model.Transformer, *tokenizer.Tokenizer) {
+	config := model.Config{
+		SequenceLen: 16, VocabSize: 32, NumLayer: 4, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L", CompressionRatio: 2, SparseTopK: 2,
+		IndexerDim: 4, ReusePattern: "FRUU",
+	}
+	transformer := model.NewTransformer(config)
+	transformer.InitWeights(tensors.NewRNG(42))
+	ranks := make(map[string]int, 256)
+	for index := 0; index < 256; index++ {
+		ranks[string([]byte{byte(index)})] = index
+	}
+	tokenizerImpl := tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
+	return transformer, tokenizerImpl
+}
+
+// testDenseReuseEngineModel exercises dense (non-sparse) cross-layer reuse,
+// covering the dense compressed branch of the reuse inference path.
+func testDenseReuseEngineModel() (*model.Transformer, *tokenizer.Tokenizer) {
+	config := model.Config{
+		SequenceLen: 16, VocabSize: 32, NumLayer: 4, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L", CompressionRatio: 2, ReusePattern: "FRUU",
+	}
+	transformer := model.NewTransformer(config)
+	transformer.InitWeights(tensors.NewRNG(42))
+	ranks := make(map[string]int, 256)
+	for index := 0; index < 256; index++ {
+		ranks[string([]byte{byte(index)})] = index
+	}
+	tokenizerImpl := tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
+	return transformer, tokenizerImpl
+}
+
+func TestEngineMatchesRecomputeReuseDense(test *testing.T) {
+	transformer, tokenizerImpl := testDenseReuseEngineModel()
+	engine := NewEngine(transformer, tokenizerImpl)
+	prompt := []int{1, 5, 2, 8, 3, 7, 4, 6}
+
+	want := compressedReference(transformer, prompt, 6)
+	got, _ := engine.GenerateBatch(prompt, 1, 6, 0, 0, 7)
+
+	limit := len(want)
+	if len(got[0]) < limit {
+		limit = len(got[0])
+	}
+	for index := 0; index < limit; index++ {
+		if got[0][index] != want[index] {
+			test.Fatalf("token %d: engine=%d recompute=%d", index, got[0][index], want[index])
+		}
+	}
+}
+
+func TestEngineMatchesRecomputeReuse(test *testing.T) {
+	transformer, tokenizerImpl := testReuseEngineModel()
+	engine := NewEngine(transformer, tokenizerImpl)
+	prompt := []int{1, 5, 2, 8, 3, 7, 4, 6}
+
+	want := compressedReference(transformer, prompt, 6)
+	got, _ := engine.GenerateBatch(prompt, 1, 6, 0, 0, 7)
+
+	limit := len(want)
+	if len(got[0]) < limit {
+		limit = len(got[0])
+	}
+	for index := 0; index < limit; index++ {
+		if got[0][index] != want[index] {
+			test.Fatalf("token %d: engine=%d recompute=%d", index, got[0][index], want[index])
+		}
+	}
+}
+
 func TestEngineMatchesRecomputeSparseCompressed(test *testing.T) {
 	transformer, tokenizerImpl := testSparseCompressedEngineModel()
 	engine := NewEngine(transformer, tokenizerImpl)

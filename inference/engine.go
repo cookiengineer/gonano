@@ -44,9 +44,9 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 		prefillCache := model.NewKVBuffer(1, len(tokens), config.NumLayer, config.NumKVHead, headDim)
 		if ratio := config.Compression(); ratio > 1 {
 			kvWidth := config.NumKVHead * headDim
-			prefillCache.EnableCompression(ratio, config.EmbedDim, kvWidth, len(tokens)/ratio+1)
+			prefillCache.EnableCompressionLayers(ratio, config.EmbedDim, kvWidth, len(tokens)/ratio+1, compressionAllocMask(config))
 			if config.SparseTopK > 0 {
-				prefillCache.EnableIndexerKeys(indexerKeyWidth(config))
+				prefillCache.EnableIndexerKeysLayers(indexerKeyWidth(config), indexerAllocMask(config))
 			}
 		}
 		inputIDs := tensors.NewInt32sWithData([]int{1, len(tokens)}, toI32(tokens))
@@ -69,9 +69,9 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 		decodeCache := model.NewKVBuffer(numSamples, cacheLen, config.NumLayer, config.NumKVHead, headDim)
 		if ratio := config.Compression(); ratio > 1 {
 			kvWidth := config.NumKVHead * headDim
-			decodeCache.EnableCompression(ratio, config.EmbedDim, kvWidth, cacheLen/ratio+1)
+			decodeCache.EnableCompressionLayers(ratio, config.EmbedDim, kvWidth, cacheLen/ratio+1, compressionAllocMask(config))
 			if config.SparseTopK > 0 {
-				decodeCache.EnableIndexerKeys(indexerKeyWidth(config))
+				decodeCache.EnableIndexerKeysLayers(indexerKeyWidth(config), indexerAllocMask(config))
 			}
 		}
 		model.PrefillFrom(decodeCache, prefillCache)
@@ -215,6 +215,29 @@ func indexerKeyWidth(config model.Config) int {
 		heads = 1
 	}
 	return dim * heads
+}
+
+// compressionAllocMask marks the layers that own compressed KV buffers: only
+// full layers produce compressed state, while reindex/reuse layers borrow it.
+func compressionAllocMask(config model.Config) []bool {
+	mask := make([]bool, config.NumLayer)
+	for layer := 0; layer < config.NumLayer; layer++ {
+		mask[layer] = config.OwnsCompressed(layer)
+	}
+	return mask
+}
+
+// indexerAllocMask marks the layers that cache their own indexer keys: full and
+// reindex layers. Pure reuse layers inherit the producer's selection.
+func indexerAllocMask(config model.Config) []bool {
+	if config.SparseTopK <= 0 {
+		return nil
+	}
+	mask := make([]bool, config.NumLayer)
+	for layer := 0; layer < config.NumLayer; layer++ {
+		mask[layer] = config.OwnsIndexer(layer)
+	}
+	return mask
 }
 
 func toI32(ids []int) []int32 {

@@ -114,11 +114,21 @@ func (cache *KVBuffer) writeKeyValue(layer, row, head int, newKey, newValue []fl
 	return keyBuffer[:end], valueBuffer[:end]
 }
 
-// EnableCompression allocates the HCA-style dense compression state. ratio is
-// the number of tokens merged into one compressed entry, embeddingDimension is
-// the compressor hidden width, kvWidth is keyValueHeadCount*headDim, and
-// maxBlocks is the maximum number of compressed entries per (layer, row, head).
+// EnableCompression allocates the HCA-style dense compression state on every
+// layer. See EnableCompressionLayers.
 func (cache *KVBuffer) EnableCompression(ratio, embeddingDimension, kvWidth, maxBlocks int) {
+	cache.EnableCompressionLayers(ratio, embeddingDimension, kvWidth, maxBlocks, nil)
+}
+
+// EnableCompressionLayers allocates the HCA-style dense compression state. ratio
+// is the number of tokens merged into one compressed entry, embeddingDimension
+// is the compressor hidden width, kvWidth is keyValueHeadCount*headDim, and
+// maxBlocks is the maximum number of compressed entries per (layer, row, head).
+//
+// allocate selects which layers own compression buffers; layers that reuse
+// another layer's compressed cache (reindex/reuse) pass false and allocate only
+// the small bookkeeping counters. A nil allocate allocates every layer.
+func (cache *KVBuffer) EnableCompressionLayers(ratio, embeddingDimension, kvWidth, maxBlocks int, allocate []bool) {
 	cache.compressionRatio = ratio
 	cache.compressedMaxBlocks = maxBlocks
 	cache.compressedEmbeddingDim = embeddingDimension
@@ -134,11 +144,16 @@ func (cache *KVBuffer) EnableCompression(ratio, embeddingDimension, kvWidth, max
 	cache.compressedCount = make([][]int, cache.layerCount)
 
 	for layer := 0; layer < cache.layerCount; layer++ {
+		// Bookkeeping counters are tiny and needed by reindex layers to track
+		// how many indexer keys they have cached.
+		cache.tailLength[layer] = make([]int, cache.batchSize)
+		cache.compressedCount[layer] = make([]int, cache.batchSize)
+		if allocate != nil && !allocate[layer] {
+			continue
+		}
 		cache.tailHidden[layer] = make([][]float32, cache.batchSize)
 		cache.tailKey[layer] = make([][]float32, cache.batchSize*cache.keyValueHeadCount)
 		cache.tailValue[layer] = make([][]float32, cache.batchSize*cache.keyValueHeadCount)
-		cache.tailLength[layer] = make([]int, cache.batchSize)
-		cache.compressedCount[layer] = make([]int, cache.batchSize)
 		cache.compressedKey[layer] = make([]*tensors.Tensor, cache.batchSize*cache.keyValueHeadCount)
 		cache.compressedValue[layer] = make([]*tensors.Tensor, cache.batchSize*cache.keyValueHeadCount)
 		for batch := 0; batch < cache.batchSize; batch++ {
@@ -155,13 +170,23 @@ func (cache *KVBuffer) EnableCompression(ratio, embeddingDimension, kvWidth, max
 	}
 }
 
-// EnableIndexerKeys allocates the cached indexer key projections, one
-// [maxBlocks, width] buffer per (layer, row, kv-head). EnableCompression must
-// be called first.
+// EnableIndexerKeys allocates the cached indexer key projections on every
+// layer. See EnableIndexerKeysLayers.
 func (cache *KVBuffer) EnableIndexerKeys(width int) {
+	cache.EnableIndexerKeysLayers(width, nil)
+}
+
+// EnableIndexerKeysLayers allocates the cached indexer key projections, one
+// [maxBlocks, width] buffer per (layer, row, kv-head) whose allocate flag is
+// true. EnableCompression must be called first. A nil allocate allocates every
+// layer.
+func (cache *KVBuffer) EnableIndexerKeysLayers(width int, allocate []bool) {
 	cache.indexerKeyWidth = width
 	cache.indexerKey = make([][]*tensors.Tensor, cache.layerCount)
 	for layer := 0; layer < cache.layerCount; layer++ {
+		if allocate != nil && !allocate[layer] {
+			continue
+		}
 		cache.indexerKey[layer] = make([]*tensors.Tensor, cache.batchSize*cache.keyValueHeadCount)
 		for index := range cache.indexerKey[layer] {
 			cache.indexerKey[layer][index] = tensors.New(cache.compressedMaxBlocks, width)
@@ -171,7 +196,7 @@ func (cache *KVBuffer) EnableIndexerKeys(width int) {
 
 // AppendIndexerKey stores the indexer key projection of one compressed entry.
 func (cache *KVBuffer) AppendIndexerKey(layer, batch, head int, key []float32) {
-	if cache.indexerKey == nil {
+	if cache.indexerKey == nil || cache.indexerKey[layer] == nil {
 		return
 	}
 	count := cache.compressedCount[layer][batch]
@@ -182,11 +207,18 @@ func (cache *KVBuffer) AppendIndexerKey(layer, batch, head int, key []float32) {
 // IndexerKey returns the first count cached indexer key projections for a
 // (row, kv-head).
 func (cache *KVBuffer) IndexerKey(layer, batch, head, count int) []float32 {
-	if cache.indexerKey == nil {
+	if cache.indexerKey == nil || cache.indexerKey[layer] == nil {
 		return nil
 	}
 	index := batch*cache.keyValueHeadCount + head
 	return cache.indexerKey[layer][index].Data[:count*cache.indexerKeyWidth]
+}
+
+// CompressedBlock returns one compressed key entry [headDim] for a (row, head).
+func (cache *KVBuffer) CompressedBlock(layer, batch, head, block int) []float32 {
+	index := batch*cache.keyValueHeadCount + head
+	headDimension := cache.compressedKey[layer][index].Shape[1]
+	return cache.compressedKey[layer][index].Data[block*headDimension : (block+1)*headDimension]
 }
 
 // CompressionEnabled reports whether compression state was allocated.
@@ -248,6 +280,9 @@ func (cache *KVBuffer) CompressedCount(layer, batch int) int {
 
 // CompressedKey returns the first count compressed key rows for a (row, head).
 func (cache *KVBuffer) CompressedKey(layer, batch, head, count int) []float32 {
+	if cache.compressedKey[layer] == nil {
+		return nil
+	}
 	index := batch*cache.keyValueHeadCount + head
 	headDimension := cache.compressedKey[layer][index].Shape[1]
 	return cache.compressedKey[layer][index].Data[:count*headDimension]
@@ -255,6 +290,9 @@ func (cache *KVBuffer) CompressedKey(layer, batch, head, count int) []float32 {
 
 // CompressedValue returns the first count compressed value rows for a (row, head).
 func (cache *KVBuffer) CompressedValue(layer, batch, head, count int) []float32 {
+	if cache.compressedValue[layer] == nil {
+		return nil
+	}
 	index := batch*cache.keyValueHeadCount + head
 	headDimension := cache.compressedValue[layer][index].Shape[1]
 	return cache.compressedValue[layer][index].Data[:count*headDimension]
@@ -282,6 +320,14 @@ func PrefillFrom(destination, source *KVBuffer) {
 			sourceCount := source.compressedCount[layer][0]
 			for batch := 0; batch < destination.batchSize; batch++ {
 				destination.compressedCount[layer][batch] = sourceCount
+			}
+			if destination.compressedKey[layer] == nil {
+				// Reuse layer: it owns no compressed KV, but a reindex layer
+				// still caches its own indexer-key projections.
+				copyIndexerKeys(destination, source, layer, sourceCount)
+				continue
+			}
+			for batch := 0; batch < destination.batchSize; batch++ {
 				copy(destination.tailHidden[layer][batch], source.tailHidden[layer][0])
 				copy(destination.tailKey[layer][batch], source.tailKey[layer][0])
 				copy(destination.tailValue[layer][batch], source.tailValue[layer][0])
@@ -293,12 +339,9 @@ func PrefillFrom(destination, source *KVBuffer) {
 					destinationIndex := batch*destination.keyValueHeadCount + head
 					copy(destination.compressedKey[layer][destinationIndex].Data[:sourceCount*headDimension], source.compressedKey[layer][head].Data[:sourceCount*headDimension])
 					copy(destination.compressedValue[layer][destinationIndex].Data[:sourceCount*headDimension], source.compressedValue[layer][head].Data[:sourceCount*headDimension])
-					if destination.indexerKey != nil && source.indexerKey != nil {
-						indexerWidth := source.indexerKey[layer][head].Shape[1]
-						copy(destination.indexerKey[layer][destinationIndex].Data[:sourceCount*indexerWidth], source.indexerKey[layer][head].Data[:sourceCount*indexerWidth])
-					}
 				}
 			}
+			copyIndexerKeys(destination, source, layer, sourceCount)
 		}
 	}
 
@@ -309,6 +352,56 @@ func PrefillFrom(destination, source *KVBuffer) {
 		destination.previousEmbedding = tensors.New(destination.batchSize, 1, channels)
 		for row := 0; row < destination.batchSize; row++ {
 			copy(destination.previousEmbedding.Data[row*channels:(row+1)*channels], source.previousEmbedding.Data[:channels])
+		}
+	}
+}
+
+// CompressedBytesAllocated returns the bytes allocated for compressed key/value
+// storage and cached indexer keys across every layer. Reuse/reindex layers own
+// no compressed KV, so only full layers contribute key/value bytes; reindex
+// layers still contribute their cached indexer keys.
+func (cache *KVBuffer) CompressedBytesAllocated() int {
+	total := 0
+	for layer := 0; layer < cache.layerCount; layer++ {
+		if cache.compressedKey != nil {
+			for _, tensor := range cache.compressedKey[layer] {
+				if tensor != nil {
+					total += tensor.Numel() * 4
+				}
+			}
+		}
+		if cache.compressedValue != nil {
+			for _, tensor := range cache.compressedValue[layer] {
+				if tensor != nil {
+					total += tensor.Numel() * 4
+				}
+			}
+		}
+		if cache.indexerKey != nil {
+			for _, tensor := range cache.indexerKey[layer] {
+				if tensor != nil {
+					total += tensor.Numel() * 4
+				}
+			}
+		}
+	}
+	return total
+}
+
+// copyIndexerKeys replicates a layer's cached indexer-key projections from a
+// batch-1 source across every destination row.
+func copyIndexerKeys(destination, source *KVBuffer, layer, count int) {
+	if destination.indexerKey == nil || source.indexerKey == nil {
+		return
+	}
+	if destination.indexerKey[layer] == nil || source.indexerKey[layer] == nil {
+		return
+	}
+	for head := 0; head < destination.keyValueHeadCount; head++ {
+		indexerWidth := source.indexerKey[layer][head].Shape[1]
+		for batch := 0; batch < destination.batchSize; batch++ {
+			destinationIndex := batch*destination.keyValueHeadCount + head
+			copy(destination.indexerKey[layer][destinationIndex].Data[:count*indexerWidth], source.indexerKey[layer][head].Data[:count*indexerWidth])
 		}
 	}
 }

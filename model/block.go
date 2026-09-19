@@ -11,10 +11,11 @@ type Block struct {
 	mlp       *MLP
 }
 
-// NewBlock builds a transformer block.
-func NewBlock(configuration Config, hasValueEmbedding bool) *Block {
+// NewBlock builds a transformer block. layer is the block index, used to
+// resolve the cross-layer reuse role.
+func NewBlock(configuration Config, hasValueEmbedding bool, layer int) *Block {
 	return &Block{
-		attention: NewCausalSelfAttention(configuration, hasValueEmbedding),
+		attention: NewCausalSelfAttention(configuration, hasValueEmbedding, layer),
 		mlp:       NewMLP(configuration.EmbedDim),
 	}
 }
@@ -23,8 +24,8 @@ func NewBlock(configuration Config, hasValueEmbedding bool) *Block {
 //
 //	input = input + attention(norm(input))
 //	input = input + mlp(norm(input))
-func (block *Block) Forward(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, cache *KVBuffer, layer int) *tensors.Tensor {
-	input = tensors.Add(input, block.attention.Forward(normalizeLastDim(input), valueEmbedding, cosine, sine, positionOffset, window, cache, layer))
+func (block *Block) Forward(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, cache *KVBuffer, layer int, share *compressionShare) *tensors.Tensor {
+	input = tensors.Add(input, block.attention.Forward(normalizeLastDim(input), valueEmbedding, cosine, sine, positionOffset, window, cache, layer, share))
 	input = tensors.Add(input, block.mlp.Forward(normalizeLastDim(input)))
 	return input
 }

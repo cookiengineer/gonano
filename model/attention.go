@@ -96,11 +96,26 @@ type CausalSelfAttention struct {
 	indexerLossWeight float32
 	indexerPool       int
 	indexerCandidates int
+
+	// reuseMode/producer implement cross-layer compressed KV/index reuse. A
+	// full layer produces compressed KV (and selection); reindex/reuse layers
+	// consume the producing layer's state. producer is the layer index whose
+	// compressed state this layer uses (== its own index on full layers).
+	reuseMode ReuseMode
+	producer  int
+}
+
+// usesCompression reports whether the layer takes the compressed-attention
+// path. This is true for full, reindex, and reuse layers whenever a compression
+// ratio is configured.
+func (attention *CausalSelfAttention) usesCompression() bool {
+	return attention.compressionRatio > 1
 }
 
 // NewCausalSelfAttention builds an attention layer. hasValueEmbedding selects
-// whether the ResFormer value-embedding gate is present on this layer.
-func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool) *CausalSelfAttention {
+// whether the ResFormer value-embedding gate is present on this layer. layer is
+// the block index, used to resolve the cross-layer reuse role.
+func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool, layer int) *CausalSelfAttention {
 	headDimension := configuration.HeadDim()
 	attention := &CausalSelfAttention{
 		queryHeadCount:     configuration.NumHead,
@@ -111,16 +126,23 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool) *Causa
 		keyProjection:      layers.NewLinear(configuration.EmbedDim, configuration.NumKVHead*headDimension),
 		valueProjection:    layers.NewLinear(configuration.EmbedDim, configuration.NumKVHead*headDimension),
 		outputProjection:   layers.NewLinear(configuration.EmbedDim, configuration.EmbedDim),
+		reuseMode:          configuration.ReuseModeAt(layer),
+		producer:           configuration.ReuseProducer(layer),
 	}
 	if hasValueEmbedding {
 		attention.valueEmbeddingGate = layers.NewLinear(veGateChannels, configuration.NumKVHead)
 	}
 	if ratio := configuration.Compression(); ratio > 1 {
 		attention.compressionRatio = ratio
-		attention.compressor = NewChannelCompressor(configuration.EmbedDim, headDimension, ratio)
-		if configuration.SparseTopK > 0 {
+		attention.sparseTopK = configuration.SparseTopK
+		// Only full layers produce compressed KV. Reindex layers borrow the
+		// compressed KV but keep their own indexer for fresh selection; reuse
+		// layers borrow both and own neither.
+		if attention.reuseMode == ReuseFull {
+			attention.compressor = NewChannelCompressor(configuration.EmbedDim, headDimension, ratio)
+		}
+		if configuration.SparseTopK > 0 && attention.reuseMode != ReuseReuse {
 			dim, heads := configuration.indexerDefaults()
-			attention.sparseTopK = configuration.SparseTopK
 			attention.indexerLossWeight = configuration.IndexerWeight()
 			attention.indexerPool = configuration.IndexerPool
 			attention.indexerCandidates = configuration.IndexerCandidateBudget()
@@ -135,7 +157,7 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool) *Causa
 // tables; positionOffset is the position of the first query; window is the
 // (left, right) sliding window; cache, when non-nil, stores and reads KV. The
 // result has shape [batch, sequence, embedding].
-func (attention *CausalSelfAttention) Forward(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, cache *KVBuffer, layer int) *tensors.Tensor {
+func (attention *CausalSelfAttention) Forward(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, cache *KVBuffer, layer int, share *compressionShare) *tensors.Tensor {
 	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
 	query := attention.queryProjection.Forward(input).Reshape(batchSize, sequenceLength, attention.queryHeadCount, attention.headDimension)
 	key := attention.keyProjection.Forward(input).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
@@ -154,11 +176,11 @@ func (attention *CausalSelfAttention) Forward(input, valueEmbedding, cosine, sin
 	query = tensors.Scale(normalizeLastDim(query), qkScale)
 	key = tensors.Scale(normalizeLastDim(key), qkScale)
 
-	if attention.compressor != nil {
+	if attention.usesCompression() {
 		if cache == nil {
 			panic("model: compressed attention requires a KV cache during inference")
 		}
-		return attention.forwardCompressed(input, query, key, value, cache, layer, positionOffset)
+		return attention.forwardCompressed(input, query, key, value, cache, layer, positionOffset, share)
 	}
 
 	// Transpose to [batch, head, sequence, dim] so per-head slices are

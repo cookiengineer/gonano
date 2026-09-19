@@ -424,7 +424,7 @@ func (attention *CausalSelfAttention) compressTail(cache *KVBuffer, layer, batch
 // forwardCompressed is the inference path of an HCA-style compressed attention
 // layer. It buffers incoming rows, compresses each completed block, and attends
 // every query to the compressed blocks that strictly precede its own block.
-func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value *tensors.Tensor, cache *KVBuffer, layer, positionOffset int) *tensors.Tensor {
+func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value *tensors.Tensor, cache *KVBuffer, layer, positionOffset int, share *compressionShare) *tensors.Tensor {
 	batchSize := input.Shape[0]
 	sequenceLength := input.Shape[1]
 	embeddingDimension := input.Shape[2]
@@ -437,22 +437,33 @@ func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value
 	queryHeadMajor := toBatchHeadLayout(query) // [B, Hq, T, D]
 	outputHeadMajor := tensors.New(batchSize, queryHeadCount, sequenceLength, headDimension)
 
-	// Append every new row and compress blocks as they complete.
-	for position := 0; position < sequenceLength; position++ {
-		for batch := 0; batch < batchSize; batch++ {
-			row := batch*sequenceLength + position
-			hiddenRow := input.Data[row*embeddingDimension : row*embeddingDimension+embeddingDimension]
-			keyRow := key.Data[row*kvHeadCount*headDimension : row*kvHeadCount*headDimension+kvHeadCount*headDimension]
-			valueRow := value.Data[row*kvHeadCount*headDimension : row*kvHeadCount*headDimension+kvHeadCount*headDimension]
-			cache.AppendTailRow(layer, batch, hiddenRow, keyRow, valueRow)
-		}
-		if cache.TailLength(layer, 0) == ratio {
-			attention.compressTail(cache, layer, batchSize, embeddingDimension, headDimension)
+	// Only a full layer buffers rows and compresses completed blocks; reuse
+	// and reindex layers read the producing layer's compressed cache.
+	cacheLayer := layer
+	if attention.reuseMode != ReuseFull {
+		cacheLayer = share.producer
+	}
+	if attention.reuseMode == ReuseFull {
+		for position := 0; position < sequenceLength; position++ {
+			for batch := 0; batch < batchSize; batch++ {
+				row := batch*sequenceLength + position
+				hiddenRow := input.Data[row*embeddingDimension : row*embeddingDimension+embeddingDimension]
+				keyRow := key.Data[row*kvHeadCount*headDimension : row*kvHeadCount*headDimension+kvHeadCount*headDimension]
+				valueRow := value.Data[row*kvHeadCount*headDimension : row*kvHeadCount*headDimension+kvHeadCount*headDimension]
+				cache.AppendTailRow(layer, batch, hiddenRow, keyRow, valueRow)
+			}
+			if cache.TailLength(layer, 0) == ratio {
+				attention.compressTail(cache, layer, batchSize, embeddingDimension, headDimension)
+			}
 		}
 	}
 
-	if attention.indexer != nil {
-		attention.forwardCompressedSparse(input, queryHeadMajor, cache, layer, positionOffset, outputHeadMajor)
+	if attention.reuseMode == ReuseReindex && attention.sparseTopK > 0 {
+		attention.cacheReusedIndexerKeys(cache, layer, cacheLayer, batchSize, headDimension)
+	}
+
+	if attention.sparseTopK > 0 {
+		attention.forwardCompressedSparse(input, queryHeadMajor, cache, layer, cacheLayer, positionOffset, outputHeadMajor, share)
 	} else {
 		for batch := 0; batch < batchSize; batch++ {
 			for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
@@ -461,14 +472,17 @@ func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value
 				for position := 0; position < sequenceLength; position++ {
 					absolutePosition := positionOffset + position
 					count := absolutePosition / ratio
+					if available := cache.CompressedCount(cacheLayer, batch); count > available {
+						count = available
+					}
 					outputRow := outputHeadMajor.Data[(queryIndex*sequenceLength+position)*headDimension : (queryIndex*sequenceLength+position+1)*headDimension]
 					if count == 0 {
 						clear(outputRow)
 						continue
 					}
 					queryRow := queryHeadMajor.Data[(queryIndex*sequenceLength+position)*headDimension : (queryIndex*sequenceLength+position+1)*headDimension]
-					keySlice := cache.CompressedKey(layer, batch, keyValueHead, count)
-					valueSlice := cache.CompressedValue(layer, batch, keyValueHead, count)
+					keySlice := cache.CompressedKey(cacheLayer, batch, keyValueHead, count)
+					valueSlice := cache.CompressedValue(cacheLayer, batch, keyValueHead, count)
 					tensors.AttentionForward(queryRow, keySlice, valueSlice, outputRow, nil, 1, count, headDimension, count, -1)
 				}
 			}
@@ -482,7 +496,7 @@ func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value
 // forwardCompressedSparse is the inference attention over the top-k compressed
 // blocks selected by the lightning indexer. Selection is shared across the
 // query heads that map to one key/value head.
-func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMajor *tensors.Tensor, cache *KVBuffer, layer, positionOffset int, outputHeadMajor *tensors.Tensor) {
+func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMajor *tensors.Tensor, cache *KVBuffer, layer, cacheLayer, positionOffset int, outputHeadMajor *tensors.Tensor, share *compressionShare) {
 	batchSize := input.Shape[0]
 	sequenceLength := input.Shape[1]
 	embeddingDimension := input.Shape[2]
@@ -493,31 +507,56 @@ func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMa
 	headRatio := queryHeadCount / kvHeadCount
 	topK := attention.sparseTopK
 
+	// Published selection for the group, assembled across (batch, kv-head).
+	var published [][][]int
+	if attention.reuseMode != ReuseReuse {
+		published = make([][][]int, batchSize*kvHeadCount)
+	}
+	if attention.reuseMode == ReuseReuse {
+		published = share.selection
+	}
+
 	for batch := 0; batch < batchSize; batch++ {
-		available := cache.CompressedCount(layer, batch)
+		available := cache.CompressedCount(cacheLayer, batch)
 		hiddenSlice := tensors.NewWithData([]int{1, sequenceLength, embeddingDimension},
 			input.Data[batch*sequenceLength*embeddingDimension:(batch+1)*sequenceLength*embeddingDimension])
 		for keyValueHead := 0; keyValueHead < kvHeadCount; keyValueHead++ {
+			selectionIndex := batch*kvHeadCount + keyValueHead
 			var selection [][]int
 			var keyData, valueData []float32
 			if available > 0 {
-				keyData = cache.CompressedKey(layer, batch, keyValueHead, available)
-				valueData = cache.CompressedValue(layer, batch, keyValueHead, available)
-				projectedKeys := cache.IndexerKey(layer, batch, keyValueHead, available)
-				if projectedKeys == nil {
-					compressed := tensors.NewWithData([]int{1, available, headDimension}, keyData)
-					projectedKeys = attention.indexer.key.Forward(compressed).Data
+				keyData = cache.CompressedKey(cacheLayer, batch, keyValueHead, available)
+				valueData = cache.CompressedValue(cacheLayer, batch, keyValueHead, available)
+				switch {
+				case attention.reuseMode == ReuseReuse:
+					if published != nil {
+						selection = published[selectionIndex]
+					}
+				default:
+					var projectedKeys []float32
+					if attention.reuseMode == ReuseFull {
+						// Indexer key projections cached when the block was
+						// compressed.
+						projectedKeys = cache.IndexerKey(layer, batch, keyValueHead, available)
+					}
+					if width := indexerKeyWidthOf(attention); width <= 0 || len(projectedKeys) < available*width {
+						compressed := tensors.NewWithData([]int{1, available, headDimension}, keyData)
+						projectedKeys = attention.indexer.key.Forward(compressed).Data
+					}
+					pool := attention.indexerPool
+					if pool < 1 {
+						pool = 1
+					}
+					budget := attention.indexerCandidates
+					if pool == 1 {
+						// Flat selection: score every available entry.
+						budget = available
+					}
+					selection = attention.indexer.SelectProjected(hiddenSlice, projectedKeys, available, positionOffset, ratio, topK, pool, budget)
+					if published != nil {
+						published[selectionIndex] = selection
+					}
 				}
-				pool := attention.indexerPool
-				if pool < 1 {
-					pool = 1
-				}
-				budget := attention.indexerCandidates
-				if pool == 1 {
-					// Flat selection: score every available entry.
-					budget = available
-				}
-				selection = attention.indexer.SelectProjected(hiddenSlice, projectedKeys, available, positionOffset, ratio, topK, pool, budget)
 			}
 			keyBuffer := make([]float32, topK*headDimension)
 			valueBuffer := make([]float32, topK*headDimension)
@@ -528,7 +567,7 @@ func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMa
 				queryIndex := batch*queryHeadCount + queryHead
 				for position := 0; position < sequenceLength; position++ {
 					outputRow := outputHeadMajor.Data[(queryIndex*sequenceLength+position)*headDimension : (queryIndex*sequenceLength+position+1)*headDimension]
-					if available == 0 || len(selection[position]) == 0 {
+					if available == 0 || len(selection) == 0 || len(selection[position]) == 0 {
 						clear(outputRow)
 						continue
 					}
@@ -542,6 +581,39 @@ func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMa
 				}
 			}
 		}
+	}
+	if attention.reuseMode != ReuseReuse {
+		share.selection = published
+	}
+}
+
+// indexerKeyWidthOf returns the cached indexer key projection width for a
+// layer's indexer (headCount*dim).
+func indexerKeyWidthOf(attention *CausalSelfAttention) int {
+	if attention.indexer == nil {
+		return 0
+	}
+	return attention.indexer.HeadCount * attention.indexer.Dim
+}
+
+// cacheReusedIndexerKeys projects any newly compressed blocks of the producing
+// layer with this reindex layer's own indexer key, so decode does not re-project
+// every shared compressed key on each step.
+func (attention *CausalSelfAttention) cacheReusedIndexerKeys(cache *KVBuffer, layer, producer, batchSize, headDimension int) {
+	if attention.indexer == nil {
+		return
+	}
+	producerCount := cache.CompressedCount(producer, 0)
+	ownCount := cache.CompressedCount(layer, 0)
+	for block := ownCount; block < producerCount; block++ {
+		for batch := 0; batch < batchSize; batch++ {
+			for head := 0; head < attention.keyValueHeadCount; head++ {
+				compressed := tensors.NewWithData([]int{1, 1, headDimension}, cache.CompressedBlock(producer, batch, head, block))
+				projected := attention.indexer.key.Forward(compressed)
+				cache.AppendIndexerKey(layer, batch, head, projected.Data)
+			}
+		}
+		cache.AdvanceCompressedCount(layer)
 	}
 }
 

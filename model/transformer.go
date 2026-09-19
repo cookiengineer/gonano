@@ -64,7 +64,7 @@ func NewTransformer(config Config) *Transformer {
 		rotarySine:     rotarySine,
 	}
 	for layerIndex := 0; layerIndex < config.NumLayer; layerIndex++ {
-		model.blocks[layerIndex] = NewBlock(config, hasValueEmbedding(layerIndex, config.NumLayer))
+		model.blocks[layerIndex] = NewBlock(config, hasValueEmbedding(layerIndex, config.NumLayer), layerIndex)
 		if hasValueEmbedding(layerIndex, config.NumLayer) {
 			model.valueEmbeds[layerIndex] = layers.NewEmbedding(paddedVocabulary, config.NumKVHead*config.HeadDim())
 		}
@@ -174,13 +174,17 @@ func (model *Transformer) Forward(indexes *tensors.Int32s, cache *KVBuffer) *ten
 	initialResidual := activations
 	backoutLayerIndex := model.Config.NumLayer / 2
 	var backoutActivation *tensors.Tensor
+	var currentShare *compressionShare
 	for layerIndex, block := range model.blocks {
 		activations = combineResidual(activations, initialResidual, model.residLambdas.Data[layerIndex], model.x0Lambdas.Data[layerIndex])
 		var valueEmbedding *tensors.Tensor
 		if embedding, ok := model.valueEmbeds[layerIndex]; ok {
 			valueEmbedding = embedding.Forward(indexes)
 		}
-		activations = block.Forward(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, positionOffset, model.windowSizes[layerIndex], cache, layerIndex)
+		if model.Config.ReuseModeAt(layerIndex) == ReuseFull {
+			currentShare = &compressionShare{producer: layerIndex}
+		}
+		activations = block.Forward(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, positionOffset, model.windowSizes[layerIndex], cache, layerIndex, currentShare)
 		if layerIndex == backoutLayerIndex {
 			backoutActivation = activations.Clone()
 		}

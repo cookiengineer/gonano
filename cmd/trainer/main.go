@@ -36,6 +36,7 @@ func main() {
 		indexerDim        int
 		indexerPool       int
 		indexerCandidates int
+		reusePattern      string
 		numIterations     int
 		batchSize         int
 		modelTag          string
@@ -55,6 +56,7 @@ func main() {
 	flag.IntVar(&indexerDim, "indexer-dim", 64, "lightning indexer per-head dimension")
 	flag.IntVar(&indexerPool, "indexer-pool", 0, "hierarchical indexer super-block size (0 disables)")
 	flag.IntVar(&indexerCandidates, "indexer-candidates", 0, "hierarchical indexer candidate budget (0 = auto)")
+	flag.StringVar(&reusePattern, "reuse-pattern", "", "cross-layer reuse pattern of F/R/U per layer (empty = all full)")
 	flag.IntVar(&numIterations, "num-iterations", 50, "optimization steps")
 	flag.IntVar(&batchSize, "device-batch-size", 1, "sequences per step")
 	flag.StringVar(&modelTag, "model-tag", "", "checkpoint directory name (default d<depth>)")
@@ -84,6 +86,7 @@ func main() {
 	configuration.IndexerDim = indexerDim
 	configuration.IndexerPool = indexerPool
 	configuration.IndexerCandidates = indexerCandidates
+	configuration.ReusePattern = reusePattern
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5)

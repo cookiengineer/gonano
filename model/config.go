@@ -41,6 +41,70 @@ type Config struct {
 	// IndexerCandidates bounds the number of entries fully scored per token by
 	// the hierarchical indexer. Zero uses 8*SparseTopK (minimum 64).
 	IndexerCandidates int `json:"indexer_candidates,omitempty"`
+	// ReusePattern enables cross-layer compressed KV/index reuse
+	// (DeepSeek-V4.1 §2.3.1). It is cycled per layer: 'F' (full) owns a
+	// compressor and produces compressed KV and, when sparse, the top-k
+	// selection; 'R' (reindex) reuses the group's compressed KV but runs its
+	// own indexer for fresh top-k; 'U' (reuse) reuses both the compressed KV
+	// and the most recently published selection. The pattern must start with
+	// 'F'. Empty or all-'F' keeps the historical all-layers-full behaviour.
+	ReusePattern string `json:"reuse_pattern,omitempty"`
+}
+
+// ReuseMode is the per-layer compressed-attention reuse role.
+type ReuseMode uint8
+
+const (
+	// ReuseFull owns a compressor/indexer and produces compressed KV/selection.
+	ReuseFull ReuseMode = iota
+	// ReuseReindex reuses the group's compressed KV, with its own selection.
+	ReuseReindex
+	// ReuseReuse reuses the group's compressed KV and selection.
+	ReuseReuse
+)
+
+// ReuseModeAt returns the reuse mode of a layer, cycling the configured
+// pattern. An empty pattern yields ReuseFull for every layer.
+func (config Config) ReuseModeAt(layer int) ReuseMode {
+	pattern := config.ReusePattern
+	if len(pattern) == 0 {
+		return ReuseFull
+	}
+	switch pattern[layer%len(pattern)] {
+	case 'R', 'r':
+		return ReuseReindex
+	case 'U', 'u':
+		return ReuseReuse
+	default:
+		return ReuseFull
+	}
+}
+
+// OwnsCompressed reports whether a layer produces its own compressed KV rather
+// than borrowing the producing layer's.
+func (config Config) OwnsCompressed(layer int) bool {
+	return config.ReuseModeAt(layer) == ReuseFull
+}
+
+// OwnsIndexer reports whether a layer owns a lightning indexer. Full and
+// reindex layers do when sparsity is enabled; pure reuse layers do not.
+func (config Config) OwnsIndexer(layer int) bool {
+	return config.SparseTopK > 0 && config.ReuseModeAt(layer) != ReuseReuse
+}
+
+// ReuseProducer returns the index of the producing full layer for a reuse
+// layer, or the layer itself when it is full. It assumes Validate has passed,
+// which guarantees at least one preceding full layer.
+func (config Config) ReuseProducer(layer int) int {
+	if config.ReuseModeAt(layer) == ReuseFull {
+		return layer
+	}
+	for index := layer - 1; index >= 0; index-- {
+		if config.ReuseModeAt(index) == ReuseFull {
+			return index
+		}
+	}
+	return layer
 }
 
 // IndexerCandidateBudget returns the hierarchical indexer candidate budget.
@@ -126,6 +190,21 @@ func (config Config) Validate() {
 	}
 	if config.SparseTopK > 0 && config.Compression() <= 1 {
 		panic("model: SparseTopK requires CompressionRatio > 1")
+	}
+	if config.ReusePattern != "" {
+		if config.Compression() <= 1 {
+			panic("model: ReusePattern requires CompressionRatio > 1")
+		}
+		for _, patternChar := range config.ReusePattern {
+			switch patternChar {
+			case 'F', 'R', 'U', 'f', 'r', 'u':
+			default:
+				panic(fmt.Sprintf("model: invalid reuse pattern %q", config.ReusePattern))
+			}
+		}
+		if config.ReuseModeAt(0) != ReuseFull {
+			panic(fmt.Sprintf("model: reuse pattern %q must start with F", config.ReusePattern))
+		}
 	}
 }
 

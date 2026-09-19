@@ -256,6 +256,7 @@ func TestSparseSelectAllMatchesDense(t *testing.T) {
 	sparseLogits, _ := transformer.TrainForward(indexes)
 	for _, block := range transformer.blocks {
 		block.attention.indexer = nil
+		block.attention.sparseTopK = 0
 	}
 	denseLogits, _ := transformer.TrainForward(indexes)
 
@@ -321,6 +322,248 @@ func TestSparseIndexerReceivesDistillationGradient(t *testing.T) {
 	}
 	if !nonZero {
 		t.Fatal("indexer parameters received no distillation gradient")
+	}
+}
+
+func TestReusePatternValidation(t *testing.T) {
+	cases := []struct {
+		name    string
+		pattern string
+		ratio   int
+	}{
+		{"reuse without compression", "FRUU", 0},
+		{"must start with full", "RU", 2},
+		{"invalid character", "FXU", 2},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			config := testConfig()
+			config.CompressionRatio = testCase.ratio
+			config.ReusePattern = testCase.pattern
+			NewTransformer(config)
+		})
+	}
+}
+
+func TestReusePatternBuilds(t *testing.T) {
+	config := testConfig()
+	config.NumLayer = 4
+	config.CompressionRatio = 2
+	config.SparseTopK = 2
+	config.IndexerDim = 4
+	config.ReusePattern = "FRUU"
+	transformer := NewTransformer(config)
+
+	modes := []ReuseMode{ReuseFull, ReuseReindex, ReuseReuse, ReuseReuse}
+	for layerIndex, want := range modes {
+		attention := transformer.blocks[layerIndex].attention
+		if attention.reuseMode != want {
+			t.Fatalf("layer %d mode = %d, want %d", layerIndex, attention.reuseMode, want)
+		}
+		if attention.producer != 0 {
+			t.Fatalf("layer %d producer = %d, want 0", layerIndex, attention.producer)
+		}
+	}
+}
+
+func TestReuseProducerFollowsLaterFullLayers(t *testing.T) {
+	// Pattern F F R U: layers 0 and 1 are full; layer 1 produces for layers 2-3.
+	config := testConfig()
+	config.NumLayer = 4
+	config.CompressionRatio = 2
+	config.SparseTopK = 2
+	config.IndexerDim = 4
+	config.ReusePattern = "FFRU"
+	transformer := NewTransformer(config)
+
+	if producer := transformer.blocks[2].attention.producer; producer != 1 {
+		t.Fatalf("layer 2 producer = %d, want 1", producer)
+	}
+	if producer := transformer.blocks[3].attention.producer; producer != 1 {
+		t.Fatalf("layer 3 producer = %d, want 1", producer)
+	}
+}
+
+func TestReuseCompressedTrainStepFinite(t *testing.T) {
+	config := testConfig()
+	config.NumLayer = 4
+	config.CompressionRatio = 2
+	config.SparseTopK = 2
+	config.IndexerDim = 4
+	config.ReusePattern = "FRUU"
+	transformer := NewTransformer(config)
+	transformer.InitWeights(tensors.NewRNG(42))
+	indexes, targets := tinyData()
+
+	logits, context := transformer.TrainForward(indexes)
+	for _, value := range logits.Data {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			t.Fatalf("non-finite logit %v", value)
+		}
+	}
+	flattened := logits.Reshape(indexes.Numel(), config.VocabSize)
+	_, valid := tensors.CrossEntropyPerPosition(flattened, targets.Reshape(indexes.Numel()), -1)
+	gradLogits := tensors.CrossEntropyGrad(flattened, targets.Reshape(indexes.Numel()), -1, 1/float32(valid))
+	transformer.TrainBackward(context, gradLogits.Reshape(indexes.Shape[0], indexes.Shape[1], config.VocabSize))
+	for _, parameter := range transformer.Parameters() {
+		for _, value := range parameter.Grad {
+			if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+				t.Fatalf("non-finite gradient")
+			}
+		}
+	}
+}
+
+// TestReuseMultiGroupTrainStepFinite exercises patterns with more than one full
+// producer group, ensuring each group's share state is independent.
+func TestReuseMultiGroupTrainStepFinite(t *testing.T) {
+	for _, pattern := range []string{"FFRU", "FRFR", "FRUR"} {
+		t.Run(pattern, func(t *testing.T) {
+			config := testConfig()
+			config.NumLayer = 4
+			config.CompressionRatio = 2
+			config.SparseTopK = 2
+			config.IndexerDim = 4
+			config.ReusePattern = pattern
+			transformer := NewTransformer(config)
+			transformer.InitWeights(tensors.NewRNG(42))
+			indexes, targets := tinyData()
+
+			transformer.ZeroGrad()
+			logits, context := transformer.TrainForward(indexes)
+			flattened := logits.Reshape(indexes.Numel(), config.VocabSize)
+			_, valid := tensors.CrossEntropyPerPosition(flattened, targets.Reshape(indexes.Numel()), -1)
+			gradLogits := tensors.CrossEntropyGrad(flattened, targets.Reshape(indexes.Numel()), -1, 1/float32(valid))
+			transformer.TrainBackward(context, gradLogits.Reshape(indexes.Shape[0], indexes.Shape[1], config.VocabSize))
+			for _, parameter := range transformer.Parameters() {
+				for _, value := range parameter.Grad {
+					if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+						t.Fatalf("non-finite gradient")
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestReuseLayersReceiveQueryGradient verifies reuse layers still train their
+// own query projection even though they borrow the producing layer's KV. The
+// fixture perturbs the zero-initialized projections so the gradient signal
+// reaches the attention input.
+func TestReuseLayersReceiveQueryGradient(t *testing.T) {
+	transformer := tinyReuseModel()
+	indexes, targets := tinyData()
+
+	analyticGrads(transformer, indexes, targets)
+
+	for _, layerIndex := range []int{1, 2, 3} {
+		gradient := transformer.blocks[layerIndex].attention.queryProjection.Weight.Grad
+		nonZero := false
+		for _, value := range gradient {
+			if value != 0 {
+				nonZero = true
+				break
+			}
+		}
+		if !nonZero {
+			t.Fatalf("layer %d query projection received no gradient", layerIndex)
+		}
+	}
+}
+
+func TestReuseReducesParameters(t *testing.T) {
+	base := testConfig()
+	base.NumLayer = 4
+	base.CompressionRatio = 2
+	base.SparseTopK = 2
+	base.IndexerDim = 4
+	full := NewTransformer(base)
+
+	reuseConfig := base
+	reuseConfig.ReusePattern = "FRUU"
+	reuse := NewTransformer(reuseConfig)
+
+	if reuse.TotalParams() >= full.TotalParams() {
+		t.Fatalf("reuse params %d must be fewer than full params %d", reuse.TotalParams(), full.TotalParams())
+	}
+	if reuse.blocks[0].attention.compressor == nil || reuse.blocks[0].attention.indexer == nil {
+		t.Fatal("full layer should own a compressor and indexer")
+	}
+	if reuse.blocks[1].attention.compressor != nil || reuse.blocks[1].attention.indexer == nil {
+		t.Fatal("reindex layer should own an indexer but no compressor")
+	}
+	for _, layerIndex := range []int{2, 3} {
+		if reuse.blocks[layerIndex].attention.compressor != nil || reuse.blocks[layerIndex].attention.indexer != nil {
+			t.Fatalf("reuse layer %d should own neither compressor nor indexer", layerIndex)
+		}
+	}
+}
+
+func TestReuseCacheAllocation(t *testing.T) {
+	config := testConfig()
+	config.NumLayer = 4
+	config.CompressionRatio = 2
+	config.SparseTopK = 2
+	config.IndexerDim = 4
+	config.ReusePattern = "FRUU"
+
+	cache := NewKVBuffer(1, 16, config.NumLayer, config.NumKVHead, config.HeadDim())
+	compressionMask := make([]bool, config.NumLayer)
+	indexerMask := make([]bool, config.NumLayer)
+	for layer := 0; layer < config.NumLayer; layer++ {
+		compressionMask[layer] = config.OwnsCompressed(layer)
+		indexerMask[layer] = config.OwnsIndexer(layer)
+	}
+	cache.EnableCompressionLayers(2, config.EmbedDim, config.NumKVHead*config.HeadDim(), 8, compressionMask)
+	cache.EnableIndexerKeysLayers(config.IndexerDim, indexerMask)
+
+	if cache.compressedKey[0] == nil {
+		t.Fatal("full layer should own compressed KV")
+	}
+	for _, layerIndex := range []int{1, 2, 3} {
+		if cache.compressedKey[layerIndex] != nil {
+			t.Fatalf("layer %d should not own compressed KV", layerIndex)
+		}
+	}
+	if cache.indexerKey[0] == nil || cache.indexerKey[1] == nil {
+		t.Fatal("full and reindex layers should cache indexer keys")
+	}
+	if cache.indexerKey[2] != nil || cache.indexerKey[3] != nil {
+		t.Fatal("reuse layers should not cache indexer keys")
+	}
+}
+
+func TestReuseReducesCompressedCacheBytes(t *testing.T) {
+	config := testConfig()
+	config.NumLayer = 4
+	config.CompressionRatio = 2
+	config.SparseTopK = 2
+	config.IndexerDim = 4
+
+	newCache := func(pattern string) *KVBuffer {
+		current := config
+		current.ReusePattern = pattern
+		cache := NewKVBuffer(1, 16, current.NumLayer, current.NumKVHead, current.HeadDim())
+		compressionMask := make([]bool, current.NumLayer)
+		indexerMask := make([]bool, current.NumLayer)
+		for layer := 0; layer < current.NumLayer; layer++ {
+			compressionMask[layer] = current.OwnsCompressed(layer)
+			indexerMask[layer] = current.OwnsIndexer(layer)
+		}
+		cache.EnableCompressionLayers(2, current.EmbedDim, current.NumKVHead*current.HeadDim(), 8, compressionMask)
+		cache.EnableIndexerKeysLayers(current.IndexerDim, indexerMask)
+		return cache
+	}
+
+	full := newCache("")
+	reuse := newCache("FRUU")
+	if reuse.CompressedBytesAllocated() >= full.CompressedBytesAllocated() {
+		t.Fatalf("reuse cache %d bytes must be fewer than full %d", reuse.CompressedBytesAllocated(), full.CompressedBytesAllocated())
 	}
 }
 

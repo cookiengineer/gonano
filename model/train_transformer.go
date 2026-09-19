@@ -46,6 +46,7 @@ func (model *Transformer) TrainForward(indexes *tensors.Int32s) (*tensors.Tensor
 
 	backoutLayerIndex := model.Config.NumLayer / 2
 	var backoutActivations *tensors.Tensor
+	var currentShare *compressionShare
 	for layerIndex, block := range model.blocks {
 		context.previousActivations = append(context.previousActivations, activations)
 		activations = combineResidual(activations, initialResidual, model.residLambdas.Data[layerIndex], model.x0Lambdas.Data[layerIndex])
@@ -54,8 +55,11 @@ func (model *Transformer) TrainForward(indexes *tensors.Int32s) (*tensors.Tensor
 			valueEmbedding = embedding.Forward(indexes)
 			context.valueEmbeddings[layerIndex] = valueEmbedding
 		}
+		if model.Config.ReuseModeAt(layerIndex) == ReuseFull {
+			currentShare = &compressionShare{producer: layerIndex}
+		}
 		var blockCtx *blockContext
-		activations, blockCtx = block.forwardTraining(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, 0, model.windowSizes[layerIndex])
+		activations, blockCtx = block.forwardTraining(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, 0, model.windowSizes[layerIndex], currentShare)
 		context.blockContexts = append(context.blockContexts, blockCtx)
 		if layerIndex == backoutLayerIndex {
 			backoutActivations = activations.Clone()
