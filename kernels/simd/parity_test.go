@@ -198,6 +198,93 @@ func TestAttentionParityLarge(t *testing.T) {
 	kerneltest.AssertSlicesClose(t, gotLogSumExp, wantLogSumExp, 5e-3, 1e-5)
 }
 
+// splitAttention runs split-K forward + combine through a backend.
+func splitAttention(backend kernels.Backend, parameters kernels.AttentionForwardParameters, splits int) ([]float32, []float32) {
+	output := make([]float32, parameters.QueryLength*parameters.HeadDim)
+	logSumExp := make([]float32, parameters.QueryLength)
+	partials := make([]kernels.AttentionSplitResult, splits)
+	keysPerSplit := (parameters.KeyLength + splits - 1) / splits
+	for split := 0; split < splits; split++ {
+		keyStart := split * keysPerSplit
+		keyEnd := min(keyStart+keysPerSplit, parameters.KeyLength)
+		partial := kernels.AttentionSplitResult{
+			Accumulator: make([]float32, parameters.QueryLength*parameters.HeadDim),
+			Maximum:     make([]float32, parameters.QueryLength),
+			Sum:         make([]float32, parameters.QueryLength),
+		}
+		backend.AttentionForwardSplit(kernels.AttentionSplitParameters{
+			Query:          parameters.Query,
+			Key:            parameters.Key,
+			Value:          parameters.Value,
+			QueryLength:    parameters.QueryLength,
+			KeyLength:      parameters.KeyLength,
+			HeadDim:        parameters.HeadDim,
+			PositionOffset: parameters.PositionOffset,
+			Window:         parameters.Window,
+			KeyStart:       keyStart,
+			KeyEnd:         keyEnd,
+		}, partial)
+		partials[split] = partial
+	}
+	backend.AttentionCombine(
+		kernels.AttentionCombineParameters{Partials: partials, QueryLength: parameters.QueryLength, HeadDim: parameters.HeadDim},
+		kernels.AttentionForwardResult{Output: output, LogSumExp: logSumExp},
+	)
+	return output, logSumExp
+}
+
+// TestAttentionSplitParity verifies that split-K shards recombine to the same
+// result as the single-pass flash attention, for both the SIMD and scalar
+// backends, across causal, decode, and sliding-window shapes.
+func TestAttentionSplitParity(t *testing.T) {
+	simdBackend := simdbackend.New()
+	scalarBackend := scalar.New()
+	cases := []struct {
+		name           string
+		queryLength    int
+		keyLength      int
+		headDim        int
+		positionOffset int
+		window         int
+	}{
+		{"causal", 6, 6, 8, 0, -1},
+		{"decode", 1, 10, 8, 9, -1},
+		{"sliding", 6, 6, 8, 0, 2},
+		{"sliding-decode", 1, 10, 4, 9, 3},
+		{"wide-head", 5, 5, 16, 0, -1},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			query := kerneltest.Data(testCase.queryLength * testCase.headDim)
+			key := kerneltest.Data(testCase.keyLength * testCase.headDim)
+			value := kerneltest.DataB(testCase.keyLength * testCase.headDim)
+			parameters := kernels.AttentionForwardParameters{
+				Query:          query,
+				Key:            key,
+				Value:          value,
+				QueryLength:    testCase.queryLength,
+				KeyLength:      testCase.keyLength,
+				HeadDim:        testCase.headDim,
+				PositionOffset: testCase.positionOffset,
+				Window:         testCase.window,
+			}
+			reference := make([]float32, testCase.queryLength*testCase.headDim)
+			referenceLogSumExp := make([]float32, testCase.queryLength)
+			scalarBackend.AttentionForward(parameters, kernels.AttentionForwardResult{Output: reference, LogSumExp: referenceLogSumExp})
+
+			for _, splits := range []int{1, 2, 3, 5, testCase.keyLength} {
+				simdOutput, simdLogSumExp := splitAttention(simdBackend, parameters, splits)
+				kerneltest.AssertSlicesClose(t, simdOutput, reference, 5e-3, 1e-5)
+				kerneltest.AssertSlicesClose(t, simdLogSumExp, referenceLogSumExp, 5e-3, 1e-5)
+
+				scalarOutput, scalarLogSumExp := splitAttention(scalarBackend, parameters, splits)
+				kerneltest.AssertSlicesClose(t, scalarOutput, reference, 2e-4, 1e-5)
+				kerneltest.AssertSlicesClose(t, scalarLogSumExp, referenceLogSumExp, 2e-4, 1e-5)
+			}
+		})
+	}
+}
+
 // TestAttentionParity verifies the attention forward and backward against the
 // scalar reference across decode, sliding-window, and full-causal shapes.
 func TestAttentionParity(t *testing.T) {

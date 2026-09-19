@@ -24,30 +24,102 @@ const (
 // accumulator are live, so peak memory is independent of sequence length.
 func (backend *Backend) AttentionForward(parameters kernels.AttentionForwardParameters, result kernels.AttentionForwardResult) {
 	queryLength := parameters.QueryLength
-	keyLength := parameters.KeyLength
 	headDim := parameters.HeadDim
 
+	maximum := make([]float32, queryLength)
+	for row := range maximum {
+		maximum[row] = float32(math.Inf(-1))
+	}
+	total := make([]float32, queryLength)
+	accumulator := make([]float32, queryLength*headDim)
+
+	attentionForwardRange(parameters.Query, parameters.Key, parameters.Value, queryLength, headDim,
+		parameters.PositionOffset, parameters.Window, 0, parameters.KeyLength, maximum, total, accumulator)
+
+	for row := 0; row < queryLength; row++ {
+		accumulatorRow := accumulator[row*headDim : (row+1)*headDim]
+		scaleCore(accumulatorRow, accumulatorRow, float32(1.0/total[row]))
+		copy(result.Output[row*headDim:], accumulatorRow)
+		if result.LogSumExp != nil {
+			result.LogSumExp[row] = maximum[row] + float32(math.Log(float64(total[row])))
+		}
+	}
+}
+
+// AttentionForwardSplit computes the unnormalized output and softmax
+// statistics for the key shard [KeyStart, KeyEnd) of a (batch, head). The
+// result slices must be pre-sized to [QueryLength, HeadDim] (accumulator) and
+// [QueryLength] (maximum, sum); they are overwritten.
+func (backend *Backend) AttentionForwardSplit(parameters kernels.AttentionSplitParameters, result kernels.AttentionSplitResult) {
+	queryLength := parameters.QueryLength
+	headDim := parameters.HeadDim
+	for row := 0; row < queryLength; row++ {
+		result.Maximum[row] = float32(math.Inf(-1))
+	}
+	clear(result.Sum)
+	clear(result.Accumulator)
+	attentionForwardRange(parameters.Query, parameters.Key, parameters.Value, queryLength, headDim,
+		parameters.PositionOffset, parameters.Window, parameters.KeyStart, parameters.KeyEnd,
+		result.Maximum, result.Sum, result.Accumulator)
+}
+
+// AttentionCombine merges per-shard statistics into the normalized output and
+// optional log-sum-exp, using the standard flash-attention reduction.
+func (backend *Backend) AttentionCombine(parameters kernels.AttentionCombineParameters, result kernels.AttentionForwardResult) {
+	queryLength := parameters.QueryLength
+	headDim := parameters.HeadDim
+	for row := 0; row < queryLength; row++ {
+		globalMaximum := float32(math.Inf(-1))
+		for _, partial := range parameters.Partials {
+			if partial.Maximum[row] > globalMaximum {
+				globalMaximum = partial.Maximum[row]
+			}
+		}
+		var total float64
+		outputRow := result.Output[row*headDim : (row+1)*headDim]
+		clear(outputRow)
+		for _, partial := range parameters.Partials {
+			scale := float32(0)
+			if partial.Maximum[row] > float32(math.Inf(-1)) {
+				scale = float32(math.Exp(float64(partial.Maximum[row] - globalMaximum)))
+			}
+			total += float64(partial.Sum[row]) * float64(scale)
+			accumulatorRow := partial.Accumulator[row*headDim : (row+1)*headDim]
+			for dimension := 0; dimension < headDim; dimension++ {
+				outputRow[dimension] += accumulatorRow[dimension] * scale
+			}
+		}
+		if total > 0 {
+			inverse := float32(1.0 / total)
+			for dimension := 0; dimension < headDim; dimension++ {
+				outputRow[dimension] *= inverse
+			}
+		}
+		if result.LogSumExp != nil {
+			result.LogSumExp[row] = globalMaximum + float32(math.Log(total))
+		}
+	}
+}
+
+// attentionForwardRange accumulates the flash-attention statistics for the key
+// range [keyStartBound, keyEndBound) into the caller-provided maximum, sum, and
+// accumulator. maximum must be initialized to -Inf and sum/accumulator zeroed.
+func attentionForwardRange(query, key, value []float32, queryLength, headDim, positionOffset, window, keyStartBound, keyEndBound int, maximum, sum, accumulator []float32) {
 	scoreTile := make([]float32, queryBlockSize*keyBlockSize)
 	for queryStart := 0; queryStart < queryLength; queryStart += queryBlockSize {
 		queryEnd := min(queryStart+queryBlockSize, queryLength)
 		blockRows := queryEnd - queryStart
 
-		runningMaximum := make([]float32, blockRows)
-		runningSum := make([]float32, blockRows)
-		accumulator := make([]float32, blockRows*headDim)
-		for row := 0; row < blockRows; row++ {
-			runningMaximum[row] = float32(math.Inf(-1))
-		}
-
-		for keyStart := 0; keyStart < keyLength; keyStart += keyBlockSize {
-			keyEnd := min(keyStart+keyBlockSize, keyLength)
+		for keyStart := keyStartBound; keyStart < keyEndBound; keyStart += keyBlockSize {
+			keyEnd := min(keyStart+keyBlockSize, keyEndBound)
 			blockColumns := keyEnd - keyStart
-			computeMaskedScoreTile(scoreTile, parameters, queryStart, keyStart, blockRows, blockColumns)
+			computeMaskedScoreTile(scoreTile, query, key, queryLength, headDim, positionOffset, window, queryStart, keyStart, blockRows, blockColumns)
 
 			for row := 0; row < blockRows; row++ {
+				globalRow := queryStart + row
 				rowScores := scoreTile[row*keyBlockSize : row*keyBlockSize+blockColumns]
 				blockMaximum := maxCore(rowScores)
-				previousMaximum := runningMaximum[row]
+				previousMaximum := maximum[globalRow]
 				newMaximum := previousMaximum
 				if blockMaximum > newMaximum {
 					newMaximum = blockMaximum
@@ -56,8 +128,8 @@ func (backend *Backend) AttentionForward(parameters kernels.AttentionForwardPara
 				// Rescale the running statistics and accumulator to the new
 				// maximum. exp(-Inf) is zero, so the first block starts clean.
 				rescale := float32(math.Exp(float64(previousMaximum - newMaximum)))
-				runningSum[row] *= rescale
-				accumulatorRow := accumulator[row*headDim : (row+1)*headDim]
+				sum[globalRow] *= rescale
+				accumulatorRow := accumulator[globalRow*headDim : (globalRow+1)*headDim]
 				scaleCore(accumulatorRow, accumulatorRow, rescale)
 
 				var blockSum float64
@@ -66,26 +138,17 @@ func (backend *Backend) AttentionForward(parameters kernels.AttentionForwardPara
 					rowScores[column] = probability
 					blockSum += float64(probability)
 				}
-				runningSum[row] += float32(blockSum)
+				sum[globalRow] += float32(blockSum)
 
 				for column := 0; column < blockColumns; column++ {
 					probability := rowScores[column]
 					if probability == 0 {
 						continue
 					}
-					valueRow := parameters.Value[(keyStart+column)*headDim : (keyStart+column+1)*headDim]
+					valueRow := value[(keyStart+column)*headDim : (keyStart+column+1)*headDim]
 					addScaledCore(accumulatorRow, accumulatorRow, valueRow, probability)
 				}
-				runningMaximum[row] = newMaximum
-			}
-		}
-
-		for row := 0; row < blockRows; row++ {
-			accumulatorRow := accumulator[row*headDim : (row+1)*headDim]
-			scaleCore(accumulatorRow, accumulatorRow, float32(1.0/runningSum[row]))
-			copy(result.Output[(queryStart+row)*headDim:], accumulatorRow)
-			if result.LogSumExp != nil {
-				result.LogSumExp[queryStart+row] = runningMaximum[row] + float32(math.Log(float64(runningSum[row])))
+				maximum[globalRow] = newMaximum
 			}
 		}
 	}
@@ -93,24 +156,18 @@ func (backend *Backend) AttentionForward(parameters kernels.AttentionForwardPara
 
 // computeMaskedScoreTile fills the [blockRows, keyBlockSize] score tile with
 // Query @ Key^T values, replacing disallowed positions with the mask constant.
-func computeMaskedScoreTile(scoreTile []float32, parameters kernels.AttentionForwardParameters, queryStart, keyStart, blockRows, blockColumns int) {
-	queryLength := parameters.QueryLength
-	keyLength := parameters.KeyLength
-	headDim := parameters.HeadDim
+func computeMaskedScoreTile(scoreTile, query, key []float32, queryLength, headDim, positionOffset, window, queryStart, keyStart, blockRows, blockColumns int) {
 	for row := 0; row < blockRows; row++ {
 		queryIndex := queryStart + row
 		if queryIndex >= queryLength {
 			break
 		}
-		queryPosition := parameters.PositionOffset + queryIndex
-		queryRow := parameters.Query[queryIndex*headDim : (queryIndex+1)*headDim]
+		queryPosition := positionOffset + queryIndex
+		queryRow := query[queryIndex*headDim : (queryIndex+1)*headDim]
 		for column := 0; column < blockColumns; column++ {
 			keyIndex := keyStart + column
-			if keyIndex >= keyLength {
-				break
-			}
-			score := dotProduct(queryRow, parameters.Key[keyIndex*headDim:(keyIndex+1)*headDim], headDim)
-			if keyIndex > queryPosition || (parameters.Window >= 0 && queryPosition-keyIndex > parameters.Window) {
+			score := dotProduct(queryRow, key[keyIndex*headDim:(keyIndex+1)*headDim], headDim)
+			if keyIndex > queryPosition || (window >= 0 && queryPosition-keyIndex > window) {
 				score = maskedAttentionScore
 			}
 			scoreTile[row*keyBlockSize+column] = score

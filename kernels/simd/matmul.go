@@ -6,16 +6,13 @@ import (
 	"github.com/cookiengineer/gonano/internal/parallel"
 )
 
-// rowBlockSize and columnBlockSize control cache reuse of the right operand
-// across rows of the left operand.
-const (
-	rowBlockSize    = 64
-	columnBlockSize = 64
-)
+// columnBlockSize controls how many output columns each worker computes when
+// MatMulTransposed partitions by column (small row counts).
+const columnBlockSize = 64
 
 // MatMul computes destination = left @ right, where left is
 // [rowCount, innerCount] and right is [innerCount, columnCount]. It uses rank-1
-// updates vectorized over columns and parallelized over row blocks.
+// updates vectorized over columns and parallelized over row chunks.
 func (backend *Backend) MatMul(destination, left, right []float32, rowCount, columnCount, innerCount int) {
 	matMulCore(destination, left, right, rowCount, columnCount, innerCount)
 }
@@ -23,11 +20,7 @@ func (backend *Backend) MatMul(destination, left, right []float32, rowCount, col
 // matMulCore holds the vectorized body of MatMul, for the same compiler reason
 // as addCore in elementwise.go.
 func matMulCore(destination, left, right []float32, rowCount, columnCount, innerCount int) {
-	numberRowBlocks := (rowCount + rowBlockSize - 1) / rowBlockSize
-	parallel.Default().For(0, numberRowBlocks, func(blockIndex int) {
-		rowStart := blockIndex * rowBlockSize
-		rowEnd := min(rowStart+rowBlockSize, rowCount)
-
+	parallel.KernelPool().Chunks(0, rowCount, func(rowStart, rowEnd int) {
 		for row := rowStart; row < rowEnd; row++ {
 			clear(destination[row*columnCount : (row+1)*columnCount])
 		}
@@ -53,21 +46,36 @@ func matMulCore(destination, left, right []float32, rowCount, columnCount, inner
 
 // MatMulTransposed computes destination = left @ right^T, where left is
 // [rowCount, innerCount] and right is [columnCount, innerCount]. It is
-// vectorized over the inner dimension and parallelized over row blocks.
+// vectorized over the inner dimension.
+//
+// Parallelization adapts to the shape. With enough rows (the training/prefill
+// case) it partitions rows, so each row reads the full weight matrix once and
+// the left operand is streamed once. With few rows (small decode batches) it
+// partitions output columns instead, so batched decode still fans out across
+// cores instead of leaving the whole matmul on one.
 func (backend *Backend) MatMulTransposed(destination, left, right []float32, rowCount, columnCount, innerCount int) {
-	numberRowBlocks := (rowCount + rowBlockSize - 1) / rowBlockSize
-	parallel.Default().For(0, numberRowBlocks, func(blockIndex int) {
-		rowStart := blockIndex * rowBlockSize
-		rowEnd := min(rowStart+rowBlockSize, rowCount)
-
-		for columnStart := 0; columnStart < columnCount; columnStart += columnBlockSize {
-			columnEnd := min(columnStart+columnBlockSize, columnCount)
+	pool := parallel.KernelPool()
+	if rowCount >= pool.Workers() {
+		pool.Chunks(0, rowCount, func(rowStart, rowEnd int) {
 			for row := rowStart; row < rowEnd; row++ {
 				leftRow := left[row*innerCount:]
 				destinationRow := destination[row*columnCount:]
-				for column := columnStart; column < columnEnd; column++ {
+				for column := 0; column < columnCount; column++ {
 					destinationRow[column] = dotProduct(leftRow, right[column*innerCount:], innerCount)
 				}
+			}
+		})
+		return
+	}
+	numberColumnBlocks := (columnCount + columnBlockSize - 1) / columnBlockSize
+	pool.For(0, numberColumnBlocks, func(blockIndex int) {
+		columnStart := blockIndex * columnBlockSize
+		columnEnd := min(columnStart+columnBlockSize, columnCount)
+		for row := 0; row < rowCount; row++ {
+			leftRow := left[row*innerCount:]
+			destinationRow := destination[row*columnCount:]
+			for column := columnStart; column < columnEnd; column++ {
+				destinationRow[column] = dotProduct(leftRow, right[column*innerCount:], innerCount)
 			}
 		}
 	})

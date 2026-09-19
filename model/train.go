@@ -34,6 +34,8 @@ type attentionContext struct {
 	valueGateSigmoid       *tensors.Tensor // [B,T,Hkv] sigmoid gate output (pre *3), nil if no value embedding
 	valueEmbedding         *tensors.Tensor // [B,T,Hkv,D] value embedding, nil if none
 	valueEmbeddingGradient *tensors.Tensor // [B,T,Hkv,D] gradient wrt the value embedding (set by backward)
+
+	compression *compressedContext // non-nil on HCA-style compressed layers
 }
 
 // forwardTraining runs the attention forward while saving activations. The
@@ -76,15 +78,20 @@ func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cos
 	outputHeadMajor := tensors.New(batchSize, attention.queryHeadCount, sequenceLength, headDimension)
 	logSumExp := tensors.New(batchSize, attention.queryHeadCount, sequenceLength)
 
-	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
-		for queryHead := 0; queryHead < attention.queryHeadCount; queryHead++ {
-			keyValueHead := queryHead / headRatio
-			queryHeadData := headSlice(queryHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
-			keyHeadData := headSlice(keyHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
-			valueHeadData := headSlice(valueHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
-			outputHeadData := headSlice(outputHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
-			logSumExpHead := headSlice(logSumExp.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, 1)
-			tensors.AttentionForward(queryHeadData, keyHeadData, valueHeadData, outputHeadData, logSumExpHead, sequenceLength, sequenceLength, headDimension, positionOffset, window[0])
+	if attention.compressor != nil {
+		context.compression = compressForward(attention.compressor, input, keyHeadMajor, valueHeadMajor, attention.compressionRatio)
+		compressedAttentionForward(queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed, outputHeadMajor, logSumExp, headRatio, attention.compressionRatio)
+	} else {
+		for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+			for queryHead := 0; queryHead < attention.queryHeadCount; queryHead++ {
+				keyValueHead := queryHead / headRatio
+				queryHeadData := headSlice(queryHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
+				keyHeadData := headSlice(keyHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
+				valueHeadData := headSlice(valueHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
+				outputHeadData := headSlice(outputHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
+				logSumExpHead := headSlice(logSumExp.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, 1)
+				tensors.AttentionForward(queryHeadData, keyHeadData, valueHeadData, outputHeadData, logSumExpHead, sequenceLength, sequenceLength, headDimension, positionOffset, window[0])
+			}
 		}
 	}
 	context.logSumExp = logSumExp
@@ -109,23 +116,34 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 	gradientOutputHeadMajor = toBatchHeadLayout(gradientOutputHeadMajor)
 
 	gradientQuery := tensors.New(batchSize, attention.queryHeadCount, sequenceLength, headDimension)
-	gradientKey := tensors.New(batchSize, attention.keyValueHeadCount, sequenceLength, headDimension)
-	gradientValue := tensors.New(batchSize, attention.keyValueHeadCount, sequenceLength, headDimension)
+	var gradientKey, gradientValue *tensors.Tensor
+	var gradientInputFromCompressor *tensors.Tensor
+	if attention.compressor != nil {
+		blocks := context.compression.blocks
+		gradientKeyCompressed := tensors.New(batchSize, attention.keyValueHeadCount, blocks, headDimension)
+		gradientValueCompressed := tensors.New(batchSize, attention.keyValueHeadCount, blocks, headDimension)
+		compressedAttentionBackward(context.queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed,
+			context.outputHeadMajor, gradientOutputHeadMajor, context.logSumExp,
+			gradientQuery, gradientKeyCompressed, gradientValueCompressed, headRatio, attention.compressionRatio)
+		gradientInputFromCompressor, gradientKey, gradientValue = compressBackward(attention.compressor, context.compression, gradientKeyCompressed, gradientValueCompressed)
+	} else {
+		gradientKey = tensors.New(batchSize, attention.keyValueHeadCount, sequenceLength, headDimension)
+		gradientValue = tensors.New(batchSize, attention.keyValueHeadCount, sequenceLength, headDimension)
+		for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+			for queryHead := 0; queryHead < attention.queryHeadCount; queryHead++ {
+				keyValueHead := queryHead / headRatio
+				queryHeadData := headSlice(context.queryHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
+				keyHeadData := headSlice(context.keyHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
+				valueHeadData := headSlice(context.valueHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
+				outputHeadData := headSlice(context.outputHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
+				outputGradientHeadData := headSlice(gradientOutputHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
+				logSumExpHead := headSlice(context.logSumExp.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, 1)
+				queryGradientHead := headSlice(gradientQuery.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
+				keyGradientHead := headSlice(gradientKey.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
+				valueGradientHead := headSlice(gradientValue.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
 
-	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
-		for queryHead := 0; queryHead < attention.queryHeadCount; queryHead++ {
-			keyValueHead := queryHead / headRatio
-			queryHeadData := headSlice(context.queryHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
-			keyHeadData := headSlice(context.keyHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
-			valueHeadData := headSlice(context.valueHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
-			outputHeadData := headSlice(context.outputHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
-			outputGradientHeadData := headSlice(gradientOutputHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
-			logSumExpHead := headSlice(context.logSumExp.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, 1)
-			queryGradientHead := headSlice(gradientQuery.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
-			keyGradientHead := headSlice(gradientKey.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
-			valueGradientHead := headSlice(gradientValue.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
-
-			tensors.AttentionBackward(queryHeadData, keyHeadData, valueHeadData, outputHeadData, outputGradientHeadData, logSumExpHead, queryGradientHead, keyGradientHead, valueGradientHead, sequenceLength, sequenceLength, headDimension, positionOffset, context.window)
+				tensors.AttentionBackward(queryHeadData, keyHeadData, valueHeadData, outputHeadData, outputGradientHeadData, logSumExpHead, queryGradientHead, keyGradientHead, valueGradientHead, sequenceLength, sequenceLength, headDimension, positionOffset, context.window)
+			}
 		}
 	}
 
@@ -185,6 +203,11 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 
 	// value projection gradient (gradientValue flows through valueProjection).
 	gradientInput = tensors.Add(gradientInput, attention.valueProjection.Backward(input, gradientValueSequence.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount*attention.headDimension)))
+
+	// The compressor logit projection reads the attention input directly.
+	if gradientInputFromCompressor != nil {
+		gradientInput = tensors.Add(gradientInput, gradientInputFromCompressor)
+	}
 
 	return gradientInput
 }

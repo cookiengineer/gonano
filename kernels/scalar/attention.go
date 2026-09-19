@@ -48,6 +48,94 @@ func (backend *Backend) AttentionForward(parameters kernels.AttentionForwardPara
 	}
 }
 
+// AttentionForwardSplit computes the unnormalized output and softmax
+// statistics for the key shard [KeyStart, KeyEnd) of a (batch, head). This is
+// the scalar reference for split-K (flash-decoding) attention.
+func (backend *Backend) AttentionForwardSplit(parameters kernels.AttentionSplitParameters, result kernels.AttentionSplitResult) {
+	queryLength := parameters.QueryLength
+	headDim := parameters.HeadDim
+	keyStart := parameters.KeyStart
+	keyEnd := parameters.KeyEnd
+	if keyEnd > parameters.KeyLength {
+		keyEnd = parameters.KeyLength
+	}
+	rangeLength := keyEnd - keyStart
+	if rangeLength < 0 {
+		rangeLength = 0
+	}
+
+	for queryIndex := 0; queryIndex < queryLength; queryIndex++ {
+		queryRow := parameters.Query[queryIndex*headDim : (queryIndex+1)*headDim]
+		queryPosition := parameters.PositionOffset + queryIndex
+		accumulatorRow := result.Accumulator[queryIndex*headDim : (queryIndex+1)*headDim]
+		clear(accumulatorRow)
+
+		maximum := float32(math.Inf(-1))
+		scores := make([]float32, rangeLength)
+		for column := 0; column < rangeLength; column++ {
+			keyIndex := keyStart + column
+			score := backend.DotProduct(queryRow, parameters.Key[keyIndex*headDim:(keyIndex+1)*headDim])
+			if keyIndex > queryPosition || (parameters.Window >= 0 && queryPosition-keyIndex > parameters.Window) {
+				score = maskedAttentionScore
+			}
+			scores[column] = score
+			if score > maximum {
+				maximum = score
+			}
+		}
+
+		var total float64
+		for column := 0; column < rangeLength; column++ {
+			probability := math.Exp(float64(scores[column] - maximum))
+			total += probability
+			valueRow := parameters.Value[(keyStart+column)*headDim : (keyStart+column+1)*headDim]
+			for dimension := 0; dimension < headDim; dimension++ {
+				accumulatorRow[dimension] += float32(probability) * valueRow[dimension]
+			}
+		}
+		result.Maximum[queryIndex] = maximum
+		result.Sum[queryIndex] = float32(total)
+	}
+}
+
+// AttentionCombine merges per-shard statistics into the normalized output and
+// optional log-sum-exp, using the standard flash-attention reduction.
+func (backend *Backend) AttentionCombine(parameters kernels.AttentionCombineParameters, result kernels.AttentionForwardResult) {
+	queryLength := parameters.QueryLength
+	headDim := parameters.HeadDim
+	for queryIndex := 0; queryIndex < queryLength; queryIndex++ {
+		globalMaximum := float32(math.Inf(-1))
+		for _, partial := range parameters.Partials {
+			if partial.Maximum[queryIndex] > globalMaximum {
+				globalMaximum = partial.Maximum[queryIndex]
+			}
+		}
+		var total float64
+		outputRow := result.Output[queryIndex*headDim : (queryIndex+1)*headDim]
+		clear(outputRow)
+		for _, partial := range parameters.Partials {
+			scale := float32(0)
+			if partial.Maximum[queryIndex] > float32(math.Inf(-1)) {
+				scale = float32(math.Exp(float64(partial.Maximum[queryIndex] - globalMaximum)))
+			}
+			total += float64(partial.Sum[queryIndex]) * float64(scale)
+			accumulatorRow := partial.Accumulator[queryIndex*headDim : (queryIndex+1)*headDim]
+			for dimension := 0; dimension < headDim; dimension++ {
+				outputRow[dimension] += accumulatorRow[dimension] * scale
+			}
+		}
+		if total > 0 {
+			inverse := float32(1.0 / total)
+			for dimension := 0; dimension < headDim; dimension++ {
+				outputRow[dimension] *= inverse
+			}
+		}
+		if result.LogSumExp != nil {
+			result.LogSumExp[queryIndex] = globalMaximum + float32(math.Log(total))
+		}
+	}
+}
+
 // AttentionBackward computes the query/key/value gradients from the saved
 // forward statistics. Gradients are accumulated into the result slices.
 func (backend *Backend) AttentionBackward(parameters kernels.AttentionBackwardParameters, result kernels.AttentionBackwardResult) {

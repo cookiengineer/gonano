@@ -141,6 +141,43 @@ type AttentionBackwardResult struct {
 	ValueGradient []float32
 }
 
+// AttentionSplitParameters describes one contiguous key range
+// [KeyStart, KeyEnd) of a (batch, head) attention pass. It is used by split-K
+// (flash-decoding) parallelism, where the key dimension is partitioned across
+// workers and the per-shard statistics are merged by AttentionCombine. Key and
+// Value are the full [KeyLength, HeadDim] arrays; the shard selects a sub-range
+// of keys, and masking still uses absolute key indices.
+type AttentionSplitParameters struct {
+	Query          []float32
+	Key            []float32
+	Value          []float32
+	QueryLength    int
+	KeyLength      int
+	HeadDim        int
+	PositionOffset int
+	Window         int
+	KeyStart       int
+	KeyEnd         int
+}
+
+// AttentionSplitResult is one key shard's unnormalized attention output and its
+// running softmax statistics. All fields are indexed per query row:
+// Accumulator is [QueryLength, HeadDim] (the unnormalized sum of p*Value),
+// Maximum and Sum are [QueryLength].
+type AttentionSplitResult struct {
+	Accumulator []float32
+	Maximum     []float32
+	Sum         []float32
+}
+
+// AttentionCombineParameters merges the shards of one (batch, head) pass into a
+// normalized output.
+type AttentionCombineParameters struct {
+	Partials    []AttentionSplitResult
+	QueryLength int
+	HeadDim     int
+}
+
 // Attention is the contract for masked, causal attention over contiguous
 // slices. Forward receives the softmax statistics; Backward consumes them.
 type Attention interface {
@@ -151,6 +188,14 @@ type Attention interface {
 	// AttentionBackward computes the query/key/value gradients from the saved
 	// forward statistics and accumulates them into the result slices.
 	AttentionBackward(parameters AttentionBackwardParameters, result AttentionBackwardResult)
+	// AttentionForwardSplit computes the unnormalized attention output and
+	// softmax statistics for one contiguous key shard, enabling split-K
+	// parallelism. Result slices must be pre-sized to the query length (and
+	// query length times head dim for the accumulator).
+	AttentionForwardSplit(parameters AttentionSplitParameters, result AttentionSplitResult)
+	// AttentionCombine merges per-shard statistics into the normalized output
+	// and optional log-sum-exp.
+	AttentionCombine(parameters AttentionCombineParameters, result AttentionForwardResult)
 }
 
 // Backend is the complete numeric contract. A backend must implement every

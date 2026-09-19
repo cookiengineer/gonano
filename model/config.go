@@ -14,6 +14,47 @@ type Config struct {
 	NumKVHead     int    `json:"n_kv_head"`      // number of key/value heads (GQA)
 	EmbedDim      int    `json:"n_embd"`         // transformer width (n_embd)
 	WindowPattern string `json:"window_pattern"` // sliding-window pattern (L=long, S=short)
+	// RotaryDims is the number of trailing head dimensions that receive RoPE
+	// (partial rotary embedding, as used by DeepSeek-V4). Zero means the full
+	// head dimension, preserving the historical behavior.
+	RotaryDims int `json:"rotary_dims,omitempty"`
+	// CompressionRatio enables HCA-style dense KV compression on every layer
+	// when > 1: each ratio consecutive key/value rows are merged into one
+	// compressed entry, and queries attend to strictly preceding compressed
+	// blocks. Zero or one disables compression.
+	CompressionRatio int `json:"compression_ratio,omitempty"`
+	// QAT selects quantization-aware training for the linear weights. The
+	// empty string disables it; "int8" uses per-row symmetric int8 fake
+	// quantization with a straight-through estimator.
+	QAT string `json:"qat,omitempty"`
+}
+
+// Compression returns the effective KV compression ratio (>= 1).
+func (config Config) Compression() int {
+	if config.CompressionRatio <= 1 {
+		return 1
+	}
+	return config.CompressionRatio
+}
+
+// defaultRotaryDims is the partial-RoPE width used by ConfigForDepthRatio when
+// the head dimension allows it, matching DeepSeek-V4's 64-dim rotary slice.
+const defaultRotaryDims = 64
+
+// RotaryDimension returns the number of trailing head dimensions that receive
+// RoPE. It validates that the value is even and does not exceed the head
+// dimension.
+func (config Config) RotaryDimension() int {
+	if config.RotaryDims <= 0 {
+		return config.HeadDim()
+	}
+	if config.RotaryDims > config.HeadDim() {
+		panic(fmt.Sprintf("model: RotaryDims %d exceeds head dim %d", config.RotaryDims, config.HeadDim()))
+	}
+	if config.RotaryDims%2 != 0 {
+		panic(fmt.Sprintf("model: RotaryDims %d must be even", config.RotaryDims))
+	}
+	return config.RotaryDims
 }
 
 // HeadDim returns the per-head dimension d = n_embd / n_head.
@@ -35,24 +76,53 @@ func (config Config) Validate() {
 			panic(fmt.Sprintf("model: invalid window pattern %q", config.WindowPattern))
 		}
 	}
+	if config.QAT != "" && config.QAT != "int8" {
+		panic(fmt.Sprintf("model: unsupported QAT mode %q", config.QAT))
+	}
 }
 
 // ConfigForDepth derives a compute-optimal config from a single dial: the
 // depth. model_dim = ceil(depth*aspectRatio / headDim) * headDim, and heads =
 // model_dim / headDim. All other hyperparameters (batch size, learning rates,
 // horizons) are derived later from the scaling laws in package trainer.
+//
+// It uses full multi-head attention (one key/value head per query head). Use
+// ConfigForDepthRatio to enable grouped-query attention.
 func ConfigForDepth(depth, vocabSize, aspectRatio, headDim, seqLen int, windowPattern string) Config {
+	return ConfigForDepthRatio(depth, vocabSize, aspectRatio, headDim, seqLen, windowPattern, 1)
+}
+
+// ConfigForDepthRatio is ConfigForDepth with an explicit grouped-query
+// attention ratio: there is exactly one key/value head per kvHeadRatio query
+// heads. A ratio of 1 is full multi-head attention; a ratio equal to the query
+// head count is single-head multi-query attention. The query head count must
+// be divisible by the ratio.
+func ConfigForDepthRatio(depth, vocabSize, aspectRatio, headDim, seqLen int, windowPattern string, kvHeadRatio int) Config {
+	if kvHeadRatio < 1 {
+		panic(fmt.Sprintf("model: kvHeadRatio %d must be >= 1", kvHeadRatio))
+	}
 	baseDimension := depth * aspectRatio
 	modelDimension := ((baseDimension + headDim - 1) / headDim) * headDim
 	numHeads := modelDimension / headDim
+	if numHeads%kvHeadRatio != 0 {
+		panic(fmt.Sprintf("model: numHeads %d not divisible by kvHeadRatio %d", numHeads, kvHeadRatio))
+	}
+	rotaryDims := defaultRotaryDims
+	if headDim < rotaryDims {
+		rotaryDims = headDim
+	}
+	if rotaryDims%2 != 0 {
+		rotaryDims--
+	}
 	config := Config{
 		SequenceLen:   seqLen,
 		VocabSize:     vocabSize,
 		NumLayer:      depth,
 		NumHead:       numHeads,
-		NumKVHead:     numHeads,
+		NumKVHead:     numHeads / kvHeadRatio,
 		EmbedDim:      modelDimension,
 		WindowPattern: windowPattern,
+		RotaryDims:    rotaryDims,
 	}
 	config.Validate()
 	return config

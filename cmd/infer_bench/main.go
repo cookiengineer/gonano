@@ -59,7 +59,8 @@ func main() {
 		prompt = append(prompt, 1)
 	}
 
-	fmt.Printf("%-6s %-10s %-12s %-10s %-12s\n", "batch", "TTFT(ms)", "TPOT(ms)", "tok/s", "decode tok/s")
+	fmt.Printf("%-6s %-9s %-10s %-9s %-13s %-11s %-11s %-8s %-7s\n",
+		"batch", "TTFT(ms)", "TPOT(ms)", "tok/s", "decode tok/s", "weight B/s", "kv B/s", "GB/s", "kv%")
 	for _, batchSize := range parseBatchSizes(*batchSizes) {
 		measurement := inference.Measure(engine, prompt, batchSize, *decodeTokens, 0, 0, 42)
 		var totalStepTime time.Duration
@@ -75,13 +76,40 @@ func main() {
 		// Pure decode throughput excludes the prefill and is the number to
 		// watch when serving (decode is memory-bandwidth-bound).
 		decodeRate := "-"
-		if totalStepTime > 0 {
+		weightPerStep := "-"
+		kvPerStep := "-"
+		bandwidth := "-"
+		kvShare := "-"
+		if totalStepTime > 0 && measurement.DecodeSteps > 0 {
 			decodeTokensPerSecond := float64(batchSize*len(measurement.StepTimes)) / totalStepTime.Seconds()
-			decodeRate = fmt.Sprintf("%-12.0f", decodeTokensPerSecond)
+			decodeRate = fmt.Sprintf("%-13.0f", decodeTokensPerSecond)
+
+			steps := int64(measurement.DecodeSteps)
+			weightPerStep = humanBytes(measurement.WeightBytes / steps)
+			kvPerStep = humanBytes(measurement.KVBytes / steps)
+
+			totalBytes := measurement.WeightBytes + measurement.KVBytes
+			bandwidth = fmt.Sprintf("%-8.1f", float64(totalBytes)/totalStepTime.Seconds()/1e9)
+			kvShare = fmt.Sprintf("%-7.0f", 100*float64(measurement.KVBytes)/float64(totalBytes))
 		}
-		fmt.Printf("%-6d %-10.2f %-12.3f %-10.0f %s\n",
-			batchSize, measurement.TTFT.Seconds()*1000, timePerOutputToken.Seconds()*1000, tokensPerSecond, decodeRate)
+		fmt.Printf("%-6d %-9.2f %-10.3f %-9.0f %-13s %-11s %-11s %-8s %-7s\n",
+			batchSize, measurement.TTFT.Seconds()*1000, timePerOutputToken.Seconds()*1000, tokensPerSecond,
+			decodeRate, weightPerStep, kvPerStep, bandwidth, kvShare)
 	}
+}
+
+// humanBytes formats a byte count with a binary unit suffix (e.g. "1.7 MB").
+func humanBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	divisor, exponent := int64(unit), 0
+	for value := bytes / unit; value >= unit; value /= unit {
+		divisor *= unit
+		exponent++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(divisor), "KMGTPE"[exponent])
 }
 
 func parseBatchSizes(spec string) []int {

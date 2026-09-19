@@ -22,6 +22,9 @@ import (
 func main() {
 	depth := flag.Int("depth", 12, "transformer depth (complexity dial)")
 	maxSeqLen := flag.Int("max-seq-len", 512, "context length")
+	kvHeadRatio := flag.Int("kv-head-ratio", 1, "query heads per key/value head (1 = MHA, >1 = GQA)")
+	compressionRatio := flag.Int("compression-ratio", 0, "HCA-style dense KV compression ratio (0/1 disables)")
+	qat := flag.String("qat", "", "quantization-aware training mode (\"\" or int8)")
 	vocabSize := flag.Int("vocab-size", 32768, "vocabulary size")
 	numIterations := flag.Int("num-iterations", 50, "optimization steps")
 	deviceBatchSize := flag.Int("device-batch-size", 1, "per-step batch size")
@@ -52,7 +55,9 @@ func main() {
 		}
 	}
 
-	configuration := model.ConfigForDepth(*depth, tokenizer.VocabSize(), 64, 128, *maxSeqLen, "SSSL")
+	configuration := model.ConfigForDepthRatio(*depth, tokenizer.VocabSize(), 64, 128, *maxSeqLen, "SSSL", *kvHeadRatio)
+	configuration.CompressionRatio = *compressionRatio
+	configuration.QAT = *qat
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 

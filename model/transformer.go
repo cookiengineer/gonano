@@ -37,7 +37,7 @@ type Transformer struct {
 
 	valueEmbeds map[int]*layers.Embedding // layer -> embedding (ResFormer)
 
-	rotaryCosine, rotarySine *tensors.Tensor // [rotarySeqLen, headDim/2]
+	rotaryCosine, rotarySine *tensors.Tensor // [rotarySeqLen, rotaryDim/2]
 }
 
 // NewTransformer builds a Transformer with all parameters zero-initialized.
@@ -45,8 +45,7 @@ type Transformer struct {
 func NewTransformer(config Config) *Transformer {
 	config.Validate()
 	paddedVocabulary := config.PaddedVocab()
-	headDimension := config.HeadDim()
-	rotaryCosine, rotarySine := precomputeRotary(config.SequenceLen*rotaryOvercompute, headDimension)
+	rotaryCosine, rotarySine := precomputeRotary(config.SequenceLen*rotaryOvercompute, config.RotaryDimension())
 
 	model := &Transformer{
 		Config:         config,
@@ -67,10 +66,35 @@ func NewTransformer(config Config) *Transformer {
 	for layerIndex := 0; layerIndex < config.NumLayer; layerIndex++ {
 		model.blocks[layerIndex] = NewBlock(config, hasValueEmbedding(layerIndex, config.NumLayer))
 		if hasValueEmbedding(layerIndex, config.NumLayer) {
-			model.valueEmbeds[layerIndex] = layers.NewEmbedding(paddedVocabulary, config.NumKVHead*headDimension)
+			model.valueEmbeds[layerIndex] = layers.NewEmbedding(paddedVocabulary, config.NumKVHead*config.HeadDim())
 		}
 	}
+	if config.QAT == "int8" {
+		model.enableInt8Quantization()
+	}
 	return model
+}
+
+// enableInt8Quantization turns on int8 quantization-aware training for every
+// linear weight in the model. Master weights remain float32.
+func (model *Transformer) enableInt8Quantization() {
+	linears := []*layers.Linear{model.lmHead}
+	for _, block := range model.blocks {
+		linears = append(linears,
+			block.attention.queryProjection, block.attention.keyProjection,
+			block.attention.valueProjection, block.attention.outputProjection,
+			block.mlp.inputProjection, block.mlp.outputProjection,
+		)
+		if block.attention.valueEmbeddingGate != nil {
+			linears = append(linears, block.attention.valueEmbeddingGate)
+		}
+		if block.attention.compressor != nil {
+			linears = append(linears, block.attention.compressor.logitWeight)
+		}
+	}
+	for _, linear := range linears {
+		linear.QuantMode = layers.QuantInt8
+	}
 }
 
 // NumLayers returns the number of transformer blocks.
@@ -118,6 +142,10 @@ func (model *Transformer) InitWeights(rng *tensors.RNG) {
 	for _, block := range model.blocks {
 		if block.attention.valueEmbeddingGate != nil {
 			layers.InitUniform(block.attention.valueEmbeddingGate.Weight, rng, 0.0, 0.02)
+		}
+		if block.attention.compressor != nil {
+			layers.InitUniform(block.attention.compressor.logitWeight.Weight, rng, -bound, bound)
+			layers.InitZeros(block.attention.compressor.bias)
 		}
 	}
 }

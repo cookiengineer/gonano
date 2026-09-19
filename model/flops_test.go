@@ -46,6 +46,25 @@ func TestFlopsEstimatesPositive(t *testing.T) {
 	}
 }
 
+func TestGQAReducesKVBytes(t *testing.T) {
+	mha := NewTransformer(ConfigForDepthRatio(12, 32000, 64, 128, 2048, "SSSL", 1))
+	gqa := NewTransformer(ConfigForDepthRatio(12, 32000, 64, 128, 2048, "SSSL", 3))
+	if gqa.Config.NumKVHead*3 != mha.Config.NumKVHead {
+		t.Fatalf("NumKVHead: gqa=%d mha=%d, want ratio 3", gqa.Config.NumKVHead, mha.Config.NumKVHead)
+	}
+	if gqa.KVBytesPerToken()*3 != mha.KVBytesPerToken() {
+		t.Fatalf("KVBytesPerToken gqa=%d mha=%d, want 3x reduction", gqa.KVBytesPerToken(), mha.KVBytesPerToken())
+	}
+}
+
+func TestWeightReadBytesFormula(t *testing.T) {
+	model := buildTestTransformer(t)
+	expected := model.MatmulParams() * 4
+	if model.WeightReadBytes() != expected {
+		t.Fatalf("WeightReadBytes = %d, want %d", model.WeightReadBytes(), expected)
+	}
+}
+
 func TestKVBytesPerTokenFormula(t *testing.T) {
 	model := buildTestTransformer(t)
 	// n_layer * 2 * n_kv_head * head_dim * 4 bytes.

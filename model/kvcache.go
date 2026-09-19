@@ -26,6 +26,25 @@ type KVBuffer struct {
 	// previousEmbedding caches the previous token's post-norm embedding for the
 	// smear mechanism during single-token decode.
 	previousEmbedding *tensors.Tensor
+
+	// HCA-style dense compression state, allocated by EnableCompression.
+	compressionRatio       int
+	compressedMaxBlocks    int
+	compressedEmbeddingDim int
+	compressedKVWidth      int
+	// tailHidden[layer][batch] is [ratio, d] flattened.
+	tailHidden [][][]float32
+	// tailKey/tailValue[layer][batch] are [ratio, kvWidth] flattened.
+	tailKey   [][][]float32
+	tailValue [][][]float32
+	// tailLength[layer][batch] is the number of buffered rows.
+	tailLength [][]int
+	// compressedKey/compressedValue[layer][batch*kvHead] are
+	// [maxBlocks, headDim].
+	compressedKey   [][]*tensors.Tensor
+	compressedValue [][]*tensors.Tensor
+	// compressedCount[layer][batch] is the number of complete blocks.
+	compressedCount [][]int
 }
 
 // NewKVBuffer allocates a zeroed KV cache for the given model geometry.
@@ -91,6 +110,118 @@ func (cache *KVBuffer) writeKeyValue(layer, row, head int, newKey, newValue []fl
 	return keyBuffer[:end], valueBuffer[:end]
 }
 
+// EnableCompression allocates the HCA-style dense compression state. ratio is
+// the number of tokens merged into one compressed entry, embeddingDimension is
+// the compressor hidden width, kvWidth is keyValueHeadCount*headDim, and
+// maxBlocks is the maximum number of compressed entries per (layer, row, head).
+func (cache *KVBuffer) EnableCompression(ratio, embeddingDimension, kvWidth, maxBlocks int) {
+	cache.compressionRatio = ratio
+	cache.compressedMaxBlocks = maxBlocks
+	cache.compressedEmbeddingDim = embeddingDimension
+	cache.compressedKVWidth = kvWidth
+	headDimension := kvWidth / cache.keyValueHeadCount
+
+	cache.tailHidden = make([][][]float32, cache.layerCount)
+	cache.tailKey = make([][][]float32, cache.layerCount)
+	cache.tailValue = make([][][]float32, cache.layerCount)
+	cache.tailLength = make([][]int, cache.layerCount)
+	cache.compressedKey = make([][]*tensors.Tensor, cache.layerCount)
+	cache.compressedValue = make([][]*tensors.Tensor, cache.layerCount)
+	cache.compressedCount = make([][]int, cache.layerCount)
+
+	for layer := 0; layer < cache.layerCount; layer++ {
+		cache.tailHidden[layer] = make([][]float32, cache.batchSize)
+		cache.tailKey[layer] = make([][]float32, cache.batchSize*cache.keyValueHeadCount)
+		cache.tailValue[layer] = make([][]float32, cache.batchSize*cache.keyValueHeadCount)
+		cache.tailLength[layer] = make([]int, cache.batchSize)
+		cache.compressedCount[layer] = make([]int, cache.batchSize)
+		cache.compressedKey[layer] = make([]*tensors.Tensor, cache.batchSize*cache.keyValueHeadCount)
+		cache.compressedValue[layer] = make([]*tensors.Tensor, cache.batchSize*cache.keyValueHeadCount)
+		for batch := 0; batch < cache.batchSize; batch++ {
+			cache.tailHidden[layer][batch] = make([]float32, ratio*embeddingDimension)
+		}
+		for index := range cache.tailKey[layer] {
+			cache.tailKey[layer][index] = make([]float32, ratio*headDimension)
+			cache.tailValue[layer][index] = make([]float32, ratio*headDimension)
+		}
+		for index := range cache.compressedKey[layer] {
+			cache.compressedKey[layer][index] = tensors.New(maxBlocks, headDimension)
+			cache.compressedValue[layer][index] = tensors.New(maxBlocks, headDimension)
+		}
+	}
+}
+
+// CompressionEnabled reports whether compression state was allocated.
+func (cache *KVBuffer) CompressionEnabled() bool { return cache.compressionRatio > 1 }
+
+// CompressionRatio returns the configured compression ratio.
+func (cache *KVBuffer) CompressionRatio() int { return cache.compressionRatio }
+
+// TailLength returns the number of buffered (uncompressed) rows for a row.
+func (cache *KVBuffer) TailLength(layer, batch int) int { return cache.tailLength[layer][batch] }
+
+// TailHidden returns the [ratio*d] buffered hidden rows for a row.
+func (cache *KVBuffer) TailHidden(layer, batch int) []float32 { return cache.tailHidden[layer][batch] }
+
+// TailKey returns the [ratio*headDim] buffered key rows for a (row, kv-head).
+func (cache *KVBuffer) TailKey(layer, index int) []float32 { return cache.tailKey[layer][index] }
+
+// TailValue returns the [ratio*headDim] buffered value rows for a (row, kv-head).
+func (cache *KVBuffer) TailValue(layer, index int) []float32 { return cache.tailValue[layer][index] }
+
+// AppendTailRow appends one hidden/key/value row to the buffered tail. keyNew
+// and valueNew are flattened [keyValueHeadCount*headDim] rows.
+func (cache *KVBuffer) AppendTailRow(layer, batch int, hiddenNew, keyNew, valueNew []float32) {
+	position := cache.tailLength[layer][batch]
+	embeddingDimension := cache.compressedEmbeddingDim
+	headDimension := cache.compressedKVWidth / cache.keyValueHeadCount
+	copy(cache.tailHidden[layer][batch][position*embeddingDimension:], hiddenNew)
+	for head := 0; head < cache.keyValueHeadCount; head++ {
+		index := batch*cache.keyValueHeadCount + head
+		copy(cache.tailKey[layer][index][position*headDimension:], keyNew[head*headDimension:(head+1)*headDimension])
+		copy(cache.tailValue[layer][index][position*headDimension:], valueNew[head*headDimension:(head+1)*headDimension])
+	}
+	cache.tailLength[layer][batch]++
+}
+
+// ResetTail clears the buffered tail for a row.
+func (cache *KVBuffer) ResetTail(layer, batch int) { cache.tailLength[layer][batch] = 0 }
+
+// AppendCompressed writes one compressed entry for a (row, kv-head).
+func (cache *KVBuffer) AppendCompressed(layer, batch, head int, key, value []float32) {
+	count := cache.compressedCount[layer][batch]
+	index := batch*cache.keyValueHeadCount + head
+	headDimension := cache.compressedKey[layer][index].Shape[1]
+	copy(cache.compressedKey[layer][index].Data[count*headDimension:], key)
+	copy(cache.compressedValue[layer][index].Data[count*headDimension:], value)
+}
+
+// AdvanceCompressedCount marks that every (batch, head) gained one entry.
+func (cache *KVBuffer) AdvanceCompressedCount(layer int) {
+	for batch := 0; batch < cache.batchSize; batch++ {
+		cache.compressedCount[layer][batch]++
+	}
+}
+
+// CompressedCount returns the number of complete blocks for a row.
+func (cache *KVBuffer) CompressedCount(layer, batch int) int {
+	return cache.compressedCount[layer][batch]
+}
+
+// CompressedKey returns the first count compressed key rows for a (row, head).
+func (cache *KVBuffer) CompressedKey(layer, batch, head, count int) []float32 {
+	index := batch*cache.keyValueHeadCount + head
+	headDimension := cache.compressedKey[layer][index].Shape[1]
+	return cache.compressedKey[layer][index].Data[:count*headDimension]
+}
+
+// CompressedValue returns the first count compressed value rows for a (row, head).
+func (cache *KVBuffer) CompressedValue(layer, batch, head, count int) []float32 {
+	index := batch*cache.keyValueHeadCount + head
+	headDimension := cache.compressedValue[layer][index].Shape[1]
+	return cache.compressedValue[layer][index].Data[:count*headDimension]
+}
+
 // PrefillFrom copies the cache contents (and smear state) of source into
 // destination, expanding a batch-1 cache into a larger batch. It is used by the
 // engine to replicate a single-row prefill across many decode rows.
@@ -108,6 +239,27 @@ func PrefillFrom(destination, source *KVBuffer) {
 			}
 		}
 	}
+	if destination.CompressionEnabled() {
+		for layer := 0; layer < destination.layerCount; layer++ {
+			sourceCount := source.compressedCount[layer][0]
+			for batch := 0; batch < destination.batchSize; batch++ {
+				destination.compressedCount[layer][batch] = sourceCount
+				copy(destination.tailHidden[layer][batch], source.tailHidden[layer][0])
+				copy(destination.tailKey[layer][batch], source.tailKey[layer][0])
+				copy(destination.tailValue[layer][batch], source.tailValue[layer][0])
+				destination.tailLength[layer][batch] = source.tailLength[layer][0]
+			}
+			for head := 0; head < destination.keyValueHeadCount; head++ {
+				headDimension := source.compressedKey[layer][head].Shape[1]
+				for batch := 0; batch < destination.batchSize; batch++ {
+					destinationIndex := batch*destination.keyValueHeadCount + head
+					copy(destination.compressedKey[layer][destinationIndex].Data[:sourceCount*headDimension], source.compressedKey[layer][head].Data[:sourceCount*headDimension])
+					copy(destination.compressedValue[layer][destinationIndex].Data[:sourceCount*headDimension], source.compressedValue[layer][head].Data[:sourceCount*headDimension])
+				}
+			}
+		}
+	}
+
 	destination.sequenceLength = source.sequenceLength
 	if source.previousEmbedding != nil {
 		// Expand the batch-1 previous embedding across all decode rows.

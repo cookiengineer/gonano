@@ -151,6 +151,13 @@ var defaultPool = NewPool(0)
 // Default returns a process-wide pool sized to GOMAXPROCS.
 func Default() *Pool { return defaultPool }
 
+// KernelPool returns the default pool with a small parallelization threshold.
+// It is meant for kernels whose loop indices are substantial work items (matmul
+// row/column blocks, attention (batch, head) pairs) rather than individual
+// elements, so short index ranges should still fan out across cores. The
+// default pool's element-count heuristic would run these inline.
+func KernelPool() *Pool { return defaultPool.WithMinChunk(1) }
+
 // SetDefault replaces the process-wide pool (used by tests and by commands
 // that want a custom worker count).
 func SetDefault(pool *Pool) { defaultPool = pool }

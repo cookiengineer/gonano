@@ -42,6 +42,10 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 
 		// 1) Batch-1 prefill of the prompt.
 		prefillCache := model.NewKVBuffer(1, len(tokens), config.NumLayer, config.NumKVHead, headDim)
+		if ratio := config.Compression(); ratio > 1 {
+			kvWidth := config.NumKVHead * headDim
+			prefillCache.EnableCompression(ratio, config.EmbedDim, kvWidth, len(tokens)/ratio+1)
+		}
 		inputIDs := tensors.NewInt32sWithData([]int{1, len(tokens)}, toI32(tokens))
 		logits := engine.Model.Forward(inputIDs, prefillCache) // [1, T, vocab]
 		vocab := config.VocabSize
@@ -60,6 +64,10 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 			cacheLen += maxTokens
 		}
 		decodeCache := model.NewKVBuffer(numSamples, cacheLen, config.NumLayer, config.NumKVHead, headDim)
+		if ratio := config.Compression(); ratio > 1 {
+			kvWidth := config.NumKVHead * headDim
+			decodeCache.EnableCompression(ratio, config.EmbedDim, kvWidth, cacheLen/ratio+1)
+		}
 		model.PrefillFrom(decodeCache, prefillCache)
 
 		// 3) Row states.

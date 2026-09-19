@@ -10,12 +10,22 @@ import (
 	"github.com/cookiengineer/gonano/tensors"
 )
 
+// Quantization modes for a Linear layer's weight.
+const (
+	QuantNone = 0
+	QuantInt8 = 1
+)
+
 // Linear is a bias-free linear layer: out = input @ W^T, with W of shape
 // [out_features, in_features]. nanochat uses no biases anywhere.
 type Linear struct {
 	InFeatures  int
 	OutFeatures int
 	Weight      *tensors.Tensor // [out, in]
+	// QuantMode enables quantization-aware training for the forward pass. The
+	// master weight stays float32; the forward use a fake-quantized copy so the
+	// network adapts to quantization (straight-through on the backward).
+	QuantMode int
 }
 
 // NewLinear allocates a zero-initialized Linear layer.
@@ -35,7 +45,13 @@ func (layer *Linear) Forward(input *tensors.Tensor) *tensors.Tensor {
 	}
 	rows := input.Numel() / layer.InFeatures
 	inputMatrix := input.Reshape(rows, layer.InFeatures)
-	outputMatrix := tensors.MatMulTransposed(inputMatrix, layer.Weight) // [rows, out]
+	weight := layer.Weight
+	if layer.QuantMode == QuantInt8 {
+		// Quantization-aware training: use a fake-quantized weight in the
+		// forward pass. Backward keeps the straight-through estimator.
+		weight = tensors.FakeQuantizeInt8Rows(weight)
+	}
+	outputMatrix := tensors.MatMulTransposed(inputMatrix, weight) // [rows, out]
 	return outputMatrix.Reshape(append(append([]int(nil), input.Shape[:len(input.Shape)-1]...), layer.OutFeatures)...)
 }
 

@@ -4,7 +4,61 @@ import (
 	"runtime"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+// peakConcurrency runs fn over count iterations through the pool and returns
+// the maximum number of iterations observed executing at the same time. Each
+// iteration sleeps briefly so overlapping workers are observable.
+func peakConcurrency(pool *Pool, count int) int {
+	var active, peak atomic.Int64
+	pool.For(0, count, func(int) {
+		current := active.Add(1)
+		for {
+			previous := peak.Load()
+			if current <= previous || peak.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		time.Sleep(time.Millisecond)
+		active.Add(-1)
+	})
+	return int(peak.Load())
+}
+
+// TestPoolForGateBelowMinChunkRunsInline pins the current behavior that an
+// index range smaller than minChunk executes inline. Attention and matmul call
+// For with ranges of this size, so this is why they are not parallel today.
+func TestPoolForGateBelowMinChunkRunsInline(t *testing.T) {
+	pool := NewPool(4)
+	if peak := peakConcurrency(pool, 10); peak != 1 {
+		t.Fatalf("small range peak concurrency = %d, want 1 (inline)", peak)
+	}
+}
+
+// TestPoolForGateAtMinChunkParallelizes documents the inverse: once a range
+// reaches minChunk, the pool actually fans out across workers.
+func TestPoolForGateAtMinChunkParallelizes(t *testing.T) {
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("needs at least two CPUs")
+	}
+	pool := NewPool(4)
+	if peak := peakConcurrency(pool, 4*pool.minChunk); peak < 2 {
+		t.Fatalf("large range peak concurrency = %d, want >= 2", peak)
+	}
+}
+
+// TestPoolWithMinChunkParallelizesSmall documents the fix direction used by
+// M1c: lowering minChunk makes small block-index loops run on multiple workers.
+func TestPoolWithMinChunkParallelizesSmall(t *testing.T) {
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("needs at least two CPUs")
+	}
+	pool := NewPool(4).WithMinChunk(1)
+	if peak := peakConcurrency(pool, 8); peak < 2 {
+		t.Fatalf("WithMinChunk(1) peak concurrency = %d, want >= 2", peak)
+	}
+}
 
 func TestPoolForCoversAll(test *testing.T) {
 	pool := NewPool(runtime.GOMAXPROCS(0))

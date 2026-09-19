@@ -22,18 +22,21 @@ import (
 
 func main() {
 	var (
-		dataDir       string
-		format        string
-		tokenizerPath string
-		trainTok      bool
-		vocabSize     int
-		maxChars      int
-		depth         int
-		maxSeqLen     int
-		numIterations int
-		batchSize     int
-		modelTag      string
-		baseDir       string
+		dataDir          string
+		format           string
+		tokenizerPath    string
+		trainTok         bool
+		vocabSize        int
+		maxChars         int
+		depth            int
+		maxSeqLen        int
+		kvHeadRatio      int
+		compressionRatio int
+		qat              string
+		numIterations    int
+		batchSize        int
+		modelTag         string
+		baseDir          string
 	)
 	flag.StringVar(&dataDir, "data-dir", "", "directory of training data (.parquet or .md) (required)")
 	flag.StringVar(&format, "format", "parquet", "data format: parquet|markdown")
@@ -43,6 +46,9 @@ func main() {
 	flag.IntVar(&maxChars, "max-chars", 2000000000, "max characters for tokenizer training")
 	flag.IntVar(&depth, "depth", 12, "transformer depth (the complexity dial)")
 	flag.IntVar(&maxSeqLen, "max-seq-len", 512, "context length")
+	flag.IntVar(&kvHeadRatio, "kv-head-ratio", 1, "query heads per key/value head (1 = MHA, >1 = GQA)")
+	flag.IntVar(&compressionRatio, "compression-ratio", 0, "HCA-style dense KV compression ratio (0/1 disables)")
+	flag.StringVar(&qat, "qat", "", "quantization-aware training mode (\"\" or int8)")
 	flag.IntVar(&numIterations, "num-iterations", 50, "optimization steps")
 	flag.IntVar(&batchSize, "device-batch-size", 1, "sequences per step")
 	flag.StringVar(&modelTag, "model-tag", "", "checkpoint directory name (default d<depth>)")
@@ -66,7 +72,9 @@ func main() {
 	tokenizer := setupTokenizer(logger, baseDir, dataDir, format, tokenizerPath, trainTok, vocabSize, maxChars)
 
 	// 2) Model.
-	configuration := model.ConfigForDepth(depth, tokenizer.VocabSize(), 64, 128, maxSeqLen, "SSSL")
+	configuration := model.ConfigForDepthRatio(depth, tokenizer.VocabSize(), 64, 128, maxSeqLen, "SSSL", kvHeadRatio)
+	configuration.CompressionRatio = compressionRatio
+	configuration.QAT = qat
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5)

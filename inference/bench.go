@@ -14,6 +14,17 @@ type Measurement struct {
 	StepTimes []time.Duration
 	// NumTokens is the total number of tokens produced.
 	NumTokens int
+	// DecodeSteps is the number of token-by-token decode forwards measured,
+	// equal to len(StepTimes).
+	DecodeSteps int
+	// WeightBytes is the total bytes of matmul weights read across the measured
+	// decode steps. Weights are shared across batch rows, so this does not
+	// scale with the batch size.
+	WeightBytes int64
+	// KVBytes is the total bytes of KV cache read across the measured decode
+	// steps. Each batch row reads its own KV prefix, so this scales with both
+	// the batch size and the growing context length.
+	KVBytes int64
 }
 
 // Measure runs one timed generation and reports TTFT and per-step timings.
@@ -26,6 +37,11 @@ func Measure(engine *Engine, tokens []int, numSamples, decodeTokens int, tempera
 	first := true
 	stepStart := time.Now()
 
+	// Between the first and second yielded tokens the engine performed the
+	// first token-by-token decode forward, at context length prompt+1. Each
+	// subsequent step advances the context by one.
+	decodeContext := len(tokens) + 1
+
 	generate(func(column, mask []int) bool {
 		measurement.NumTokens++
 		if first {
@@ -35,6 +51,10 @@ func Measure(engine *Engine, tokens []int, numSamples, decodeTokens int, tempera
 			return true
 		}
 		measurement.StepTimes = append(measurement.StepTimes, time.Since(stepStart))
+		measurement.DecodeSteps++
+		measurement.WeightBytes += int64(engine.Model.WeightReadBytes())
+		measurement.KVBytes += int64(numSamples) * int64(engine.Model.KVReadBytes(decodeContext))
+		decodeContext++
 		stepStart = time.Now()
 		return true
 	})

@@ -2,6 +2,7 @@ package model
 
 import (
 	"github.com/cookiengineer/gonano/internal/parallel"
+	"github.com/cookiengineer/gonano/kernels"
 	"github.com/cookiengineer/gonano/model/layers"
 	"github.com/cookiengineer/gonano/tensors"
 )
@@ -34,7 +35,7 @@ func toBatchHeadLayout(input *tensors.Tensor) *tensors.Tensor {
 	batchSize, sequenceLength, headCount, headDimension := input.Shape[0], input.Shape[1], input.Shape[2], input.Shape[3]
 	output := tensors.New(batchSize, headCount, sequenceLength, headDimension)
 	source, destination := input.Data, output.Data
-	parallel.Default().For(0, batchSize*headCount, func(index int) {
+	parallel.KernelPool().For(0, batchSize*headCount, func(index int) {
 		batchIndex := index / headCount
 		headIndex := index % headCount
 		for position := 0; position < sequenceLength; position++ {
@@ -51,7 +52,7 @@ func toBatchSequenceLayout(input *tensors.Tensor) *tensors.Tensor {
 	batchSize, headCount, sequenceLength, headDimension := input.Shape[0], input.Shape[1], input.Shape[2], input.Shape[3]
 	output := tensors.New(batchSize, sequenceLength, headCount, headDimension)
 	source, destination := input.Data, output.Data
-	parallel.Default().For(0, batchSize*headCount, func(index int) {
+	parallel.KernelPool().For(0, batchSize*headCount, func(index int) {
 		batchIndex := index / headCount
 		headIndex := index % headCount
 		for position := 0; position < sequenceLength; position++ {
@@ -83,6 +84,11 @@ type CausalSelfAttention struct {
 	outputProjection *layers.Linear
 
 	valueEmbeddingGate *layers.Linear // nil on layers without value embeddings
+
+	// compressor is non-nil when HCA-style dense KV compression is enabled;
+	// it merges every compressionRatio key/value rows into one entry.
+	compressor       *ChannelCompressor
+	compressionRatio int
 }
 
 // NewCausalSelfAttention builds an attention layer. hasValueEmbedding selects
@@ -101,6 +107,10 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool) *Causa
 	}
 	if hasValueEmbedding {
 		attention.valueEmbeddingGate = layers.NewLinear(veGateChannels, configuration.NumKVHead)
+	}
+	if ratio := configuration.Compression(); ratio > 1 {
+		attention.compressionRatio = ratio
+		attention.compressor = NewChannelCompressor(configuration.EmbedDim, headDimension, ratio)
 	}
 	return attention
 }
@@ -129,6 +139,13 @@ func (attention *CausalSelfAttention) Forward(input, valueEmbedding, cosine, sin
 	query = tensors.Scale(normalizeLastDim(query), qkScale)
 	key = tensors.Scale(normalizeLastDim(key), qkScale)
 
+	if attention.compressor != nil {
+		if cache == nil {
+			panic("model: compressed attention requires a KV cache during inference")
+		}
+		return attention.forwardCompressed(input, query, key, value, cache, layer, positionOffset)
+	}
+
 	// Transpose to [batch, head, sequence, dim] so per-head slices are
 	// contiguous.
 	queryHeadMajor := toBatchHeadLayout(query)
@@ -138,32 +155,109 @@ func (attention *CausalSelfAttention) Forward(input, valueEmbedding, cosine, sin
 	headRatio := attention.queryHeadCount / attention.keyValueHeadCount
 	outputHeadMajor := tensors.New(batchSize, attention.queryHeadCount, sequenceLength, attention.headDimension)
 	headDimension := attention.headDimension
+	kvHeadCount := attention.keyValueHeadCount
 
-	parallel.Default().For(0, batchSize*attention.queryHeadCount, func(index int) {
+	// Collect the full KV prefix once per (batch, kv-head). Writing once here
+	// (rather than once per query head) also avoids concurrent duplicate writes
+	// to the same cache slot when grouped-query attention shares a KV head.
+	keyValueFull := make([]keyValueSlice, batchSize*kvHeadCount)
+	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		for keyValueHead := 0; keyValueHead < kvHeadCount; keyValueHead++ {
+			slot := batchIndex*kvHeadCount + keyValueHead
+			keyNew := headSlice(keyHeadMajor.Data, slot, sequenceLength, headDimension)
+			valueNew := headSlice(valueHeadMajor.Data, slot, sequenceLength, headDimension)
+			if cache != nil {
+				// Write k/v into the cache and read the full prefix back.
+				keyFull, valueFull := cache.writeKeyValue(layer, batchIndex, keyValueHead, keyNew, valueNew)
+				keyValueFull[slot] = keyValueSlice{key: keyFull, value: valueFull}
+			} else {
+				keyValueFull[slot] = keyValueSlice{key: keyNew, value: valueNew}
+			}
+		}
+	}
+
+	keyLength := sequenceLength
+	if cache != nil {
+		keyLength = cache.Position() + sequenceLength
+	}
+	splits := attentionSplitCount(keyLength, batchSize*attention.queryHeadCount, parallel.Default().Workers())
+
+	parallel.KernelPool().For(0, batchSize*attention.queryHeadCount, func(index int) {
 		batchIndex := index / attention.queryHeadCount
 		queryHead := index % attention.queryHeadCount
 		keyValueHead := queryHead / headRatio
 
-		queryHeadData := headSlice(queryHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
-		outputHeadData := headSlice(outputHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
-
-		var keyFull, valueFull []float32
-		if cache != nil {
-			// Write k/v for this (batch, kv-head) into the cache and read the
-			// full prefix as the available context.
-			keyNew := headSlice(keyHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
-			valueNew := headSlice(valueHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
-			keyFull, valueFull = cache.writeKeyValue(layer, batchIndex, keyValueHead, keyNew, valueNew)
-		} else {
-			keyFull = headSlice(keyHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
-			valueFull = headSlice(valueHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
-		}
-		keyLength := len(keyFull) / headDimension
-		tensors.AttentionForward(queryHeadData, keyFull, valueFull, outputHeadData, nil, sequenceLength, keyLength, headDimension, positionOffset, window[0])
+		queryHeadData := headSlice(queryHeadMajor.Data, index, sequenceLength, headDimension)
+		outputHeadData := headSlice(outputHeadMajor.Data, index, sequenceLength, headDimension)
+		full := keyValueFull[batchIndex*kvHeadCount+keyValueHead]
+		attentionForwardCombined(queryHeadData, full.key, full.value, outputHeadData, nil, sequenceLength, keyLength, headDimension, positionOffset, window[0], splits)
 	})
 
 	output := toBatchSequenceLayout(outputHeadMajor).Reshape(batchSize, sequenceLength, attention.queryHeadCount*attention.headDimension)
 	return attention.outputProjection.Forward(output)
+}
+
+// keyValueSlice is a (key, value) pair of matching [length, headDim] buffers.
+type keyValueSlice struct {
+	key   []float32
+	value []float32
+}
+
+// attentionSplitK tuning. Split-K only helps when the key dimension is long
+// and the (batch, head) task count cannot fill the cores.
+const (
+	attentionSplitKeyThreshold = 512
+	attentionSplitMinKeys      = 128
+	attentionMaxSplits         = 16
+)
+
+// attentionSplitCount returns how many key shards to use for a (batch, head)
+// attention pass. It is 1 when the key dimension is short, when the existing
+// (batch, head) parallelism already fills the cores, or when shards would hold
+// too few keys.
+func attentionSplitCount(keyLength, baseTasks, workers int) int {
+	if keyLength < attentionSplitKeyThreshold || workers < 2 || baseTasks < 1 {
+		return 1
+	}
+	splits := workers / baseTasks
+	if splits < 2 {
+		return 1
+	}
+	if byLength := keyLength / attentionSplitMinKeys; byLength < splits {
+		splits = byLength
+	}
+	if splits > attentionMaxSplits {
+		splits = attentionMaxSplits
+	}
+	if splits < 2 {
+		return 1
+	}
+	return splits
+}
+
+// attentionForwardCombined computes one (batch, head) attention pass. With
+// splits > 1 it partitions the key dimension across workers, computes each
+// shard's unnormalized statistics, and merges them. logSumExp may be nil.
+func attentionForwardCombined(query, key, value, output, logSumExp []float32, queryLength, keyLength, headDim, positionOffset, window, splits int) {
+	if splits <= 1 {
+		tensors.AttentionForward(query, key, value, output, logSumExp, queryLength, keyLength, headDim, positionOffset, window)
+		return
+	}
+	partials := make([]kernels.AttentionSplitResult, splits)
+	keysPerSplit := (keyLength + splits - 1) / splits
+	parallel.KernelPool().For(0, splits, func(split int) {
+		keyStart := split * keysPerSplit
+		keyEnd := min(keyStart+keysPerSplit, keyLength)
+		partial := kernels.AttentionSplitResult{
+			Accumulator: make([]float32, queryLength*headDim),
+			Maximum:     make([]float32, queryLength),
+			Sum:         make([]float32, queryLength),
+		}
+		tensors.AttentionForwardSplit(query, key, value, partial.Accumulator, partial.Maximum, partial.Sum,
+			queryLength, keyLength, headDim, positionOffset, window, keyStart, keyEnd)
+		partials[split] = partial
+	})
+	tensors.AttentionCombine(partials, output, logSumExp, queryLength, headDim)
 }
 
 // addGateTimesValueEmbedding computes value + gate * valueEmbedding, where gate

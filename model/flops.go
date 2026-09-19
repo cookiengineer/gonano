@@ -77,6 +77,13 @@ func (model *Transformer) EstimatePrefillFlops(numTokens int) float64 {
 	return 2*float64(model.MatmulParams())*float64(numTokens) + attentionFlops
 }
 
+// WeightReadBytes returns the bytes of matmul weights read by one decode step.
+// Decode re-reads every matmul parameter once per step; embeddings and scalar
+// parameters are negligible and excluded, matching MatmulParams.
+func (model *Transformer) WeightReadBytes() int {
+	return model.MatmulParams() * 4
+}
+
 // KVBytesPerToken returns the bytes to store one token of KV cache across all
 // layers (float32).
 func (model *Transformer) KVBytesPerToken() int {

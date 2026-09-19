@@ -24,6 +24,9 @@ func (model *Transformer) SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, w
 		if block.attention.valueEmbeddingGate != nil {
 			matrixParameters = append(matrixParameters, block.attention.valueEmbeddingGate.Weight)
 		}
+		if block.attention.compressor != nil {
+			matrixParameters = append(matrixParameters, block.attention.compressor.logitWeight.Weight)
+		}
 	}
 
 	var valueEmbeddingParameters []*tensors.Tensor
@@ -32,6 +35,11 @@ func (model *Transformer) SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, w
 	}
 
 	smearParameters := []*tensors.Tensor{model.smearGate.Weight, model.smearLambda, model.backoutLambda}
+	for _, block := range model.blocks {
+		if block.attention.compressor != nil {
+			smearParameters = append(smearParameters, block.attention.compressor.bias)
+		}
+	}
 
 	modelDimensionLRScale := float32(math.Pow(float64(modelDimension)/768.0, -0.5))
 

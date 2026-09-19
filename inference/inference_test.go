@@ -122,6 +122,99 @@ func naiveGenerate(transformer *model.Transformer, tokens []int, maxTokens int, 
 	return ids
 }
 
+func testGQAEngineModel() (*model.Transformer, *tokenizer.Tokenizer) {
+	config := model.Config{
+		SequenceLen: 16, VocabSize: 32, NumLayer: 2, NumHead: 4, NumKVHead: 1,
+		EmbedDim: 32, WindowPattern: "L",
+	}
+	transformer := model.NewTransformer(config)
+	transformer.InitWeights(tensors.NewRNG(42))
+	ranks := make(map[string]int, 256)
+	for index := 0; index < 256; index++ {
+		ranks[string([]byte{byte(index)})] = index
+	}
+	tokenizerImpl := tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
+	return transformer, tokenizerImpl
+}
+
+// TestEngineMatchesNaiveGenerateGQA exercises the grouped-query KV-cache path,
+// where several query heads share one KV head (and therefore one cache slot).
+func testCompressedEngineModel() (*model.Transformer, *tokenizer.Tokenizer) {
+	config := model.Config{
+		SequenceLen: 16, VocabSize: 32, NumLayer: 2, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L", CompressionRatio: 2,
+	}
+	transformer := model.NewTransformer(config)
+	transformer.InitWeights(tensors.NewRNG(42))
+	ranks := make(map[string]int, 256)
+	for index := 0; index < 256; index++ {
+		ranks[string([]byte{byte(index)})] = index
+	}
+	tokenizerImpl := tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
+	return transformer, tokenizerImpl
+}
+
+// compressedReference greedily generates by recomputing the full compressed
+// forward from scratch at every step, providing an independent reference for
+// the incremental compressed KV cache.
+func compressedReference(transformer *model.Transformer, tokens []int, maxTokens int) []int {
+	config := transformer.Config
+	headDim := config.HeadDim()
+	ids := append([]int(nil), tokens...)
+	for step := 0; step < maxTokens; step++ {
+		cache := model.NewKVBuffer(1, len(ids), config.NumLayer, config.NumKVHead, headDim)
+		if ratio := config.Compression(); ratio > 1 {
+			cache.EnableCompression(ratio, config.EmbedDim, config.NumKVHead*headDim, len(ids)/ratio+1)
+		}
+		inputIDs := tensors.NewInt32sWithData([]int{1, len(ids)}, toI32(ids))
+		logits := transformer.Forward(inputIDs, cache)
+		flat := logits.Reshape(len(ids), config.VocabSize)
+		row := flat.Data[(len(ids)-1)*config.VocabSize:]
+		best := 0
+		for index := 1; index < config.VocabSize; index++ {
+			if row[index] > row[best] {
+				best = index
+			}
+		}
+		ids = append(ids, best)
+	}
+	return ids
+}
+
+func TestEngineMatchesRecomputeCompressed(test *testing.T) {
+	transformer, tokenizerImpl := testCompressedEngineModel()
+	engine := NewEngine(transformer, tokenizerImpl)
+	prompt := []int{1, 5, 2, 8}
+
+	want := compressedReference(transformer, prompt, 6)
+	got, _ := engine.GenerateBatch(prompt, 1, 6, 0, 0, 7)
+
+	limit := len(want)
+	if len(got[0]) < limit {
+		limit = len(got[0])
+	}
+	for index := 0; index < limit; index++ {
+		if got[0][index] != want[index] {
+			test.Fatalf("token %d: engine=%d recompute=%d", index, got[0][index], want[index])
+		}
+	}
+}
+
+func TestEngineMatchesNaiveGenerateGQA(test *testing.T) {
+	transformer, tokenizerImpl := testGQAEngineModel()
+	engine := NewEngine(transformer, tokenizerImpl)
+	prompt := []int{1, 5, 2, 8}
+
+	want := naiveGenerate(transformer, prompt, 6, 0, 0, 7)
+	got, _ := engine.GenerateBatch(prompt, 1, 6, 0, 0, 7)
+
+	for index := range want {
+		if got[0][index] != want[index] {
+			test.Fatalf("token %d: engine=%d naive=%d", index, got[0][index], want[index])
+		}
+	}
+}
+
 func TestEngineMatchesNaiveGenerate(test *testing.T) {
 	transformer, tokenizerImpl := testEngineModel()
 	engine := NewEngine(transformer, tokenizerImpl)
@@ -170,5 +263,31 @@ func TestMeasure(test *testing.T) {
 	}
 	if len(measurement.StepTimes) != 4 {
 		test.Fatalf("StepTimes = %d, want 4", len(measurement.StepTimes))
+	}
+}
+
+func TestMeasureTrafficAccounting(test *testing.T) {
+	transformer, tokenizerImpl := testEngineModel()
+	engine := NewEngine(transformer, tokenizerImpl)
+	prompt := []int{1, 2, 3}
+	numSamples := 2
+	measurement := Measure(engine, prompt, numSamples, 5, 0.0, 0, 42)
+
+	if measurement.DecodeSteps != len(measurement.StepTimes) {
+		test.Fatalf("DecodeSteps = %d, want %d", measurement.DecodeSteps, len(measurement.StepTimes))
+	}
+	wantWeight := int64(measurement.DecodeSteps) * int64(transformer.WeightReadBytes())
+	if measurement.WeightBytes != wantWeight {
+		test.Fatalf("WeightBytes = %d, want %d", measurement.WeightBytes, wantWeight)
+	}
+	var wantKV int64
+	for step := 0; step < measurement.DecodeSteps; step++ {
+		wantKV += int64(numSamples) * int64(transformer.KVReadBytes(len(prompt)+1+step))
+	}
+	if measurement.KVBytes != wantKV {
+		test.Fatalf("KVBytes = %d, want %d", measurement.KVBytes, wantKV)
+	}
+	if measurement.KVBytes <= 0 || measurement.WeightBytes <= 0 {
+		test.Fatalf("traffic accounting must be positive")
 	}
 }

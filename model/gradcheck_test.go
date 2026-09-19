@@ -30,6 +30,22 @@ func tinyTrainModel() *Transformer {
 	return model
 }
 
+func tinyCompressedModel() *Transformer {
+	config := Config{
+		SequenceLen: 16, VocabSize: 16, NumLayer: 2, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L", CompressionRatio: 2,
+	}
+	model := NewTransformer(config)
+	model.InitWeights(tensors.NewRNG(42))
+	perturb := tensors.NewRNG(123)
+	for _, parameter := range model.Parameters() {
+		for elementIndex := range parameter.Data {
+			parameter.Data[elementIndex] += perturb.NormFloat32() * 0.1
+		}
+	}
+	return model
+}
+
 func tinyData() (*tensors.Int32s, *tensors.Int32s) {
 	indexes := tensors.NewInt32sWithData([]int{1, 6}, []int32{1, 5, 2, 8, 3, 7})
 	targets := tensors.NewInt32sWithData([]int{1, 6}, []int32{5, 2, 8, 3, 7, 4})
@@ -55,7 +71,14 @@ func analyticGrads(model *Transformer, indexes, targets *tensors.Int32s) {
 }
 
 func TestBackpropDirectionalGradientCheck(t *testing.T) {
-	model := tinyTrainModel()
+	runDirectionalGradientCheck(t, tinyTrainModel())
+}
+
+func TestBackpropDirectionalGradientCheckCompressed(t *testing.T) {
+	runDirectionalGradientCheck(t, tinyCompressedModel())
+}
+
+func runDirectionalGradientCheck(t *testing.T, model *Transformer) {
 	indexes, targets := tinyData()
 	analyticGrads(model, indexes, targets)
 
