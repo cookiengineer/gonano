@@ -10,7 +10,7 @@ package tokenizer
 // The tool-call vocabulary is language-agnostic: the assistant emits
 // <|tool_start|> … <|tool_end|> to invoke a tool, and the runtime replies with
 // <|tool_output_start|> … <|tool_output_end|>. The tool itself is executed by
-// Go code (see package infer), not by any particular scripting language.
+// Go code (see package inference), not by any particular scripting language.
 var SpecialTokens = []string{
 	"<|bos|>",
 	"<|user_start|>",

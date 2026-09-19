@@ -6,162 +6,162 @@ import (
 	"github.com/cookiengineer/gonano/tokenizer"
 )
 
-// simpleTokenizer builds a byte-level tokenizer with no merges (256 byte
+// newSimpleTokenizer builds a byte-level tokenizer with no merges (256 byte
 // tokens + special tokens), so encode maps each byte to its id.
-func simpleTokenizer() *tokenizer.Tokenizer {
+func newSimpleTokenizer() *tokenizer.Tokenizer {
 	ranks := make(map[string]int, 256)
-	for i := 0; i < 256; i++ {
-		ranks[string([]byte{byte(i)})] = i
+	for byteValue := 0; byteValue < 256; byteValue++ {
+		ranks[string([]byte{byte(byteValue)})] = byteValue
 	}
 	return tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
 }
 
-func cyclicProvider(docs []string) DocProvider {
-	i := 0
+func newCyclicProvider(docs []string) DocProvider {
+	position := 0
 	return func() ([]string, State) {
-		batch := []string{docs[i%len(docs)]}
-		i++
+		batch := []string{docs[position%len(docs)]}
+		position++
 		return batch, State{PQIndex: 0, RGIndex: 0, Epoch: 1}
 	}
 }
 
-func TestPretrainLoaderBOSAligned(t *testing.T) {
-	tok := simpleTokenizer()
+func TestPretrainLoaderBOSAligned(tests *testing.T) {
+	tok := newSimpleTokenizer()
 	bos := tok.BOSTokenID()
-	provider := cyclicProvider([]string{"hello", "world", "hi", "there"})
+	provider := newCyclicProvider([]string{"hello", "world", "hi", "there"})
 	loader := NewPretrainLoader(tok, 2, 8, provider, 10)
 
 	inputs, targets, _ := loader.Next()
 	if inputs.Shape[0] != 2 || inputs.Shape[1] != 8 {
-		t.Fatalf("inputs shape = %v, want [2 8]", inputs.Shape)
+		tests.Fatalf("inputs shape = %v, want [2 8]", inputs.Shape)
 	}
 	// Every row starts with BOS.
-	for r := 0; r < 2; r++ {
-		if inputs.Get2(r, 0) != int32(bos) {
-			t.Fatalf("row %d does not start with BOS: %d", r, inputs.Get2(r, 0))
+	for row := 0; row < 2; row++ {
+		if inputs.Get2(row, 0) != int32(bos) {
+			tests.Fatalf("row %d does not start with BOS: %d", row, inputs.Get2(row, 0))
 		}
 	}
 	// targets[i] == inputs[i+1] (autoregressive shift).
-	for r := 0; r < 2; r++ {
-		for i := 0; i < 7; i++ {
-			if targets.Get2(r, i) != inputs.Get2(r, i+1) {
-				t.Fatalf("shift mismatch at (%d,%d)", r, i)
+	for row := 0; row < 2; row++ {
+		for index := 0; index < 7; index++ {
+			if targets.Get2(row, index) != inputs.Get2(row, index+1) {
+				tests.Fatalf("shift mismatch at (%d,%d)", row, index)
 			}
 		}
 	}
 	// All ids are valid.
 	vocab := tok.VocabSize()
-	for r := 0; r < 2; r++ {
-		for i := 0; i < 8; i++ {
-			if int(inputs.Get2(r, i)) >= vocab {
-				t.Fatalf("invalid input id %d at (%d,%d)", inputs.Get2(r, i), r, i)
+	for row := 0; row < 2; row++ {
+		for index := 0; index < 8; index++ {
+			if int(inputs.Get2(row, index)) >= vocab {
+				tests.Fatalf("invalid input id %d at (%d,%d)", inputs.Get2(row, index), row, index)
 			}
 		}
 	}
 }
 
-func TestPretrainLoaderMultipleBatches(t *testing.T) {
-	tok := simpleTokenizer()
-	provider := cyclicProvider([]string{"a", "b", "c"})
+func TestPretrainLoaderMultipleBatches(tests *testing.T) {
+	tok := newSimpleTokenizer()
+	provider := newCyclicProvider([]string{"a", "b", "c"})
 	loader := NewPretrainLoader(tok, 3, 4, provider, 5)
 
 	// Pull several batches; each must be BOS-aligned and consistently shifted.
-	for b := 0; b < 10; b++ {
+	for batch := 0; batch < 10; batch++ {
 		inputs, targets, _ := loader.Next()
-		for r := 0; r < 3; r++ {
-			if inputs.Get2(r, 0) != int32(tok.BOSTokenID()) {
-				t.Fatalf("batch %d row %d not BOS-aligned", b, r)
+		for row := 0; row < 3; row++ {
+			if inputs.Get2(row, 0) != int32(tok.BOSTokenID()) {
+				tests.Fatalf("batch %d row %d not BOS-aligned", batch, row)
 			}
-			for i := 0; i < 3; i++ {
-				if targets.Get2(r, i) != inputs.Get2(r, i+1) {
-					t.Fatalf("batch %d shift mismatch at (%d,%d)", b, r, i)
+			for index := 0; index < 3; index++ {
+				if targets.Get2(row, index) != inputs.Get2(row, index+1) {
+					tests.Fatalf("batch %d shift mismatch at (%d,%d)", batch, row, index)
 				}
 			}
 		}
 	}
 }
 
-func TestPretrainLoaderCropsToFill(t *testing.T) {
+func TestPretrainLoaderCropsToFill(tests *testing.T) {
 	// Documents longer than T must be cropped; the row is always full.
-	tok := simpleTokenizer()
-	provider := cyclicProvider([]string{"aaaaaaaaaaaaaaaaaaaa"}) // 20 a's
+	tok := newSimpleTokenizer()
+	provider := newCyclicProvider([]string{"aaaaaaaaaaaaaaaaaaaa"}) // 20 a's
 	loader := NewPretrainLoader(tok, 1, 6, provider, 5)
 	inputs, targets, _ := loader.Next()
 	if inputs.Get2(0, 0) != int32(tok.BOSTokenID()) {
-		t.Fatal("row must start with BOS")
+		tests.Fatal("row must start with BOS")
 	}
-	for i := 0; i < 5; i++ {
-		if targets.Get2(0, i) != inputs.Get2(0, i+1) {
-			t.Fatalf("shift mismatch at %d", i)
+	for index := 0; index < 5; index++ {
+		if targets.Get2(0, index) != inputs.Get2(0, index+1) {
+			tests.Fatalf("shift mismatch at %d", index)
 		}
 	}
 }
 
-func finiteConvProvider(convs []*tokenizer.Conversation) ConvProvider {
-	i := 0
+func newFiniteConvProvider(convs []*tokenizer.Conversation) ConvProvider {
+	position := 0
 	return func() ([]*tokenizer.Conversation, bool) {
-		if i >= len(convs) {
+		if position >= len(convs) {
 			return nil, false
 		}
-		c := convs[i]
-		i++
-		return []*tokenizer.Conversation{c}, true
+		conversation := convs[position]
+		position++
+		return []*tokenizer.Conversation{conversation}, true
 	}
 }
 
-func TestSFTLoaderMasking(t *testing.T) {
-	tok := simpleTokenizer()
+func TestSFTLoaderMasking(tests *testing.T) {
+	tok := newSimpleTokenizer()
 	conv := &tokenizer.Conversation{Messages: []tokenizer.Message{
 		{Role: "user", Content: "hi"},
 		{Role: "assistant", Content: "hello"},
 	}}
-	loader := NewSFTLoader(tok, 1, 32, finiteConvProvider([]*tokenizer.Conversation{conv}), 5)
+	loader := NewSFTLoader(tok, 1, 32, newFiniteConvProvider([]*tokenizer.Conversation{conv}), 5)
 
 	inputs, targets, ok := loader.Next()
 	if !ok {
-		t.Fatal("expected a batch")
+		tests.Fatal("expected a batch")
 	}
 	// Reconstruct the expected rendered ids.
 	wantIDs, _ := tok.RenderConversation(conv, 1<<30)
 	if int(inputs.Numel()) != 32 {
-		t.Fatalf("inputs numel = %d, want 32", inputs.Numel())
+		tests.Fatalf("inputs numel = %d, want 32", inputs.Numel())
 	}
 	// The first len(wantIDs) inputs should match the rendered ids.
-	for i := 0; i < len(wantIDs); i++ {
-		if inputs.Data[i] != int32(wantIDs[i]) {
-			t.Fatalf("input %d = %d, want %d", i, inputs.Data[i], wantIDs[i])
+	for index := 0; index < len(wantIDs); index++ {
+		if inputs.Data[index] != int32(wantIDs[index]) {
+			tests.Fatalf("input %d = %d, want %d", index, inputs.Data[index], wantIDs[index])
 		}
 	}
 	// Padding inputs after the conversation should be BOS.
 	bos := int32(tok.BOSTokenID())
-	for i := len(wantIDs); i < 32; i++ {
-		if inputs.Data[i] != bos {
-			t.Fatalf("padding input %d = %d, want BOS", i, inputs.Data[i])
+	for index := len(wantIDs); index < 32; index++ {
+		if inputs.Data[index] != bos {
+			tests.Fatalf("padding input %d = %d, want BOS", index, inputs.Data[index])
 		}
 	}
 	// The first target (BOS->user_start shift) must be masked -1 since mask[1]==0.
 	// Verify at least one -1 target exists (non-assistant positions).
 	sawMask := false
 	sawValid := false
-	for i := 0; i < 32; i++ {
-		if targets.Data[i] == -1 {
+	for index := 0; index < 32; index++ {
+		if targets.Data[index] == -1 {
 			sawMask = true
 		} else {
 			sawValid = true
 		}
 	}
 	if !sawMask || !sawValid {
-		t.Fatalf("expected both masked and valid targets, sawMask=%v sawValid=%v", sawMask, sawValid)
+		tests.Fatalf("expected both masked and valid targets, sawMask=%v sawValid=%v", sawMask, sawValid)
 	}
 }
 
-func TestSFTLoaderExhaustion(t *testing.T) {
-	tok := simpleTokenizer()
+func TestSFTLoaderExhaustion(tests *testing.T) {
+	tok := newSimpleTokenizer()
 	conv := &tokenizer.Conversation{Messages: []tokenizer.Message{
 		{Role: "user", Content: "hi"},
 		{Role: "assistant", Content: "hello"},
 	}}
-	loader := NewSFTLoader(tok, 1, 32, finiteConvProvider([]*tokenizer.Conversation{conv}), 5)
+	loader := NewSFTLoader(tok, 1, 32, newFiniteConvProvider([]*tokenizer.Conversation{conv}), 5)
 
 	// Keep pulling until exhausted.
 	pulled := 0
@@ -172,7 +172,7 @@ func TestSFTLoaderExhaustion(t *testing.T) {
 		}
 		pulled++
 		if pulled > 100 {
-			t.Fatal("loader did not terminate")
+			tests.Fatal("loader did not terminate")
 		}
 	}
 }

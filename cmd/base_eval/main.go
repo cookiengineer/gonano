@@ -8,12 +8,12 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cookiengineer/gonano/checkpoint"
 	"github.com/cookiengineer/gonano/data"
-	"github.com/cookiengineer/gonano/eval"
-	"github.com/cookiengineer/gonano/infer"
-	"github.com/cookiengineer/gonano/logging"
-	"github.com/cookiengineer/gonano/tensor"
+	"github.com/cookiengineer/gonano/evaluator"
+	"github.com/cookiengineer/gonano/inference"
+	"github.com/cookiengineer/gonano/internal/logging"
+	"github.com/cookiengineer/gonano/model/checkpoint"
+	"github.com/cookiengineer/gonano/tensors"
 	"github.com/cookiengineer/gonano/tokenizer"
 )
 
@@ -33,7 +33,7 @@ func main() {
 	if *baseDir == "" {
 		*baseDir = data.BaseDir()
 	}
-	tok, err := tokenizer.LoadTokenizer(filepath.Join(*baseDir, "tokenizer", "tokenizer.json"))
+	tokenizer, err := tokenizer.LoadTokenizer(filepath.Join(*baseDir, "tokenizer", "tokenizer.json"))
 	if err != nil {
 		logger.Error("load tokenizer", "err", err)
 		os.Exit(1)
@@ -43,15 +43,15 @@ func main() {
 		logger.Error("load checkpoint", "err", err)
 		os.Exit(1)
 	}
-	m := checkpoint.LoadModel(meta, params)
+	model := checkpoint.LoadModel(meta, params)
 
 	// Samples.
-	engine := infer.NewEngine(m, tok)
+	engine := inference.NewEngine(model, tokenizer)
 	prompts := []string{"The capital of France is", "The chemical symbol of gold is"}
-	for _, p := range prompts {
-		ids := append([]int{tok.BOSTokenID()}, tok.Encode(p)...)
+	for _, prompt := range prompts {
+		ids := append([]int{tokenizer.BOSTokenID()}, tokenizer.Encode(prompt)...)
 		results, _ := engine.GenerateBatch(ids, 1, 8, 0, 0, 42)
-		fmt.Printf("%s%s\n", p, tok.Decode(results[0][len(ids):]))
+		fmt.Printf("%s%s\n", prompt, tokenizer.Decode(results[0][len(ids):]))
 	}
 
 	// BPB (requires data).
@@ -61,23 +61,23 @@ func main() {
 			logger.Error("no parquet files", "dir", *dataDir)
 			os.Exit(1)
 		}
-		tokenBytes := make([]int32, tok.VocabSize())
-		for i := 0; i < tok.VocabSize(); i++ {
-			if tok.IsSpecial(i) {
-				tokenBytes[i] = 0
+		tokenBytes := make([]int32, tokenizer.VocabSize())
+		for index := 0; index < tokenizer.VocabSize(); index++ {
+			if tokenizer.IsSpecial(index) {
+				tokenBytes[index] = 0
 			} else {
-				tokenBytes[i] = int32(len(tok.DecodeSingleTokenBytes(i)))
+				tokenBytes[index] = int32(len(tokenizer.DecodeSingleTokenBytes(index)))
 			}
 		}
 		src := data.NewParquetSource(paths, 128)
-		loader := data.NewPretrainLoader(tok, *batchSize, meta.ModelConfig.SequenceLen, func() ([]string, data.State) {
+		loader := data.NewPretrainLoader(tokenizer, *batchSize, meta.ModelConfig.SequenceLen, func() ([]string, data.State) {
 			return src.Next()
 		}, 1000)
-		batches := func() (*tensor.Int32s, *tensor.Int32s) {
-			x, y, _ := loader.Next()
-			return x, y
+		batches := func() (*tensors.Int32s, *tensors.Int32s) {
+			inputs, targets, _ := loader.Next()
+			return inputs, targets
 		}
-		bpb := eval.BitsPerByte(m, batches, *steps, tokenBytes)
-		fmt.Printf("bits per byte: %.6f\n", bpb)
+		bitsPerByte := evaluator.BitsPerByte(model, batches, *steps, tokenBytes)
+		fmt.Printf("bits per byte: %.6f\n", bitsPerByte)
 	}
 }

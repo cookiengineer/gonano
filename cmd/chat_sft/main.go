@@ -8,11 +8,11 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cookiengineer/gonano/checkpoint"
 	"github.com/cookiengineer/gonano/data"
-	"github.com/cookiengineer/gonano/logging"
-	"github.com/cookiengineer/gonano/train"
-	"github.com/cookiengineer/gonano/tokenizer"
+	"github.com/cookiengineer/gonano/internal/logging"
+	"github.com/cookiengineer/gonano/model/checkpoint"
+	tokenizerpkg "github.com/cookiengineer/gonano/tokenizer"
+	"github.com/cookiengineer/gonano/trainer"
 )
 
 func main() {
@@ -32,7 +32,7 @@ func main() {
 	if *baseDir == "" {
 		*baseDir = data.BaseDir()
 	}
-	tok, err := tokenizer.LoadTokenizer(filepath.Join(*baseDir, "tokenizer", "tokenizer.json"))
+	tokenizer, err := tokenizerpkg.LoadTokenizer(filepath.Join(*baseDir, "tokenizer", "tokenizer.json"))
 	if err != nil {
 		logger.Error("load tokenizer", "err", err)
 		os.Exit(1)
@@ -42,32 +42,32 @@ func main() {
 		logger.Error("load checkpoint", "err", err)
 		os.Exit(1)
 	}
-	m := checkpoint.LoadModel(meta, params)
+	model := checkpoint.LoadModel(meta, params)
 
 	// Synthetic conversation provider for demonstration; a production setup
 	// loads SmolTalk/MMLU/GSM8K via the tasks package.
-	convs := []*tokenizer.Conversation{
-		{Messages: []tokenizer.Message{{Role: "user", Content: "hi"}, {Role: "assistant", Content: "hello"}}},
-		{Messages: []tokenizer.Message{{Role: "user", Content: "how are you"}, {Role: "assistant", Content: "fine thanks"}}},
+	conversations := []*tokenizerpkg.Conversation{
+		{Messages: []tokenizerpkg.Message{{Role: "user", Content: "hi"}, {Role: "assistant", Content: "hello"}}},
+		{Messages: []tokenizerpkg.Message{{Role: "user", Content: "how are you"}, {Role: "assistant", Content: "fine thanks"}}},
 	}
-	i := 0
-	provider := func() ([]*tokenizer.Conversation, bool) {
-		c := convs[i%len(convs)]
-		i++
-		return []*tokenizer.Conversation{c}, true
+	index := 0
+	provider := func() ([]*tokenizerpkg.Conversation, bool) {
+		conversation := conversations[index%len(conversations)]
+		index++
+		return []*tokenizerpkg.Conversation{conversation}, true
 	}
-	loader := data.NewSFTLoader(tok, *batchSize, *maxSeqLen, provider, 100)
+	loader := data.NewSFTLoader(tokenizer, *batchSize, *maxSeqLen, provider, 100)
 
-	groups := m.SetupOptimizer(0.008, 0.2, 0.02, 0.0, 0.5)
-	train.TrainSFT(m, groups, loader, *numIterations, func(step int, loss float32) {
+	groups := model.SetupOptimizer(0.008, 0.2, 0.02, 0.0, 0.5)
+	trainer.TrainSFT(model, groups, loader, *numIterations, func(step int, loss float32) {
 		if step%20 == 0 {
 			logger.Info("sft", "step", step, "loss", fmt.Sprintf("%.4f", loss))
 		}
 	})
 
 	if *outPath != "" {
-		outMeta := checkpoint.Meta{Step: *numIterations, ModelConfig: m.Config}
-		if err := checkpoint.Save(*outPath, outMeta, m.NamedParameters()); err != nil {
+		outMeta := checkpoint.Meta{Step: *numIterations, ModelConfig: model.Config}
+		if err := checkpoint.Save(*outPath, outMeta, model.NamedParameters()); err != nil {
 			logger.Error("save", "err", err)
 			os.Exit(1)
 		}

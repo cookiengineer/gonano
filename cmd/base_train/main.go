@@ -1,6 +1,6 @@
 // Command base_train pretrains a nanochat transformer. It derives all
 // hyperparameters from a single dial (--depth) using the scaling laws in the
-// train package.
+// trainer package.
 package main
 
 import (
@@ -10,13 +10,13 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cookiengineer/gonano/checkpoint"
 	"github.com/cookiengineer/gonano/data"
-	"github.com/cookiengineer/gonano/logging"
+	"github.com/cookiengineer/gonano/internal/logging"
 	"github.com/cookiengineer/gonano/model"
-	"github.com/cookiengineer/gonano/tensor"
+	"github.com/cookiengineer/gonano/model/checkpoint"
+	"github.com/cookiengineer/gonano/tensors"
 	"github.com/cookiengineer/gonano/tokenizer"
-	"github.com/cookiengineer/gonano/train"
+	"github.com/cookiengineer/gonano/trainer"
 )
 
 func main() {
@@ -39,25 +39,25 @@ func main() {
 
 	// Tokenizer: load a trained tokenizer if present, else fall back to a
 	// byte-level tokenizer for smoke runs.
-	tok, err := tokenizer.LoadTokenizer(filepath.Join(*baseDir, "tokenizer", "tokenizer.json"))
+	tokenizer, err := tokenizer.LoadTokenizer(filepath.Join(*baseDir, "tokenizer", "tokenizer.json"))
 	if err != nil {
 		logger.Warn("no trained tokenizer, using byte-level tokenizer", "err", err)
-		tok = byteTokenizer()
-		*vocabSize = tok.VocabSize()
+		tokenizer = byteTokenizer()
+		*vocabSize = tokenizer.VocabSize()
 		// Persist the tokenizer so downstream commands can load it.
 		tokDir := filepath.Join(*baseDir, "tokenizer")
 		os.MkdirAll(tokDir, 0o755)
-		if err := tok.Save(filepath.Join(tokDir, "tokenizer.json")); err != nil {
+		if err := tokenizer.Save(filepath.Join(tokDir, "tokenizer.json")); err != nil {
 			logger.Warn("could not save tokenizer", "err", err)
 		}
 	}
 
-	cfg := model.ConfigForDepth(*depth, tok.VocabSize(), 64, 128, *maxSeqLen, "SSSL")
-	m := model.NewTransformer(cfg)
-	m.InitWeights(tensor.NewRNG(42))
+	configuration := model.ConfigForDepth(*depth, tokenizer.VocabSize(), 64, 128, *maxSeqLen, "SSSL")
+	model := model.NewTransformer(configuration)
+	model.InitWeights(tensors.NewRNG(42))
 
 	// Optimizer groups and training hyperparameters.
-	groups := m.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5)
+	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5)
 
 	// Data source.
 	var provider data.DocProvider
@@ -84,31 +84,31 @@ func main() {
 		provider = syntheticProvider()
 	}
 
-	loader := data.NewPretrainLoader(tok, *deviceBatchSize, *maxSeqLen, provider, 1000)
+	loader := data.NewPretrainLoader(tokenizer, *deviceBatchSize, *maxSeqLen, provider, 1000)
 
 	gradAccum := *totalBatchSize / (*deviceBatchSize * *maxSeqLen)
 	if gradAccum < 1 {
 		gradAccum = 1
 	}
-	tr := train.NewTrainer(m, groups, gradAccum)
+	trainer := trainer.NewTrainer(model, groups, gradAccum)
 
 	// Training loop.
 	outputDir := filepath.Join(*baseDir, "base_checkpoints", modelTagOrDepth(*modelTag, *depth))
 	os.MkdirAll(outputDir, 0o755)
 
-	logger.Info("training", "depth", *depth, "dim", cfg.EmbedDim, "params", m.TotalParams(), "steps", *numIterations)
+	logger.Info("training", "depth", *depth, "dim", configuration.EmbedDim, "params", model.TotalParams(), "steps", *numIterations)
 	for step := 0; step < *numIterations; step++ {
-		x, y, _ := loader.Next()
-		loss := tr.TrainStep(x, y)
-		tr.StepOptimizer(step, *numIterations)
+		inputs, targets, _ := loader.Next()
+		loss := trainer.TrainStep(inputs, targets)
+		trainer.StepOptimizer(step, *numIterations)
 		if step%10 == 0 || step == *numIterations-1 {
 			logger.Info("step", "step", step, "loss", fmt.Sprintf("%.4f", loss))
 		}
 	}
 
 	// Save the final checkpoint.
-	meta := checkpoint.Meta{Step: *numIterations, ModelConfig: cfg}
-	if err := checkpoint.Save(checkpoint.ModelPath(outputDir, *numIterations), meta, m.NamedParameters()); err != nil {
+	meta := checkpoint.Meta{Step: *numIterations, ModelConfig: configuration}
+	if err := checkpoint.Save(checkpoint.ModelPath(outputDir, *numIterations), meta, model.NamedParameters()); err != nil {
 		logger.Error("save checkpoint", "err", err)
 		os.Exit(1)
 	}
@@ -124,8 +124,8 @@ func modelTagOrDepth(tag string, depth int) string {
 
 func byteTokenizer() *tokenizer.Tokenizer {
 	ranks := make(map[string]int, 256)
-	for i := 0; i < 256; i++ {
-		ranks[string([]byte{byte(i)})] = i
+	for index := 0; index < 256; index++ {
+		ranks[string([]byte{byte(index)})] = index
 	}
 	return tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
 }
@@ -136,10 +136,10 @@ func syntheticProvider() data.DocProvider {
 		"machine learning is the study of algorithms that improve with experience",
 		"the capital of France is Paris",
 	}
-	i := 0
+	index := 0
 	return func() ([]string, data.State) {
-		d := docs[i%len(docs)]
-		i++
-		return []string{d}, data.State{PQIndex: 0, RGIndex: 0, Epoch: 1}
+		document := docs[index%len(docs)]
+		index++
+		return []string{document}, data.State{PQIndex: 0, RGIndex: 0, Epoch: 1}
 	}
 }

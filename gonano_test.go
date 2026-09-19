@@ -4,12 +4,12 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/cookiengineer/gonano/checkpoint"
-	"github.com/cookiengineer/gonano/infer"
+	"github.com/cookiengineer/gonano/inference"
 	"github.com/cookiengineer/gonano/model"
-	"github.com/cookiengineer/gonano/tensor"
+	"github.com/cookiengineer/gonano/model/checkpoint"
+	"github.com/cookiengineer/gonano/tensors"
 	"github.com/cookiengineer/gonano/tokenizer"
-	"github.com/cookiengineer/gonano/train"
+	"github.com/cookiengineer/gonano/trainer"
 )
 
 // TestEndToEnd exercises the full pipeline: train a tiny model, save it, load
@@ -20,14 +20,14 @@ func TestEndToEnd(t *testing.T) {
 		EmbedDim: 32, WindowPattern: "L",
 	}
 	m := model.NewTransformer(cfg)
-	m.InitWeights(tensor.NewRNG(0))
+	m.InitWeights(tensors.NewRNG(0))
 	groups := m.SetupOptimizer(0.01, 0.1, 0.01, 0.0, 0.1)
-	tr := train.NewTrainer(m, groups, 1)
+	tr := trainer.NewTrainer(m, groups, 1)
 	tr.WarmupSteps = 2
 	tr.WarmdownRatio = 0
 
-	x := tensor.NewInt32sWithData([]int{1, 8}, []int32{1, 2, 3, 4, 5, 6, 7, 8})
-	y := tensor.NewInt32sWithData([]int{1, 8}, []int32{2, 3, 4, 5, 6, 7, 8, 9})
+	x := tensors.NewInt32sWithData([]int{1, 8}, []int32{1, 2, 3, 4, 5, 6, 7, 8})
+	y := tensors.NewInt32sWithData([]int{1, 8}, []int32{2, 3, 4, 5, 6, 7, 8, 9})
 	for step := 0; step < 20; step++ {
 		tr.TrainStep(x, y)
 		tr.StepOptimizer(step, 20)
@@ -50,7 +50,7 @@ func TestEndToEnd(t *testing.T) {
 		ranks[string([]byte{byte(i)})] = i
 	}
 	tok := tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
-	engine := infer.NewEngine(loaded, tok)
+	engine := inference.NewEngine(loaded, tok)
 
 	prompt := []int{1, 2, 3}
 	results, _ := engine.GenerateBatch(prompt, 1, 4, 0.0, 0, 42)

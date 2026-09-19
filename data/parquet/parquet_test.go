@@ -11,66 +11,66 @@ import (
 // compactWriter builds Thrift Compact Protocol bytes, used to construct valid
 // test Parquet files.
 type compactWriter struct {
-	b         []byte
+	buffer    []byte
 	lastField int
 }
 
-func (w *compactWriter) field(id int, typ byte) {
-	delta := id - w.lastField
+func (writer *compactWriter) field(id int, typ byte) {
+	delta := id - writer.lastField
 	if delta > 0 && delta <= 15 {
-		w.b = append(w.b, byte(delta<<4)|typ)
+		writer.buffer = append(writer.buffer, byte(delta<<4)|typ)
 	} else {
-		w.b = append(w.b, typ)
-		w.zigzagI16(int16(id))
+		writer.buffer = append(writer.buffer, typ)
+		writer.zigzagI16(int16(id))
 	}
-	w.lastField = id
+	writer.lastField = id
 }
 
-func (w *compactWriter) stop() { w.b = append(w.b, 0x00) }
+func (writer *compactWriter) stop() { writer.buffer = append(writer.buffer, 0x00) }
 
-func (w *compactWriter) uvarint(u uint64) {
-	for u >= 0x80 {
-		w.b = append(w.b, byte(u)|0x80)
-		u >>= 7
+func (writer *compactWriter) uvarint(value uint64) {
+	for value >= 0x80 {
+		writer.buffer = append(writer.buffer, byte(value)|0x80)
+		value >>= 7
 	}
-	w.b = append(w.b, byte(u))
+	writer.buffer = append(writer.buffer, byte(value))
 }
 
-func (w *compactWriter) zigzag(v int64) {
-	w.uvarint(uint64((v << 1) ^ (v >> 63)))
+func (writer *compactWriter) zigzag(value int64) {
+	writer.uvarint(uint64((value << 1) ^ (value >> 63)))
 }
 
-func (w *compactWriter) zigzagI16(v int16) {
-	w.uvarint(uint64((int32(v) << 1) ^ (int32(v) >> 31)))
+func (writer *compactWriter) zigzagI16(value int16) {
+	writer.uvarint(uint64((int32(value) << 1) ^ (int32(value) >> 31)))
 }
 
-func (w *compactWriter) i32(v int32) { w.zigzag(int64(v)) }
-func (w *compactWriter) i64(v int64) { w.zigzag(v) }
+func (writer *compactWriter) i32(value int32) { writer.zigzag(int64(value)) }
+func (writer *compactWriter) i64(value int64) { writer.zigzag(value) }
 
-func (w *compactWriter) bin(s []byte) {
-	w.uvarint(uint64(len(s)))
-	w.b = append(w.b, s...)
+func (writer *compactWriter) bin(data []byte) {
+	writer.uvarint(uint64(len(data)))
+	writer.buffer = append(writer.buffer, data...)
 }
 
-func (w *compactWriter) str(s string) { w.bin([]byte(s)) }
+func (writer *compactWriter) str(text string) { writer.bin([]byte(text)) }
 
-func (w *compactWriter) listHeader(size int, elemType byte) {
+func (writer *compactWriter) listHeader(size int, elemType byte) {
 	if size < 15 {
-		w.b = append(w.b, byte(size<<4)|elemType)
+		writer.buffer = append(writer.buffer, byte(size<<4)|elemType)
 	} else {
-		w.b = append(w.b, 0xF0|elemType)
-		w.uvarint(uint64(size))
+		writer.buffer = append(writer.buffer, 0xF0|elemType)
+		writer.uvarint(uint64(size))
 	}
 }
 
 // buildPlainPage encodes a DATA_PAGE with PLAIN BYTE_ARRAY values.
 func buildPlainPage(values [][]byte) []byte {
 	var data []byte
-	for _, v := range values {
-		var u compactWriter
-		u.uvarint(uint64(len(v)))
-		data = append(data, u.b...)
-		data = append(data, v...)
+	for _, value := range values {
+		var lengthWriter compactWriter
+		lengthWriter.uvarint(uint64(len(value)))
+		data = append(data, lengthWriter.buffer...)
+		data = append(data, value...)
 	}
 	return buildDataPage(data, len(values), encPlain)
 }
@@ -96,10 +96,10 @@ func buildDataPage(data []byte, numValues int, encoding int32) []byte {
 	ph.field(3, ctI32)
 	ph.i32(int32(len(data))) // compressed size
 	ph.field(5, ctStruct)
-	ph.b = append(ph.b, dp.b...)
+	ph.buffer = append(ph.buffer, dp.buffer...)
 	ph.stop()
 
-	out := append([]byte(nil), ph.b...)
+	out := append([]byte(nil), ph.buffer...)
 	out = append(out, data...)
 	return out
 }
@@ -107,11 +107,11 @@ func buildDataPage(data []byte, numValues int, encoding int32) []byte {
 // buildDictionaryPage encodes a DICTIONARY_PAGE with PLAIN BYTE_ARRAY values.
 func buildDictionaryPage(dict [][]byte) []byte {
 	var data []byte
-	for _, v := range dict {
-		var u compactWriter
-		u.uvarint(uint64(len(v)))
-		data = append(data, u.b...)
-		data = append(data, v...)
+	for _, value := range dict {
+		var lengthWriter compactWriter
+		lengthWriter.uvarint(uint64(len(value)))
+		data = append(data, lengthWriter.buffer...)
+		data = append(data, value...)
 	}
 	var dh compactWriter
 	dh.field(1, ctI32)
@@ -128,10 +128,10 @@ func buildDictionaryPage(dict [][]byte) []byte {
 	ph.field(3, ctI32)
 	ph.i32(int32(len(data)))
 	ph.field(7, ctStruct)
-	ph.b = append(ph.b, dh.b...)
+	ph.buffer = append(ph.buffer, dh.buffer...)
 	ph.stop()
 
-	return append(append([]byte(nil), ph.b...), data...)
+	return append(append([]byte(nil), ph.buffer...), data...)
 }
 
 // buildRLEDictionaryIndexData builds an RLE/bit-packed encoded index buffer.
@@ -140,21 +140,21 @@ func buildRLEDictionaryIndexData(idxs []int32, bitWidth int) []byte {
 	// for general indexes use bit-packed runs. Here we support both by building
 	// bit-packed runs of 8 values.
 	var body []byte
-	for i := 0; i < len(idxs); i += 8 {
-		n := len(idxs) - i
-		if n > 8 {
-			n = 8
+	for start := 0; start < len(idxs); start += 8 {
+		remaining := len(idxs) - start
+		if remaining > 8 {
+			remaining = 8
 		}
 		// Bit-packed run header: 1 group (bit 0 set).
-		var u compactWriter
-		u.uvarint(uint64(1)<<1 | 1)
-		body = append(body, u.b...)
+		var headerWriter compactWriter
+		headerWriter.uvarint(uint64(1)<<1 | 1)
+		body = append(body, headerWriter.buffer...)
 		group := make([]byte, bitWidth)
-		for v := 0; v < n; v++ {
-			val := uint64(uint32(idxs[i+v]))
-			for b := 0; b < bitWidth; b++ {
-				if (val>>b)&1 == 1 {
-					bitPos := v*bitWidth + b
+		for valueIndex := 0; valueIndex < remaining; valueIndex++ {
+			value := uint64(uint32(idxs[start+valueIndex]))
+			for bit := 0; bit < bitWidth; bit++ {
+				if (value>>bit)&1 == 1 {
+					bitPos := valueIndex*bitWidth + bit
 					group[bitPos/8] |= 1 << (bitPos % 8)
 				}
 			}
@@ -187,44 +187,44 @@ func buildMetaClean(columns []columnChunk, numRows int64) []byte {
 	var rg compactWriter
 	rg.field(1, ctList)
 	rg.listHeader(len(columns), ctStruct)
-	for _, cc := range columns {
-		var c compactWriter
-		c.field(2, ctI64)
-		c.i64(cc.fileOffset)
-		if cc.meta != nil {
-			c.field(3, ctStruct)
-			var cm compactWriter
-			cm.field(1, ctI32)
-			cm.i32(cc.meta.typ)
-			cm.field(2, ctList)
-			cm.listHeader(len(cc.meta.encodings), ctI32)
-			for _, e := range cc.meta.encodings {
-				cm.i32(e)
+	for _, column := range columns {
+		var chunkWriter compactWriter
+		chunkWriter.field(2, ctI64)
+		chunkWriter.i64(column.fileOffset)
+		if column.meta != nil {
+			chunkWriter.field(3, ctStruct)
+			var columnMetaWriter compactWriter
+			columnMetaWriter.field(1, ctI32)
+			columnMetaWriter.i32(column.meta.typ)
+			columnMetaWriter.field(2, ctList)
+			columnMetaWriter.listHeader(len(column.meta.encodings), ctI32)
+			for _, encoding := range column.meta.encodings {
+				columnMetaWriter.i32(encoding)
 			}
-			cm.field(3, ctList)
-			cm.listHeader(len(cc.meta.pathInSchema), ctBinary)
-			for _, p := range cc.meta.pathInSchema {
-				cm.str(p)
+			columnMetaWriter.field(3, ctList)
+			columnMetaWriter.listHeader(len(column.meta.pathInSchema), ctBinary)
+			for _, path := range column.meta.pathInSchema {
+				columnMetaWriter.str(path)
 			}
-			cm.field(4, ctI32)
-			cm.i32(cc.meta.codec)
-			cm.field(5, ctI64)
-			cm.i64(cc.meta.numValues)
-			cm.field(6, ctI64)
-			cm.i64(cc.meta.totalUncompressedSize)
-			cm.field(7, ctI64)
-			cm.i64(cc.meta.totalCompressedSize)
-			cm.field(9, ctI64)
-			cm.i64(cc.meta.dataPageOffset)
-			if cc.meta.dictionaryPageOffset > 0 {
-				cm.field(11, ctI64)
-				cm.i64(cc.meta.dictionaryPageOffset)
+			columnMetaWriter.field(4, ctI32)
+			columnMetaWriter.i32(column.meta.codec)
+			columnMetaWriter.field(5, ctI64)
+			columnMetaWriter.i64(column.meta.numValues)
+			columnMetaWriter.field(6, ctI64)
+			columnMetaWriter.i64(column.meta.totalUncompressedSize)
+			columnMetaWriter.field(7, ctI64)
+			columnMetaWriter.i64(column.meta.totalCompressedSize)
+			columnMetaWriter.field(9, ctI64)
+			columnMetaWriter.i64(column.meta.dataPageOffset)
+			if column.meta.dictionaryPageOffset > 0 {
+				columnMetaWriter.field(11, ctI64)
+				columnMetaWriter.i64(column.meta.dictionaryPageOffset)
 			}
-			cm.stop()
-			c.b = append(c.b, cm.b...)
+			columnMetaWriter.stop()
+			chunkWriter.buffer = append(chunkWriter.buffer, columnMetaWriter.buffer...)
 		}
-		c.stop()
-		rg.b = append(rg.b, c.b...)
+		chunkWriter.stop()
+		rg.buffer = append(rg.buffer, chunkWriter.buffer...)
 	}
 	rg.field(2, ctI64)
 	rg.i64(0) // total_byte_size
@@ -232,24 +232,24 @@ func buildMetaClean(columns []columnChunk, numRows int64) []byte {
 	rg.i64(numRows)
 	rg.stop()
 
-	var w compactWriter
-	w.field(1, ctI32)
-	w.i32(1)
-	w.field(2, ctList)
-	w.listHeader(2, ctStruct)
-	w.b = append(w.b, root.b...)
-	w.b = append(w.b, leaf.b...)
-	w.field(3, ctI64)
-	w.i64(numRows)
-	w.field(4, ctList)
-	w.listHeader(1, ctStruct)
-	w.b = append(w.b, rg.b...)
-	w.stop()
-	return w.b
+	var metadataWriter compactWriter
+	metadataWriter.field(1, ctI32)
+	metadataWriter.i32(1)
+	metadataWriter.field(2, ctList)
+	metadataWriter.listHeader(2, ctStruct)
+	metadataWriter.buffer = append(metadataWriter.buffer, root.buffer...)
+	metadataWriter.buffer = append(metadataWriter.buffer, leaf.buffer...)
+	metadataWriter.field(3, ctI64)
+	metadataWriter.i64(numRows)
+	metadataWriter.field(4, ctList)
+	metadataWriter.listHeader(1, ctStruct)
+	metadataWriter.buffer = append(metadataWriter.buffer, rg.buffer...)
+	metadataWriter.stop()
+	return metadataWriter.buffer
 }
 
-func writeParquet(t *testing.T, dataPage []byte, dictPage []byte, numRows int64) string {
-	t.Helper()
+func writeParquet(tests *testing.T, dataPage []byte, dictPage []byte, numRows int64) string {
+	tests.Helper()
 	// Layout: "PAR1" | [dictionary page] | [data page] | FileMetaData | len | "PAR1"
 	body := []byte("PAR1")
 	dictOffset := int64(0)
@@ -260,109 +260,109 @@ func writeParquet(t *testing.T, dataPage []byte, dictPage []byte, numRows int64)
 	dataOffset := int64(len(body))
 	body = append(body, dataPage...)
 
-	cc := columnChunk{
+	chunk := columnChunk{
 		fileOffset: dataOffset,
 		meta: &columnMetaData{
-			typ:                   typeByteArray,
-			encodings:             []int32{encPlain},
-			pathInSchema:          []string{"text"},
-			codec:                 codecUncompressed,
-			numValues:             numRows,
-			dataPageOffset:        dataOffset,
-			dictionaryPageOffset:  dictOffset,
+			typ:                  typeByteArray,
+			encodings:            []int32{encPlain},
+			pathInSchema:         []string{"text"},
+			codec:                codecUncompressed,
+			numValues:            numRows,
+			dataPageOffset:       dataOffset,
+			dictionaryPageOffset: dictOffset,
 		},
 	}
-	meta := buildMetaClean([]columnChunk{cc}, numRows)
-	body = append(body, meta...)
+	metadata := buildMetaClean([]columnChunk{chunk}, numRows)
+	body = append(body, metadata...)
 	body = append(body, make([]byte, 4)...)
-	binary.LittleEndian.PutUint32(body[len(body)-4:], uint32(len(meta)))
+	binary.LittleEndian.PutUint32(body[len(body)-4:], uint32(len(metadata)))
 	body = append(body, "PAR1"...)
 
-	path := filepath.Join(t.TempDir(), "test.parquet")
+	path := filepath.Join(tests.TempDir(), "test.parquet")
 	if err := os.WriteFile(path, body, 0o644); err != nil {
-		t.Fatalf("write: %v", err)
+		tests.Fatalf("write: %v", err)
 	}
 	return path
 }
 
-func TestReaderPlainStrings(t *testing.T) {
+func TestReaderPlainStrings(tests *testing.T) {
 	values := [][]byte{[]byte("hello"), []byte("world"), []byte("foo bar")}
 	page := buildPlainPage(values)
-	path := writeParquet(t, page, nil, int64(len(values)))
+	path := writeParquet(tests, page, nil, int64(len(values)))
 
-	r, err := Open(path)
+	reader, err := Open(path)
 	if err != nil {
-		t.Fatalf("Open: %v", err)
+		tests.Fatalf("Open: %v", err)
 	}
-	defer r.Close()
-	if r.NumRowGroups() != 1 {
-		t.Fatalf("row groups = %d, want 1", r.NumRowGroups())
+	defer reader.Close()
+	if reader.NumRowGroups() != 1 {
+		tests.Fatalf("row groups = %d, want 1", reader.NumRowGroups())
 	}
-	got, err := r.ReadColumnStrings(0, "text")
+	got, err := reader.ReadColumnStrings(0, "text")
 	if err != nil {
-		t.Fatalf("ReadColumnStrings: %v", err)
+		tests.Fatalf("ReadColumnStrings: %v", err)
 	}
 	want := []string{"hello", "world", "foo bar"}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %v, want %v", got, want)
+		tests.Fatalf("got %v, want %v", got, want)
 	}
 }
 
-func TestReaderRLEDictionary(t *testing.T) {
+func TestReaderRLEDictionary(tests *testing.T) {
 	dict := [][]byte{[]byte("alpha"), []byte("beta"), []byte("gamma")}
 	dictPage := buildDictionaryPage(dict)
 	idxs := []int32{0, 1, 2, 0, 1}
-	bitWidth := bitWidthForDict(len(dict))
+	bitWidth := computeDictBitWidth(len(dict))
 	indexData := buildRLEDictionaryIndexData(idxs, bitWidth)
 	dataPage := buildDataPage(indexData, len(idxs), encRLE_Dictionary)
 
-	path := writeParquet(t, dataPage, dictPage, int64(len(idxs)))
-	r, err := Open(path)
+	path := writeParquet(tests, dataPage, dictPage, int64(len(idxs)))
+	reader, err := Open(path)
 	if err != nil {
-		t.Fatalf("Open: %v", err)
+		tests.Fatalf("Open: %v", err)
 	}
-	defer r.Close()
-	got, err := r.ReadColumnStrings(0, "text")
+	defer reader.Close()
+	got, err := reader.ReadColumnStrings(0, "text")
 	if err != nil {
-		t.Fatalf("ReadColumnStrings: %v", err)
+		tests.Fatalf("ReadColumnStrings: %v", err)
 	}
 	want := []string{"alpha", "beta", "gamma", "alpha", "beta"}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %v, want %v", got, want)
+		tests.Fatalf("got %v, want %v", got, want)
 	}
 }
 
-func TestReaderColumnNames(t *testing.T) {
+func TestReaderColumnNames(tests *testing.T) {
 	page := buildPlainPage([][]byte{[]byte("x")})
-	path := writeParquet(t, page, nil, 1)
-	r, err := Open(path)
+	path := writeParquet(tests, page, nil, 1)
+	reader, err := Open(path)
 	if err != nil {
-		t.Fatalf("Open: %v", err)
+		tests.Fatalf("Open: %v", err)
 	}
-	defer r.Close()
-	names := r.ColumnNames()
+	defer reader.Close()
+	names := reader.ColumnNames()
 	if !reflect.DeepEqual(names, []string{"text"}) {
-		t.Fatalf("names = %v, want [text]", names)
+		tests.Fatalf("names = %v, want [text]", names)
 	}
 }
 
-func TestReaderMissingColumn(t *testing.T) {
+func TestReaderMissingColumn(tests *testing.T) {
 	page := buildPlainPage([][]byte{[]byte("x")})
-	path := writeParquet(t, page, nil, 1)
-	r, err := Open(path)
+	path := writeParquet(tests, page, nil, 1)
+	reader, err := Open(path)
 	if err != nil {
-		t.Fatalf("Open: %v", err)
+		tests.Fatalf("Open: %v", err)
 	}
-	defer r.Close()
-	if _, err := r.ReadColumnStrings(0, "nope"); err == nil {
-		t.Fatal("expected error for missing column")
+	defer reader.Close()
+	if _, err := reader.ReadColumnStrings(0, "nope"); err == nil {
+		tests.Fatal("expected error for missing column")
 	}
 }
 
-func TestReaderRejectsNonParquet(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "bad.parquet")
+func TestReaderRejectsNonParquet(tests *testing.T) {
+	path := filepath.Join(tests.TempDir(), "bad.parquet")
 	os.WriteFile(path, []byte("not a parquet file"), 0o644)
 	if _, err := Open(path); err == nil {
-		t.Fatal("expected error for non-parquet file")
+		tests.Fatal("expected error for non-parquet file")
 	}
 }

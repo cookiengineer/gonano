@@ -8,12 +8,12 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cookiengineer/gonano/checkpoint"
 	"github.com/cookiengineer/gonano/data"
-	"github.com/cookiengineer/gonano/eval"
-	"github.com/cookiengineer/gonano/eval/tasks"
-	"github.com/cookiengineer/gonano/infer"
-	"github.com/cookiengineer/gonano/logging"
+	"github.com/cookiengineer/gonano/evaluator"
+	"github.com/cookiengineer/gonano/evaluator/tasks"
+	"github.com/cookiengineer/gonano/inference"
+	"github.com/cookiengineer/gonano/internal/logging"
+	"github.com/cookiengineer/gonano/model/checkpoint"
 	"github.com/cookiengineer/gonano/tokenizer"
 )
 
@@ -30,7 +30,7 @@ func main() {
 	if *baseDir == "" {
 		*baseDir = data.BaseDir()
 	}
-	tok, err := tokenizer.LoadTokenizer(filepath.Join(*baseDir, "tokenizer", "tokenizer.json"))
+	tokenizer, err := tokenizer.LoadTokenizer(filepath.Join(*baseDir, "tokenizer", "tokenizer.json"))
 	if err != nil {
 		logger.Error("load tokenizer", "err", err)
 		os.Exit(1)
@@ -40,20 +40,20 @@ func main() {
 		logger.Error("load checkpoint", "err", err)
 		os.Exit(1)
 	}
-	m := checkpoint.LoadModel(meta, params)
-	engine := infer.NewEngine(m, tok)
+	model := checkpoint.LoadModel(meta, params)
+	engine := inference.NewEngine(model, tokenizer)
 
 	// Synthetic categorical task for demonstration.
-	mm := tasks.NewMMLUFromRows([]tasks.MMLURow{
+	mmlu := tasks.NewMMLUFromRows([]tasks.MMLURow{
 		{Question: "What is 2+2?", Choices: []string{"3", "4", "5", "6"}, Answer: 1},
 		{Question: "Capital of France?", Choices: []string{"London", "Paris", "Rome", "Berlin"}, Answer: 1},
 	})
-	acc := eval.CategoricalAccuracy(mm, m, tok)
-	fmt.Printf("MMLU (synthetic) accuracy: %.2f%%\n", 100*acc)
+	categoricalAccuracy := evaluator.CategoricalAccuracy(mmlu, model, tokenizer)
+	fmt.Printf("MMLU (synthetic) accuracy: %.2f%%\n", 100*categoricalAccuracy)
 
-	gsm := tasks.NewGSM8KFromRows([]tasks.GSM8KRow{
+	gsm8k := tasks.NewGSM8KFromRows([]tasks.GSM8KRow{
 		{Question: "What is 2+2?", Answer: "#### 4"},
 	})
-	gen := eval.GenerativeAccuracy(gsm, m, tok, engine, 1, 16, 0.0, 50)
-	fmt.Printf("GSM8K (synthetic) accuracy: %.2f%%\n", 100*gen)
+	generativeAccuracy := evaluator.GenerativeAccuracy(gsm8k, model, tokenizer, engine, 1, 16, 0.0, 50)
+	fmt.Printf("GSM8K (synthetic) accuracy: %.2f%%\n", 100*generativeAccuracy)
 }

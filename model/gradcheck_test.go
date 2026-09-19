@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/cookiengineer/gonano/tensor"
+	"github.com/cookiengineer/gonano/tensors"
 )
 
 // Gradient-check the analytic backprop against finite differences. A
@@ -12,86 +12,86 @@ import (
 // far more robust to fp32 finite-difference noise than per-element checks.
 
 func tinyTrainModel() *Transformer {
-	cfg := Config{
+	config := Config{
 		SequenceLen: 16, VocabSize: 16, NumLayer: 2, NumHead: 2, NumKVHead: 2,
 		EmbedDim: 32, WindowPattern: "L",
 	}
-	m := NewTransformer(cfg)
-	m.InitWeights(tensor.NewRNG(42))
+	model := NewTransformer(config)
+	model.InitWeights(tensors.NewRNG(42))
 	// nanochat initializes projection layers to zero, which zeroes the
 	// gradient flowing into the trunk at init. Perturb all weights so the
 	// gradient check sees non-trivial signal through every layer.
-	perturb := tensor.NewRNG(123)
-	for _, p := range m.Parameters() {
-		for i := range p.Data {
-			p.Data[i] += perturb.NormFloat32() * 0.1
+	perturb := tensors.NewRNG(123)
+	for _, parameter := range model.Parameters() {
+		for elementIndex := range parameter.Data {
+			parameter.Data[elementIndex] += perturb.NormFloat32() * 0.1
 		}
 	}
-	return m
+	return model
 }
 
-func tinyData() (*tensor.Int32s, *tensor.Int32s) {
-	idx := tensor.NewInt32sWithData([]int{1, 6}, []int32{1, 5, 2, 8, 3, 7})
-	targets := tensor.NewInt32sWithData([]int{1, 6}, []int32{5, 2, 8, 3, 7, 4})
-	return idx, targets
+func tinyData() (*tensors.Int32s, *tensors.Int32s) {
+	indexes := tensors.NewInt32sWithData([]int{1, 6}, []int32{1, 5, 2, 8, 3, 7})
+	targets := tensors.NewInt32sWithData([]int{1, 6}, []int32{5, 2, 8, 3, 7, 4})
+	return indexes, targets
 }
 
-func meanLoss(m *Transformer, idx, targets *tensor.Int32s) float32 {
-	logits, _ := m.TrainForward(idx)
-	flat := logits.Reshape(idx.Numel(), m.Config.VocabSize)
-	tflat := targets.Reshape(idx.Numel())
-	return tensor.CrossEntropy(flat, tflat, -1)
+func meanLoss(model *Transformer, indexes, targets *tensors.Int32s) float32 {
+	logits, _ := model.TrainForward(indexes)
+	flattened := logits.Reshape(indexes.Numel(), model.Config.VocabSize)
+	targetFlat := targets.Reshape(indexes.Numel())
+	return tensors.CrossEntropy(flattened, targetFlat, -1)
 }
 
-func analyticGrads(m *Transformer, idx, targets *tensor.Int32s) {
-	m.ZeroGrad()
-	logits, ctx := m.TrainForward(idx)
-	flat := logits.Reshape(idx.Numel(), m.Config.VocabSize)
-	tflat := targets.Reshape(idx.Numel())
-	_, valid := tensor.CrossEntropyPerPosition(flat, tflat, -1)
-	gradLogits := tensor.CrossEntropyGrad(flat, tflat, -1, 1/float32(valid))
-	gradLogits = gradLogits.Reshape(idx.Shape[0], idx.Shape[1], m.Config.VocabSize)
-	m.TrainBackward(ctx, gradLogits)
+func analyticGrads(model *Transformer, indexes, targets *tensors.Int32s) {
+	model.ZeroGrad()
+	logits, context := model.TrainForward(indexes)
+	flattened := logits.Reshape(indexes.Numel(), model.Config.VocabSize)
+	targetFlat := targets.Reshape(indexes.Numel())
+	_, valid := tensors.CrossEntropyPerPosition(flattened, targetFlat, -1)
+	gradLogits := tensors.CrossEntropyGrad(flattened, targetFlat, -1, 1/float32(valid))
+	gradLogits = gradLogits.Reshape(indexes.Shape[0], indexes.Shape[1], model.Config.VocabSize)
+	model.TrainBackward(context, gradLogits)
 }
 
 func TestBackpropDirectionalGradientCheck(t *testing.T) {
-	m := tinyTrainModel()
-	idx, targets := tinyData()
-	analyticGrads(m, idx, targets)
+	model := tinyTrainModel()
+	indexes, targets := tinyData()
+	analyticGrads(model, indexes, targets)
 
 	// Build a random direction and compute the analytic projection.
-	rng := tensor.NewRNG(999)
-	params := m.Parameters()
-	directions := make([][]float32, len(params))
+	rng := tensors.NewRNG(999)
+	parameters := model.Parameters()
+	directions := make([][]float32, len(parameters))
 	var analytic float64
-	for i, p := range params {
-		directions[i] = make([]float32, p.Numel())
-		for j := range p.Data {
-			v := rng.NormFloat32()
-			directions[i][j] = v
-			analytic += float64(p.Grad[j]) * float64(v)
+	for parameterIndex, parameter := range parameters {
+		directions[parameterIndex] = make([]float32, parameter.Numel())
+		for elementIndex := range parameter.Data {
+			value := rng.NormFloat32()
+			directions[parameterIndex][elementIndex] = value
+			analytic += float64(parameter.Grad[elementIndex]) * float64(value)
 		}
 	}
 
-	eps := float32(1e-3)
-	for i, p := range params {
-		for j := range p.Data {
-			p.Data[j] += eps * directions[i][j]
+	epsilon := float32(1e-3)
+	for parameterIndex, parameter := range parameters {
+		for elementIndex := range parameter.Data {
+			parameter.Data[elementIndex] += epsilon * directions[parameterIndex][elementIndex]
 		}
 	}
-	lplus := meanLoss(m, idx, targets)
-	for i, p := range params {
-		for j := range p.Data {
-			p.Data[j] -= 2 * eps * directions[i][j]
+	lossPlus := meanLoss(model, indexes, targets)
+	for parameterIndex, parameter := range parameters {
+		for elementIndex := range parameter.Data {
+			parameter.Data[elementIndex] -= 2 * epsilon * directions[parameterIndex][elementIndex]
 		}
 	}
-	lminus := meanLoss(m, idx, targets)
-	for i, p := range params {
-		for j := range p.Data {
-			p.Data[j] += eps * directions[i][j]
+	lossMinus := meanLoss(model, indexes, targets)
+	for parameterIndex, parameter := range parameters {
+		for elementIndex := range parameter.Data {
+			parameter.Data[elementIndex] += epsilon * directions[parameterIndex][elementIndex]
 		}
 	}
-	numeric := float64(lplus-lminus) / (2 * float64(eps))
+	numeric := float64(lossPlus-lossMinus) / (2 * float64(epsilon))
 
 	scale := math.Abs(analytic) + 1e-6
 	if math.Abs(numeric-analytic) > 5e-2*scale {
@@ -100,42 +100,42 @@ func TestBackpropDirectionalGradientCheck(t *testing.T) {
 }
 
 func TestBackpropPerElementGradientCheck(t *testing.T) {
-	m := tinyTrainModel()
-	idx, targets := tinyData()
-	analyticGrads(m, idx, targets)
+	model := tinyTrainModel()
+	indexes, targets := tinyData()
+	analyticGrads(model, indexes, targets)
 
 	checks := []struct {
-		name string
-		p    *tensor.Tensor
-		idx  int
+		name         string
+		parameter    *tensors.Tensor
+		elementIndex int
 	}{
-		{"wte", m.wte.Weight, 100},
-		{"lm_head", m.lm.Weight, 50},
-		{"attn.c_q", m.h[0].Attn.cq.Weight, 0},
-		{"attn.c_k", m.h[0].Attn.ck.Weight, 3},
-		{"attn.c_v", m.h[0].Attn.cv.Weight, 7},
-		{"attn.c_proj", m.h[0].Attn.cproj.Weight, 2},
-		{"mlp.c_fc", m.h[0].MLP.CFc.Weight, 5},
-		{"mlp.c_proj", m.h[0].MLP.CProj.Weight, 9},
-		{"resid_lambdas", m.residLambdas, 0},
-		{"x0_lambdas", m.x0Lambdas, 1},
-		{"smear_gate", m.smearGate.Weight, 0},
-		{"smear_lambda", m.smearLambda, 0},
-		{"backout_lambda", m.backoutLambda, 0},
-		{"value_embeds.1", m.valueEmbeds[1].Weight, 11},
-		{"ve_gate.1", m.h[1].Attn.veGate.Weight, 4},
+		{"wte", model.tokenEmbedding.Weight, 100},
+		{"lm_head", model.lmHead.Weight, 50},
+		{"attn.c_q", model.blocks[0].attention.queryProjection.Weight, 0},
+		{"attn.c_k", model.blocks[0].attention.keyProjection.Weight, 3},
+		{"attn.c_v", model.blocks[0].attention.valueProjection.Weight, 7},
+		{"attn.c_proj", model.blocks[0].attention.outputProjection.Weight, 2},
+		{"mlp.c_fc", model.blocks[0].mlp.inputProjection.Weight, 5},
+		{"mlp.c_proj", model.blocks[0].mlp.outputProjection.Weight, 9},
+		{"resid_lambdas", model.residLambdas, 0},
+		{"x0_lambdas", model.x0Lambdas, 1},
+		{"smear_gate", model.smearGate.Weight, 0},
+		{"smear_lambda", model.smearLambda, 0},
+		{"backout_lambda", model.backoutLambda, 0},
+		{"value_embeds.1", model.valueEmbeds[1].Weight, 11},
+		{"ve_gate.1", model.blocks[1].attention.valueEmbeddingGate.Weight, 4},
 	}
 
-	eps := float32(1e-3)
-	for _, ck := range checks {
-		analytic := ck.p.Grad[ck.idx]
-		orig := ck.p.Data[ck.idx]
-		ck.p.Data[ck.idx] = orig + eps
-		lplus := meanLoss(m, idx, targets)
-		ck.p.Data[ck.idx] = orig - eps
-		lminus := meanLoss(m, idx, targets)
-		ck.p.Data[ck.idx] = orig
-		numeric := (lplus - lminus) / (2 * eps)
+	epsilon := float32(1e-3)
+	for _, check := range checks {
+		analytic := check.parameter.Grad[check.elementIndex]
+		original := check.parameter.Data[check.elementIndex]
+		check.parameter.Data[check.elementIndex] = original + epsilon
+		lossPlus := meanLoss(model, indexes, targets)
+		check.parameter.Data[check.elementIndex] = original - epsilon
+		lossMinus := meanLoss(model, indexes, targets)
+		check.parameter.Data[check.elementIndex] = original
+		numeric := (lossPlus - lossMinus) / (2 * epsilon)
 
 		// fp32 finite differences are noisy for small gradients; use a
 		// relative tolerance anchored to the larger magnitude.
@@ -145,7 +145,7 @@ func TestBackpropPerElementGradientCheck(t *testing.T) {
 		}
 		scale = math.Max(scale, 1e-3)
 		if math.Abs(float64(numeric-analytic)) > 0.5*scale {
-			t.Errorf("%s[%d]: analytic=%v numeric=%v", ck.name, ck.idx, analytic, numeric)
+			t.Errorf("%s[%d]: analytic=%v numeric=%v", check.name, check.elementIndex, analytic, numeric)
 		}
 	}
 }

@@ -10,7 +10,7 @@ import (
 
 	"github.com/cookiengineer/gonano/data"
 	"github.com/cookiengineer/gonano/data/parquet"
-	"github.com/cookiengineer/gonano/logging"
+	"github.com/cookiengineer/gonano/internal/logging"
 	"github.com/cookiengineer/gonano/tokenizer"
 )
 
@@ -38,44 +38,44 @@ func main() {
 
 	// Collect document pieces (regex-split) up to maxChars.
 	var pieces []string
-	total := 0
+	totalChars := 0
 outer:
-	for _, path := range paths {
-		r, err := parquet.Open(path)
+	for _, shardPath := range paths {
+		reader, err := parquet.Open(shardPath)
 		if err != nil {
-			logger.Error("open parquet", "path", path, "err", err)
+			logger.Error("open parquet", "path", shardPath, "err", err)
 			os.Exit(1)
 		}
-		for rg := 0; rg < r.NumRowGroups(); rg++ {
-			docs, err := r.ReadColumnStrings(rg, "text")
+		for rowGroupIndex := 0; rowGroupIndex < reader.NumRowGroups(); rowGroupIndex++ {
+			docs, err := reader.ReadColumnStrings(rowGroupIndex, "text")
 			if err != nil {
 				logger.Error("read parquet", "err", err)
 				os.Exit(1)
 			}
-			for _, doc := range docs {
-				for _, p := range tokenizer.SplitPieces(doc) {
-					pieces = append(pieces, p)
-					total += len(p)
-					if total >= *maxChars {
+			for _, document := range docs {
+				for _, piece := range tokenizer.SplitPieces(document) {
+					pieces = append(pieces, piece)
+					totalChars += len(piece)
+					if totalChars >= *maxChars {
 						break outer
 					}
 				}
 			}
 		}
-		r.Close()
+		reader.Close()
 	}
 
 	numMerges := *vocabSize - 256 - len(tokenizer.SpecialTokens)
-	logger.Info("training tokenizer", "pieces", len(pieces), "chars", total, "merges", numMerges)
+	logger.Info("training tokenizer", "pieces", len(pieces), "chars", totalChars, "merges", numMerges)
 	ranks := tokenizer.TrainBPE(pieces, numMerges)
-	tok := tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
+	tokenizer := tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
 
-	out := filepath.Join(*baseDir, "tokenizer")
-	os.MkdirAll(out, 0o755)
-	path := filepath.Join(out, "tokenizer.json")
-	if err := tok.Save(path); err != nil {
+	outputDir := filepath.Join(*baseDir, "tokenizer")
+	os.MkdirAll(outputDir, 0o755)
+	outputPath := filepath.Join(outputDir, "tokenizer.json")
+	if err := tokenizer.Save(outputPath); err != nil {
 		logger.Error("save tokenizer", "err", err)
 		os.Exit(1)
 	}
-	logger.Info("saved tokenizer", "path", path, "vocab", tok.VocabSize())
+	logger.Info("saved tokenizer", "path", outputPath, "vocab", tokenizer.VocabSize())
 }

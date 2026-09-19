@@ -17,10 +17,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/cookiengineer/gonano/checkpoint"
 	"github.com/cookiengineer/gonano/data"
-	"github.com/cookiengineer/gonano/infer"
-	"github.com/cookiengineer/gonano/logging"
+	"github.com/cookiengineer/gonano/inference"
+	"github.com/cookiengineer/gonano/internal/logging"
+	"github.com/cookiengineer/gonano/model/checkpoint"
 	"github.com/cookiengineer/gonano/server"
 	"github.com/cookiengineer/gonano/tokenizer"
 )
@@ -42,10 +42,10 @@ func main() {
 		*baseDir = data.BaseDir()
 	}
 
-	tok, err := tokenizer.LoadTokenizer(resolveTokenizer(*tokenizerPath, *baseDir))
+	tokenizer, err := tokenizer.LoadTokenizer(resolveTokenizer(*tokenizerPath, *baseDir))
 	if err != nil {
 		logger.Warn("no tokenizer found; using a byte-level default", "err", err)
-		tok = byteTokenizer()
+		tokenizer = byteTokenizer()
 	}
 
 	meta, params, err := checkpoint.LoadAny(*modelPath)
@@ -53,16 +53,16 @@ func main() {
 		logger.Error("load checkpoint", "err", err)
 		os.Exit(1)
 	}
-	m := checkpoint.LoadModel(meta, params)
+	model := checkpoint.LoadModel(meta, params)
 
 	// Register the built-in calculator plus a demo "now" tool. Add more Go
 	// tools here to extend the model's abilities.
-	tools := infer.NewCalculator()
+	tools := inference.NewCalculator()
 	tools.Register(nowTool{})
 
-	srv := server.NewServer(m, tok, tools, *modelName)
-	logger.Info("serving OpenAI-compatible API", "addr", *addr, "model", *modelName, "vocab", tok.VocabSize())
-	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
+	httpServer := server.NewServer(model, tokenizer, tools, *modelName)
+	logger.Info("serving OpenAI-compatible API", "addr", *addr, "model", *modelName, "vocab", tokenizer.VocabSize())
+	if err := http.ListenAndServe(*addr, httpServer.Handler()); err != nil {
 		logger.Error("serve", "err", err)
 		os.Exit(1)
 	}
@@ -88,8 +88,8 @@ func (nowTool) Call(expr string) (string, bool) {
 
 func byteTokenizer() *tokenizer.Tokenizer {
 	ranks := make(map[string]int, 256)
-	for i := 0; i < 256; i++ {
-		ranks[string([]byte{byte(i)})] = i
+	for index := 0; index < 256; index++ {
+		ranks[string([]byte{byte(index)})] = index
 	}
 	return tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
 }

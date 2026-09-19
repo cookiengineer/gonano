@@ -18,15 +18,15 @@ symptom, the likely cause, and the exact file/function to inspect.
 | `no parquet files found` / `no .md files found` | wrong `--data-dir`, or `--data-format` mismatch | `cmd/base_train/main.go`, `data.ListParquetFiles`, `data.NewMarkdownSource` |
 | `parquet: corrupt …` / `unsupported encoding/compression` | shard not the expected schema | `data/parquet/reader.go`, `data/parquet/encoding.go`, `data/parquet/snappy.go` |
 | `sequence longer than rotary cache` | prompt or `max-seq-len` exceeds the trained context | `model/transformer.go` (`Forward`) |
-| `tensor: index … out of range` in `nn.Embedding.Forward` | token id ≥ vocab size (model/tokenizer mismatch) | `nn/linear.go` (`Embedding.Forward`), `model/config.go` |
-| `loss` becomes `NaN` / `Inf` | optimizer or backprop bug, too-high LR | `optim/muon.go`, `optim/optimizer.go`, `model/train.go` |
-| Training very slow / high CPU | matmul not tiling well, tiny batch | `tensor/matmul.go`, `parallel/pool.go` |
-| `checkpoint: invalid magic` | wrong file (not a `.gn`), truncated download | `checkpoint/checkpoint.go` |
-| `checkpoint: truncated …` | file cut short / version mismatch | `checkpoint/checkpoint.go` |
-| GGUF rejected by a tool | not a stock arch, or corrupt | `checkpoint/gguf.go` |
-| Empty / garbage generation | temperature=0 with bad tokenizer, or model not trained | `infer/engine.go`, `infer/sampler.go`, `tokenizer` |
-| Tool call silent | expression unsupported by any registered tool | `infer/tooluse.go` (`Tool`, `Registry`) |
-| HumanEval always 0% | `python3` missing on host | `exec/exec.go` (`Available`) |
+| `tensor: index … out of range` in `layers.Embedding.Forward` | token id ≥ vocab size (model/tokenizer mismatch) | `model/layers/linear.go` (`Embedding.Forward`), `model/config.go` |
+| `loss` becomes `NaN` / `Inf` | optimizer or backprop bug, too-high LR | `optimizer/muon.go`, `optimizer/optimizer.go`, `model/train.go` |
+| Training very slow / high CPU | matmul not tiling well, tiny batch | `kernels/simd/matmul.go`, `internal/parallel/pool.go` |
+| `checkpoint: invalid magic` | wrong file (not a `.gn`), truncated download | `model/checkpoint/checkpoint.go` |
+| `checkpoint: truncated …` | file cut short / version mismatch | `model/checkpoint/checkpoint.go` |
+| GGUF rejected by a tool | not a stock arch, or corrupt | `model/checkpoint/gguf.go` |
+| Empty / garbage generation | temperature=0 with bad tokenizer, or model not trained | `inference/engine.go`, `inference/sampler.go`, `tokenizer` |
+| Tool call silent | expression unsupported by any registered tool | `inference/tooluse.go` (`Tool`, `Registry`) |
+| HumanEval always 0% | `python3` missing on host | `executor/exec.go` (`Available`) |
 
 ---
 
@@ -48,10 +48,10 @@ to your shell profile, `Makefile`, or CI environment.
 (e.g. `cannot convert slice with length … to array … length 16`).
 
 **Cause:** the vector width is **runtime-selected** (128/256/512-bit depending
-on CPU). gonano's kernels are width-agnostic (`tensor/simdutil.go` reads
+on CPU). gonano's kernels are width-agnostic (`kernels/simd/backend.go` reads
 `simd.VectorBitSize()`); a fixed-width panic indicates you are calling a raw
-`simd.Load…` with a too-short slice outside the `tensor` package. Use
-`tensor` kernels or `Load…Part`/`Store…Part`.
+`simd.Load…` with a too-short slice outside the `tensors` package. Use
+`tensors` kernels or `Load…Part`/`Store…Part`.
 
 ---
 
@@ -85,7 +85,7 @@ Markdown instead.
 
 ### 3.3 Tokenizer / vocab mismatch
 
-**Symptom:** `panic: tensor: index … out of range` inside `nn.Embedding.Forward`
+**Symptom:** `panic: tensor: index … out of range` inside `layers.Embedding.Forward`
 during training or inference.
 
 **Cause:** the model's `VocabSize` does not match the tokenizer's. The model was
@@ -131,7 +131,7 @@ loop.
 This is the most serious failure. Work through the layers in order:
 
 1. **Too-high learning rate.** Reduce `--depth`'s implied LRs, or the matrix LR.
-   Muon's Polar-Express iteration (`optim/muon.go`) can diverge if the update
+   Muon's Polar-Express iteration (`optimizer/muon.go`) can diverge if the update
    scale is too large.
 2. **Backprop bug.** The backprop is verified by numerical gradient checks in
    `model/gradcheck_test.go` (`TestBackpropDirectionalGradientCheck` and
@@ -139,13 +139,13 @@ This is the most serious failure. Work through the layers in order:
    ```bash
    GOEXPERIMENT=simd go test ./model -run TestBackprop -v
    ```
-3. **Optimizer state.** `optim/optimizer.go` (AdamW) and `optim/muon.go` (Muon)
+3. **Optimizer state.** `optimizer/optimizer.go` (AdamW) and `optimizer/muon.go` (Muon)
    accumulate moments in float32; a NaN there propagates forever. Check for a
-   division by zero in the RMSNorm/softmax (`tensor/norm.go`) — the epsilon is
+   division by zero in the RMSNorm/softmax (`kernels/simd/norm.go`) — the epsilon is
    `1e-6`.
 4. **Data.** A target id outside `[0, vocab)` or a `-1` that isn't masked
-   correctly can inject garbage into `tensor.CrossEntropyGrad`
-   (`tensor/backward.go`).
+   correctly can inject garbage into `tensors.CrossEntropyGrad`
+   (`tensors/backward.go`).
 
 Bisect with a **tiny model**: depth 1–2, a few tokens, `--num-iterations 5`,
 and print `loss` every step. If it NaNs immediately, the bug is in the
@@ -155,15 +155,15 @@ forward/backward; if it NaNs later, it's the optimizer or learning rate.
 
 ## 6. Performance problems
 
-- **Matmul dominates** — see `tensor/matmul.go` (`gemmTransB`/`gemmNN`). They
+- **Matmul dominates** — see `kernels/simd/matmul.go` (`gemmTransB`/`gemmNN`). They
   tile over rows (block size 64) and parallelize across `parallel.Pool`.
   Verify `parallel.Default().Workers() == runtime.GOMAXPROCS(0)`.
 - **Tiny batches** — decode is bandwidth-bound; batching helps (see the
   `infer_bench` guide).
-- **Too many goroutines** — the `parallel` pool uses `GOMAXPROCS`; don't nest
+- **Too many goroutines** — the `internal/parallel` pool uses `GOMAXPROCS`; don't nest
   `parallel.For` inside another parallel loop.
 - **GC pressure** — the training loop allocates activations per step; the
-  reference nanochat freezes the GC. gonano's `train/trainer.go` does not yet
+  reference nanochat freezes the GC. gonano's `trainer/trainer.go` does not yet
   do this (roadmap).
 
 ---
@@ -176,7 +176,7 @@ forward/backward; if it NaNs later, it's the optimizer or learning rate.
 - `checkpoint: truncated …` → the file is short. Re-download / re-save.
 - GGUF rejected → the file is a *nanochat* container, not a stock llama
   architecture. See the export guide's architectural note. The writer itself is
-  validated in `checkpoint/gguf_test.go`.
+  validated in `model/checkpoint/gguf_test.go`.
 
 ---
 
@@ -185,17 +185,17 @@ forward/backward; if it NaNs later, it's the optimizer or learning rate.
 - **Empty/garbage output** — the model may be under-trained, or the tokenizer
   doesn't round-trip. Check `tokenizer` round-trips
   (`go test ./tokenizer`), then verify `engine.GenerateBatch` equals a naive
-  `model.Forward` loop (`infer/infer_test.go`, `TestEngineMatchesNaiveGenerate`).
-- **Top-k/temperature odd behavior** — `infer/sampler.go` (`sampleRow`,
+  `model.Forward` loop (`inference/inference_test.go`, `TestEngineMatchesNaiveGenerate`).
+- **Top-k/temperature odd behavior** — `inference/sampler.go` (`sampleRow`,
   `maskTopK`, `kthLargest`). temperature ≤ 0 is argmax; top-k masks everything
   below the k-th logit.
-- **Tool use never fires** — `infer/engine.go` looks for `<|tool_start|>` /
-  `<|tool_end|>` and dispatches the enclosed text to the `infer.Tool` registry
-  (`infer/tooluse.go`), which by default contains only the calculator
+- **Tool use never fires** — `inference/engine.go` looks for `<|tool_start|>` /
+  `<|tool_end|>` and dispatches the enclosed text to the `inference.Tool` registry
+  (`inference/tooluse.go`), which by default contains only the calculator
   (pure arithmetic or `"str".count("sub")` expressions). Register more tools
   via `Registry.Register` to extend it.
-- **HumanEval 0%** — `exec.Available()` reports whether `python3` is on `PATH`;
-  if not, `HumanEval.Evaluate` returns false (`eval/tasks/humaneval.go`).
+- **HumanEval 0%** — `executor.Available()` reports whether `python3` is on `PATH`;
+  if not, `HumanEval.Evaluate` returns false (`evaluator/tasks/humaneval.go`).
 
 ---
 
@@ -210,9 +210,9 @@ For reference when writing custom loaders or debugging:
 | tokenizer vocab == model vocab | caller (`checkpoint.LoadModel` relies on the stored config) |
 | rotary cache covers `SequenceLen` | `model.NewTransformer` (`rotaryOvercompute = 10`) |
 | KV cache head dim == `n_embd/n_head` | `model.KVBuffer` |
-| GGUF magic/version/alignment | `checkpoint/gguf.go` |
+| GGUF magic/version/alignment | `model/checkpoint/gguf.go` |
 
 If you hit a problem not covered here, open an issue with the exact panic
 message, the `--depth`/`--max-seq-len`/`--data-format` flags, and the last few
-log lines — the `logging` package (`logging/logging.go`) emits leveled
+log lines — the `logging` package (`internal/logging/logging.go`) emits leveled
 `slog` output that makes this easy to include.

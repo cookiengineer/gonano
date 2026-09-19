@@ -1,26 +1,27 @@
 package model
 
 import (
-	"github.com/cookiengineer/gonano/nn"
-	"github.com/cookiengineer/gonano/tensor"
+	"github.com/cookiengineer/gonano/model/layers"
+	"github.com/cookiengineer/gonano/tensors"
 )
 
-// MLP is the feed-forward sublayer: c_fc (4x expansion) -> ReLU² -> c_proj.
+// MLP is the feed-forward sublayer: input projection (4x expansion) ->
+// ReLU-squared -> output projection.
 type MLP struct {
-	CFc   *nn.Linear
-	CProj *nn.Linear
+	inputProjection  *layers.Linear
+	outputProjection *layers.Linear
 }
 
 // NewMLP builds an MLP with the standard 4x expansion ratio.
-func NewMLP(embedDim int) *MLP {
+func NewMLP(embeddingDimension int) *MLP {
 	return &MLP{
-		CFc:   nn.NewLinear(embedDim, 4*embedDim),
-		CProj: nn.NewLinear(4*embedDim, embedDim),
+		inputProjection:  layers.NewLinear(embeddingDimension, 4*embeddingDimension),
+		outputProjection: layers.NewLinear(4*embeddingDimension, embeddingDimension),
 	}
 }
 
-// Forward computes mlp(x) for x of shape [B,T,C].
-func (m *MLP) Forward(x *tensor.Tensor) *tensor.Tensor {
-	h := tensor.Relu2(m.CFc.Forward(x))
-	return m.CProj.Forward(h)
+// Forward computes mlp(input) for input of shape [batch, sequence, embedding].
+func (mlp *MLP) Forward(input *tensors.Tensor) *tensors.Tensor {
+	hidden := tensors.ReluSquared(mlp.inputProjection.Forward(input))
+	return mlp.outputProjection.Forward(hidden)
 }

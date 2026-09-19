@@ -9,153 +9,153 @@ import "unicode"
 // rejects the possessive quantifiers and lookahead of the original.
 func SplitPieces(text string) []string {
 	runes := []rune(text)
-	n := len(runes)
-	pieces := make([]string, 0, n/4+1)
-	i := 0
-	for i < n {
-		if p, next := matchContraction(runes, i); p >= 0 {
-			pieces = append(pieces, string(runes[i:next]))
-			i = next
+	runeCount := len(runes)
+	pieces := make([]string, 0, runeCount/4+1)
+	index := 0
+	for index < runeCount {
+		if start, end := matchContraction(runes, index); start >= 0 {
+			pieces = append(pieces, string(runes[index:end]))
+			index = end
 			continue
 		}
-		if next := matchLetter(runes, i); next > i {
-			pieces = append(pieces, string(runes[i:next]))
-			i = next
+		if end := matchLetter(runes, index); end > index {
+			pieces = append(pieces, string(runes[index:end]))
+			index = end
 			continue
 		}
-		if next := matchNumber(runes, i); next > i {
-			pieces = append(pieces, string(runes[i:next]))
-			i = next
+		if end := matchNumber(runes, index); end > index {
+			pieces = append(pieces, string(runes[index:end]))
+			index = end
 			continue
 		}
-		if next := matchPunctuation(runes, i); next > i {
-			pieces = append(pieces, string(runes[i:next]))
-			i = next
+		if end := matchPunctuation(runes, index); end > index {
+			pieces = append(pieces, string(runes[index:end]))
+			index = end
 			continue
 		}
-		if next := matchNewline(runes, i); next > i {
-			pieces = append(pieces, string(runes[i:next]))
-			i = next
+		if end := matchNewline(runes, index); end > index {
+			pieces = append(pieces, string(runes[index:end]))
+			index = end
 			continue
 		}
-		if next := matchWhitespace(runes, i); next > i {
-			pieces = append(pieces, string(runes[i:next]))
-			i = next
+		if end := matchWhitespace(runes, index); end > index {
+			pieces = append(pieces, string(runes[index:end]))
+			index = end
 			continue
 		}
 		// Unreachable in practice, but never loop forever.
-		pieces = append(pieces, string(runes[i]))
-		i++
+		pieces = append(pieces, string(runes[index]))
+		index++
 	}
 	return pieces
 }
 
-// isNewline reports whether r is \r or \n (the chars explicitly excluded from
-// the letter-alternative's optional prefix).
-func isNewline(r rune) bool { return r == '\r' || r == '\n' }
+// isNewline reports whether character is \r or \n (the chars explicitly
+// excluded from the letter-alternative's optional prefix).
+func isNewline(character rune) bool { return character == '\r' || character == '\n' }
 
 // matchContraction matches ' followed by s/d/m/t/ll/ve/re (case-insensitive).
 // Returns the end index, or -1 if no match.
-func matchContraction(runes []rune, i int) (start, end int) {
-	if runes[i] != '\'' {
+func matchContraction(runes []rune, index int) (start, end int) {
+	if runes[index] != '\'' {
 		return -1, -1
 	}
-	rest := runes[i+1:]
-	lower := func(r rune) rune { return unicode.ToLower(r) }
+	rest := runes[index+1:]
+	lower := func(character rune) rune { return unicode.ToLower(character) }
 	// Two-letter contractions first.
 	if len(rest) >= 2 {
-		pair := string([]rune{lower(rest[0]), lower(rest[1])})
-		switch pair {
+		twoLetter := string([]rune{lower(rest[0]), lower(rest[1])})
+		switch twoLetter {
 		case "ll", "ve", "re":
-			return i, i + 3
+			return index, index + 3
 		}
 	}
 	if len(rest) >= 1 {
 		switch lower(rest[0]) {
 		case 's', 'd', 'm', 't':
-			return i, i + 2
+			return index, index + 2
 		}
 	}
 	return -1, -1
 }
 
 // matchLetter matches [^\r\n\p{L}\p{N}]?+ \p{L}+.
-func matchLetter(runes []rune, i int) int {
-	j := i
-	if !isNewline(runes[j]) && !unicode.IsLetter(runes[j]) && !unicode.IsNumber(runes[j]) {
-		j++
-		if j >= len(runes) || !unicode.IsLetter(runes[j]) {
-			return i
+func matchLetter(runes []rune, index int) int {
+	cursor := index
+	if !isNewline(runes[cursor]) && !unicode.IsLetter(runes[cursor]) && !unicode.IsNumber(runes[cursor]) {
+		cursor++
+		if cursor >= len(runes) || !unicode.IsLetter(runes[cursor]) {
+			return index
 		}
 	}
-	if j >= len(runes) || !unicode.IsLetter(runes[j]) {
-		return i
+	if cursor >= len(runes) || !unicode.IsLetter(runes[cursor]) {
+		return index
 	}
-	for j < len(runes) && unicode.IsLetter(runes[j]) {
-		j++
+	for cursor < len(runes) && unicode.IsLetter(runes[cursor]) {
+		cursor++
 	}
-	return j
+	return cursor
 }
 
 // matchNumber matches \p{N}{1,2}.
-func matchNumber(runes []rune, i int) int {
-	if !unicode.IsNumber(runes[i]) {
-		return i
+func matchNumber(runes []rune, index int) int {
+	if !unicode.IsNumber(runes[index]) {
+		return index
 	}
-	j := i + 1
-	if j < len(runes) && unicode.IsNumber(runes[j]) {
-		j++
+	cursor := index + 1
+	if cursor < len(runes) && unicode.IsNumber(runes[cursor]) {
+		cursor++
 	}
-	return j
+	return cursor
 }
 
 // matchPunctuation matches " ?" [^\s\p{L}\p{N}]++ [\r\n]*.
-func matchPunctuation(runes []rune, i int) int {
-	j := i
-	if runes[j] == ' ' {
-		j++
+func matchPunctuation(runes []rune, index int) int {
+	cursor := index
+	if runes[cursor] == ' ' {
+		cursor++
 	}
 	// One or more punctuation/symbol chars (not whitespace, letter, number).
-	start := j
-	for j < len(runes) && !unicode.IsSpace(runes[j]) && !unicode.IsLetter(runes[j]) && !unicode.IsNumber(runes[j]) {
-		j++
+	start := cursor
+	for cursor < len(runes) && !unicode.IsSpace(runes[cursor]) && !unicode.IsLetter(runes[cursor]) && !unicode.IsNumber(runes[cursor]) {
+		cursor++
 	}
-	if j == start {
-		return i
+	if cursor == start {
+		return index
 	}
-	for j < len(runes) && isNewline(runes[j]) {
-		j++
+	for cursor < len(runes) && isNewline(runes[cursor]) {
+		cursor++
 	}
-	return j
+	return cursor
 }
 
 // matchNewline matches \s* [\r\n]: a maximal whitespace run ending in a
 // newline. The regex backtracks \s* to leave the last \r or \n for [\r\n], so
 // a whitespace run with a newline consumes everything up to and including its
 // last newline.
-func matchNewline(runes []rune, i int) int {
-	j := i
+func matchNewline(runes []rune, index int) int {
+	cursor := index
 	lastNewline := -1
-	for j < len(runes) && unicode.IsSpace(runes[j]) {
-		if isNewline(runes[j]) {
-			lastNewline = j
+	for cursor < len(runes) && unicode.IsSpace(runes[cursor]) {
+		if isNewline(runes[cursor]) {
+			lastNewline = cursor
 		}
-		j++
+		cursor++
 	}
 	if lastNewline >= 0 {
 		return lastNewline + 1
 	}
-	return i
+	return index
 }
 
 // matchWhitespace matches \s+ (and \s+(?!\S)).
-func matchWhitespace(runes []rune, i int) int {
-	if !unicode.IsSpace(runes[i]) {
-		return i
+func matchWhitespace(runes []rune, index int) int {
+	if !unicode.IsSpace(runes[index]) {
+		return index
 	}
-	j := i
-	for j < len(runes) && unicode.IsSpace(runes[j]) {
-		j++
+	cursor := index
+	for cursor < len(runes) && unicode.IsSpace(runes[cursor]) {
+		cursor++
 	}
-	return j
+	return cursor
 }

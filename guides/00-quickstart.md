@@ -73,7 +73,7 @@ go run ./cmd/chat_cli \
 ```
 
 The output will be near-gibberish (it's a 20-step toy model) — the point is
-that **the whole pipeline works**: train → save → load → infer.
+that **the whole pipeline works**: train → save → load → inference.
 
 ## 5. Train on a real base English corpus (FineWeb-Edu)
 

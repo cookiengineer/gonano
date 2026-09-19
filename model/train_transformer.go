@@ -1,200 +1,200 @@
 package model
 
 import (
-	"github.com/cookiengineer/gonano/tensor"
+	"github.com/cookiengineer/gonano/tensors"
 )
 
 // trainCtx holds the activations saved by TrainForward for TrainBackward.
 type trainCtx struct {
-	idx *tensor.Int32s
+	indexes *tensors.Int32s
 
-	xEmbeddedNorm *tensor.Tensor // x after wte+norm, before smear
-	xRawEmbedding *tensor.Tensor // x after wte, before norm
-	smearSlice    *tensor.Tensor // [B,T-1,24] input to the smear gate
-	smearSig      *tensor.Tensor // [B,T-1,1] sigmoid output (pre lambda)
-	x0            *tensor.Tensor // x after smear
+	embeddedNormalized *tensors.Tensor // activations after token embedding + norm, before smear
+	rawEmbedding       *tensors.Tensor // activations after token embedding, before norm
+	smearSlice         *tensors.Tensor // [B,T-1,24] input to the smear gate
+	smearSigmoid       *tensors.Tensor // [B,T-1,1] sigmoid output (pre lambda)
+	initialResidual    *tensors.Tensor // activations after smear
 
-	xPrev    []*tensor.Tensor // x before combineResidual, per layer
-	blockCtx []*blockCtx
+	previousActivations []*tensors.Tensor // activations before combineResidual, per layer
+	blockContexts       []*blockContext
 
-	xBackout      *tensor.Tensor
-	xFinalPreNorm *tensor.Tensor // input to the final norm
-	xFinalNorm    *tensor.Tensor // input to lm_head
-	logits        *tensor.Tensor // softcapped logits [B,T,vocab]
-	valueEmbeds   map[int]*tensor.Tensor
+	backoutActivations *tensors.Tensor
+	finalPreNorm       *tensors.Tensor // input to the final norm
+	finalNorm          *tensors.Tensor // input to lm_head
+	logits             *tensors.Tensor // softcapped logits [B,T,vocab]
+	valueEmbeddings    map[int]*tensors.Tensor
 }
 
 // TrainForward runs the model forward, saving activations for backprop. It
 // returns the softcapped logits and the training context.
-func (m *Transformer) TrainForward(idx *tensor.Int32s) (*tensor.Tensor, *trainCtx) {
-	b, t := idx.Shape[0], idx.Shape[1]
-	ctx := &trainCtx{idx: idx, valueEmbeds: make(map[int]*tensor.Tensor)}
+func (model *Transformer) TrainForward(indexes *tensors.Int32s) (*tensors.Tensor, *trainCtx) {
+	batchSize, sequenceLength := indexes.Shape[0], indexes.Shape[1]
+	context := &trainCtx{indexes: indexes, valueEmbeddings: make(map[int]*tensors.Tensor)}
 
-	x := m.wte.Forward(idx)
-	ctx.xRawEmbedding = x
-	x = normLastDim(x)
-	ctx.xEmbeddedNorm = x
+	activations := model.tokenEmbedding.Forward(indexes)
+	context.rawEmbedding = activations
+	activations = normalizeLastDim(activations)
+	context.embeddedNormalized = activations
 
-	smearSlice := sliceChannels(x, 1, t, smearGateChannels)
-	ctx.smearSlice = smearSlice
-	sig := tensor.Sigmoid(m.smearGate.Forward(smearSlice))
-	ctx.smearSig = sig
-	smearAdd(x, tensor.Scale(sig, m.smearLambda.Data[0]))
+	smearSlice := sliceChannels(activations, 1, sequenceLength, smearGateChannels)
+	context.smearSlice = smearSlice
+	smearSigmoid := tensors.Sigmoid(model.smearGate.Forward(smearSlice))
+	context.smearSigmoid = smearSigmoid
+	smearAdd(activations, tensors.Scale(smearSigmoid, model.smearLambda.Data[0]))
 
-	x0 := x
-	ctx.x0 = x0
+	initialResidual := activations
+	context.initialResidual = initialResidual
 
-	backoutLayer := m.Config.NumLayer / 2
-	var xBackout *tensor.Tensor
-	for i, block := range m.h {
-		ctx.xPrev = append(ctx.xPrev, x)
-		x = combineResidual(x, x0, m.residLambdas.Data[i], m.x0Lambdas.Data[i])
-		var ve *tensor.Tensor
-		if emb, ok := m.valueEmbeds[i]; ok {
-			ve = emb.Forward(idx)
-			ctx.valueEmbeds[i] = ve
+	backoutLayerIndex := model.Config.NumLayer / 2
+	var backoutActivations *tensors.Tensor
+	for layerIndex, block := range model.blocks {
+		context.previousActivations = append(context.previousActivations, activations)
+		activations = combineResidual(activations, initialResidual, model.residLambdas.Data[layerIndex], model.x0Lambdas.Data[layerIndex])
+		var valueEmbedding *tensors.Tensor
+		if embedding, ok := model.valueEmbeds[layerIndex]; ok {
+			valueEmbedding = embedding.Forward(indexes)
+			context.valueEmbeddings[layerIndex] = valueEmbedding
 		}
-		var bctx *blockCtx
-		x, bctx = block.forwardTrain(x, ve, m.cos, m.sin, 0, m.windowSizes[i])
-		ctx.blockCtx = append(ctx.blockCtx, bctx)
-		if i == backoutLayer {
-			xBackout = x.Clone()
+		var blockCtx *blockContext
+		activations, blockCtx = block.forwardTraining(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, 0, model.windowSizes[layerIndex])
+		context.blockContexts = append(context.blockContexts, blockCtx)
+		if layerIndex == backoutLayerIndex {
+			backoutActivations = activations.Clone()
 		}
 	}
-	ctx.xBackout = xBackout
+	context.backoutActivations = backoutActivations
 
-	if xBackout != nil {
-		x = tensor.AddScaled(x, xBackout, -m.backoutLambda.Data[0])
+	if backoutActivations != nil {
+		activations = tensors.AddScaled(activations, backoutActivations, -model.backoutLambda.Data[0])
 	}
-	ctx.xFinalPreNorm = x
-	x = normLastDim(x)
-	ctx.xFinalNorm = x
+	context.finalPreNorm = activations
+	activations = normalizeLastDim(activations)
+	context.finalNorm = activations
 
-	logits := m.lm.Forward(x)
-	logits = trimVocab(logits, m.paddedVocab, m.Config.VocabSize)
-	logits = tensor.Softcap(logits, softcap)
-	ctx.logits = logits.Reshape(b, t, m.Config.VocabSize)
-	return ctx.logits, ctx
+	logits := model.lmHead.Forward(activations)
+	logits = trimVocab(logits, model.paddedVocab, model.Config.VocabSize)
+	logits = tensors.Softcap(logits, softcap)
+	context.logits = logits.Reshape(batchSize, sequenceLength, model.Config.VocabSize)
+	return context.logits, context
 }
 
 // TrainBackward backpropagates gradLogits (the gradient of the loss with
 // respect to the softcapped logits) through the model, accumulating gradients
 // into every parameter's Grad buffer.
-func (m *Transformer) TrainBackward(ctx *trainCtx, gradLogits *tensor.Tensor) {
-	b, t := ctx.idx.Shape[0], ctx.idx.Shape[1]
-	c := m.Config.EmbedDim
+func (model *Transformer) TrainBackward(context *trainCtx, gradLogits *tensors.Tensor) {
+	batchSize, sequenceLength := context.indexes.Shape[0], context.indexes.Shape[1]
+	embeddingDimension := model.Config.EmbedDim
 
-	gradSoft := tensor.SoftcapBackward(ctx.logits, gradLogits, softcap) // [B,T,vocab]
-	gradPadded := tensor.New(b*t, m.paddedVocab)
-	for i := 0; i < b*t; i++ {
-		copy(gradPadded.Data[i*m.paddedVocab:], gradSoft.Data[i*m.Config.VocabSize:(i+1)*m.Config.VocabSize])
+	gradSoftcap := tensors.SoftcapBackward(context.logits, gradLogits, softcap) // [B,T,vocab]
+	gradPadded := tensors.New(batchSize*sequenceLength, model.paddedVocab)
+	for tokenIndex := 0; tokenIndex < batchSize*sequenceLength; tokenIndex++ {
+		copy(gradPadded.Data[tokenIndex*model.paddedVocab:], gradSoftcap.Data[tokenIndex*model.Config.VocabSize:(tokenIndex+1)*model.Config.VocabSize])
 	}
 
-	gradFinalNorm := m.lm.Backward(ctx.xFinalNorm, gradPadded).Reshape(b, t, c)
-	gradX := normLastDimBackward(ctx.xFinalPreNorm, gradFinalNorm)
+	gradFinalNorm := model.lmHead.Backward(context.finalNorm, gradPadded).Reshape(batchSize, sequenceLength, embeddingDimension)
+	gradActivations := normalizeLastDimBackward(context.finalPreNorm, gradFinalNorm)
 
-	var gradXBackout *tensor.Tensor
-	if ctx.xBackout != nil {
-		gradXBackout = tensor.Scale(gradX, -m.backoutLambda.Data[0])
-		m.backoutLambda.EnsureGrad()
-		var s float64
-		for i := 0; i < gradX.Numel(); i++ {
-			s += float64(gradX.Data[i]) * float64(-ctx.xBackout.Data[i])
+	var gradBackoutActivations *tensors.Tensor
+	if context.backoutActivations != nil {
+		gradBackoutActivations = tensors.Scale(gradActivations, -model.backoutLambda.Data[0])
+		model.backoutLambda.EnsureGrad()
+		var backoutDot float64
+		for elementIndex := 0; elementIndex < gradActivations.Numel(); elementIndex++ {
+			backoutDot += float64(gradActivations.Data[elementIndex]) * float64(-context.backoutActivations.Data[elementIndex])
 		}
-		m.backoutLambda.Grad[0] += float32(s)
+		model.backoutLambda.Grad[0] += float32(backoutDot)
 	}
 
-	n := m.Config.NumLayer
-	backoutLayer := n / 2
-	gradX0 := tensor.New(b, t, c)
-	for i := n - 1; i >= 0; i-- {
-		layerGrad := gradX
-		if i == backoutLayer && gradXBackout != nil {
-			layerGrad = tensor.Add(gradX, gradXBackout)
+	numLayers := model.Config.NumLayer
+	backoutLayerIndex := numLayers / 2
+	gradInitialResidual := tensors.New(batchSize, sequenceLength, embeddingDimension)
+	for layerIndex := numLayers - 1; layerIndex >= 0; layerIndex-- {
+		layerGradient := gradActivations
+		if layerIndex == backoutLayerIndex && gradBackoutActivations != nil {
+			layerGradient = tensors.Add(gradActivations, gradBackoutActivations)
 		}
-		gradBlockIn := m.h[i].backwardTrain(layerGrad, ctx.blockCtx[i], m.cos, m.sin, 0)
+		gradBlockInput := model.blocks[layerIndex].backwardTraining(layerGradient, context.blockContexts[layerIndex], model.rotaryCosine, model.rotarySine, 0)
 
-		if gradVE := ctx.blockCtx[i].attnCtx.gradVE; gradVE != nil {
-			kvDim := m.Config.NumKVHead * m.Config.HeadDim()
-			m.valueEmbeds[i].Backward(ctx.idx, gradVE.Reshape(b, t, kvDim))
+		if valueEmbeddingGradient := context.blockContexts[layerIndex].attentionContext.valueEmbeddingGradient; valueEmbeddingGradient != nil {
+			keyValueDimension := model.Config.NumKVHead * model.Config.HeadDim()
+			model.valueEmbeds[layerIndex].Backward(context.indexes, valueEmbeddingGradient.Reshape(batchSize, sequenceLength, keyValueDimension))
 		}
 
-		resid := m.residLambdas.Data[i]
-		x0lamb := m.x0Lambdas.Data[i]
-		xPrev := ctx.xPrev[i]
-		gradX = tensor.Scale(gradBlockIn, resid)
-		gradX0 = tensor.AddScaled(gradX0, gradBlockIn, x0lamb)
+		residualWeight := model.residLambdas.Data[layerIndex]
+		initialWeight := model.x0Lambdas.Data[layerIndex]
+		previousActivations := context.previousActivations[layerIndex]
+		gradActivations = tensors.Scale(gradBlockInput, residualWeight)
+		gradInitialResidual = tensors.AddScaled(gradInitialResidual, gradBlockInput, initialWeight)
 
-		m.residLambdas.EnsureGrad()
-		m.x0Lambdas.EnsureGrad()
-		var sr, sx float64
-		for k := 0; k < gradBlockIn.Numel(); k++ {
-			sr += float64(gradBlockIn.Data[k]) * float64(xPrev.Data[k])
-			sx += float64(gradBlockIn.Data[k]) * float64(ctx.x0.Data[k])
+		model.residLambdas.EnsureGrad()
+		model.x0Lambdas.EnsureGrad()
+		var residualDot, initialDot float64
+		for elementIndex := 0; elementIndex < gradBlockInput.Numel(); elementIndex++ {
+			residualDot += float64(gradBlockInput.Data[elementIndex]) * float64(previousActivations.Data[elementIndex])
+			initialDot += float64(gradBlockInput.Data[elementIndex]) * float64(context.initialResidual.Data[elementIndex])
 		}
-		m.residLambdas.Grad[i] += float32(sr)
-		m.x0Lambdas.Grad[i] += float32(sx)
+		model.residLambdas.Grad[layerIndex] += float32(residualDot)
+		model.x0Lambdas.Grad[layerIndex] += float32(initialDot)
 	}
-	gradX = tensor.Add(gradX, gradX0)
+	gradActivations = tensors.Add(gradActivations, gradInitialResidual)
 
 	// Smear backward.
-	gradEmbedded := smearBackward(m, ctx, gradX, b, t, c)
+	gradEmbedded := smearBackward(model, context, gradActivations, batchSize, sequenceLength, embeddingDimension)
 
 	// Norm between the embedding and the trunk.
-	gradRaw := normLastDimBackward(ctx.xRawEmbedding, gradEmbedded)
-	m.wte.Backward(ctx.idx, gradRaw)
+	gradRaw := normalizeLastDimBackward(context.rawEmbedding, gradEmbedded)
+	model.tokenEmbedding.Backward(context.indexes, gradRaw)
 }
 
 // smearBackward backpropagates through the smear operation and the smear gate,
 // returning the gradient with respect to the pre-smear embedding.
-func smearBackward(m *Transformer, ctx *trainCtx, gradX *tensor.Tensor, b, t, c int) *tensor.Tensor {
-	lambda := m.smearLambda.Data[0]
-	gradEmbedded := tensor.New(b, t, c)
-	gradZ := tensor.New(b, t-1, 1)
-	var gradLambda float64
-	xOld := ctx.xEmbeddedNorm
+func smearBackward(model *Transformer, context *trainCtx, gradActivations *tensors.Tensor, batchSize, sequenceLength, embeddingDimension int) *tensors.Tensor {
+	smearLambda := model.smearLambda.Data[0]
+	gradEmbedded := tensors.New(batchSize, sequenceLength, embeddingDimension)
+	gradGate := tensors.New(batchSize, sequenceLength-1, 1)
+	var gradSmearLambda float64
+	embeddedActivations := context.embeddedNormalized
 
-	for bb := 0; bb < b; bb++ {
-		for r := 0; r < t; r++ {
-			base := (bb*t + r) * c
-			if r == 0 {
-				for j := 0; j < c; j++ {
-					gradEmbedded.Data[base+j] += gradX.Data[base+j]
+	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		for rowIndex := 0; rowIndex < sequenceLength; rowIndex++ {
+			base := (batchIndex*sequenceLength + rowIndex) * embeddingDimension
+			if rowIndex == 0 {
+				for channelIndex := 0; channelIndex < embeddingDimension; channelIndex++ {
+					gradEmbedded.Data[base+channelIndex] += gradActivations.Data[base+channelIndex]
 				}
 				continue
 			}
-			gIdx := bb*(t-1) + (r - 1)
-			g := lambda * ctx.smearSig.Data[gIdx]
-			prev := (bb*t + (r - 1)) * c
-			var gradGate float64
-			for j := 0; j < c; j++ {
-				gradEmbedded.Data[base+j] += gradX.Data[base+j]
-				gradEmbedded.Data[prev+j] += gradX.Data[base+j] * g
-				gradGate += float64(gradX.Data[base+j]) * float64(xOld.Data[prev+j])
+			gateIndex := batchIndex*(sequenceLength-1) + (rowIndex - 1)
+			gateValue := smearLambda * context.smearSigmoid.Data[gateIndex]
+			previousBase := (batchIndex*sequenceLength + (rowIndex - 1)) * embeddingDimension
+			var gradGateSum float64
+			for channelIndex := 0; channelIndex < embeddingDimension; channelIndex++ {
+				gradEmbedded.Data[base+channelIndex] += gradActivations.Data[base+channelIndex]
+				gradEmbedded.Data[previousBase+channelIndex] += gradActivations.Data[base+channelIndex] * gateValue
+				gradGateSum += float64(gradActivations.Data[base+channelIndex]) * float64(embeddedActivations.Data[previousBase+channelIndex])
 			}
-			sig := ctx.smearSig.Data[gIdx]
-			gradLambda += gradGate * float64(sig)
-			gradZ.Data[gIdx] = float32(gradGate*float64(lambda)) * sig * (1 - sig)
+			sigmoidValue := context.smearSigmoid.Data[gateIndex]
+			gradSmearLambda += gradGateSum * float64(sigmoidValue)
+			gradGate.Data[gateIndex] = float32(gradGateSum*float64(smearLambda)) * sigmoidValue * (1 - sigmoidValue)
 		}
 	}
 
-	m.smearLambda.EnsureGrad()
-	m.smearLambda.Grad[0] += float32(gradLambda)
-	gradSlice := m.smearGate.Backward(ctx.smearSlice, gradZ)
-	scatterAddChannels(gradEmbedded, 1, t, smearGateChannels, gradSlice)
+	model.smearLambda.EnsureGrad()
+	model.smearLambda.Grad[0] += float32(gradSmearLambda)
+	gradSlice := model.smearGate.Backward(context.smearSlice, gradGate)
+	scatterAddChannels(gradEmbedded, 1, sequenceLength, smearGateChannels, gradSlice)
 	return gradEmbedded
 }
 
-// scatterAddChannels adds src into the first `channels` channels of dst for
-// rows [rowStart, rowEnd), reversing sliceChannels.
-func scatterAddChannels(dst *tensor.Tensor, rowStart, rowEnd, channels int, src *tensor.Tensor) {
-	b, t, c := dst.Shape[0], dst.Shape[1], dst.Shape[2]
-	for bb := 0; bb < b; bb++ {
-		for r := rowStart; r < rowEnd; r++ {
-			from := src.Data[(bb*(rowEnd-rowStart)+(r-rowStart))*channels:]
-			to := dst.Data[(bb*t+r)*c : (bb*t+r)*c+channels]
-			for j := 0; j < channels; j++ {
-				to[j] += from[j]
+// scatterAddChannels adds source into the first `channels` channels of
+// destination for rows [rowStart, rowEnd), reversing sliceChannels.
+func scatterAddChannels(destination *tensors.Tensor, rowStart, rowEnd, channels int, source *tensors.Tensor) {
+	batchSize, sequenceLength, embeddingDimension := destination.Shape[0], destination.Shape[1], destination.Shape[2]
+	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		for rowIndex := rowStart; rowIndex < rowEnd; rowIndex++ {
+			from := source.Data[(batchIndex*(rowEnd-rowStart)+(rowIndex-rowStart))*channels:]
+			to := destination.Data[(batchIndex*sequenceLength+rowIndex)*embeddingDimension : (batchIndex*sequenceLength+rowIndex)*embeddingDimension+channels]
+			for channelIndex := 0; channelIndex < channels; channelIndex++ {
+				to[channelIndex] += from[channelIndex]
 			}
 		}
 	}

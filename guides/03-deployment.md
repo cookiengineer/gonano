@@ -63,7 +63,7 @@ go run ./cmd/infer_bench \
 Reports TTFT (time-to-first-token), TPOT (per-token latency), overall `tok/s`,
 and pure decode `decode tok/s` per batch size. Decode is
 memory-bandwidth-bound, so larger batches give more tok/s until
-compute saturates — this is where goroutine-per-op parallelism (`parallel`)
+compute saturates — this is where goroutine-per-op parallelism (`internal/parallel`)
 pays off.
 
 ---
@@ -78,7 +78,7 @@ package main
 import (
     "fmt"
 
-    "github.com/cookiengineer/gonano/checkpoint"
+    "github.com/cookiengineer/gonano/model/checkpoint"
     "github.com/cookiengineer/gonano/infer"
     "github.com/cookiengineer/gonano/tokenizer"
 )
@@ -91,7 +91,7 @@ func main() {
     tok, err := tokenizer.LoadTokenizer("tokenizer.json")
     check(err)
 
-    engine := infer.NewEngine(model, tok)
+    engine := inference.NewEngine(model, tok)
 
     prompt := []int{tok.BOSTokenID()}
     prompt = append(prompt, tok.Encode("the capital of France is")...)
@@ -105,21 +105,21 @@ func main() {
 
 | Step | API |
 |---|---|
-| Load weights (`.gn` or `.gguf`) | `checkpoint.LoadAny(path)` → `(Meta, map[string]*tensor.Tensor)` |
+| Load weights (`.gn` or `.gguf`) | `checkpoint.LoadAny(path)` → `(Meta, map[string]*tensors.Tensor)` |
 | Rebuild model | `checkpoint.LoadModel(meta, params)` → `*model.Transformer` |
 | Load tokenizer | `tokenizer.LoadTokenizer(path)` |
-| Build engine | `infer.NewEngine(model, tokenizer)` |
+| Build engine | `inference.NewEngine(model, tokenizer)` |
 | Generate | `engine.GenerateBatch(prompt, numSamples, maxTokens, temperature, topK, seed)` |
 
-### How inference works under the hood (`infer/engine.go`)
+### How inference works under the hood (`inference/engine.go`)
 
 1. **Prefill** — the prompt is run once through `model.Forward` with a batch-1
    KV cache, populating keys/values.
 2. **Replicate** — `model.PrefillFrom` clones the KV cache across `numSamples`
    rows (and expands the smear state).
-3. **Decode loop** — for each step, `infer.SampleNextToken` samples the next
+3. **Decode loop** — for each step, `inference.SampleNextToken` samples the next
    token per row (temperature/top-k/argmax), the tool-call state machine
-   (`infer.Engine.Tools`) handles `<|tool_start|>…<|tool_end|>`, and the
+   (`inference.Engine.Tools`) handles `<|tool_start|>…<|tool_end|>`, and the
    next single-token column is forwarded against the cache.
 
 The KV cache lives in `model.KVBuffer` (`model/kvcache.go`).
@@ -180,11 +180,11 @@ Key facts for anyone writing a custom loader:
 
 For a long-running service:
 
-- Reuse a single `*infer.Engine` (it holds no per-request state; create one per
+- Reuse a single `*inference.Engine` (it holds no per-request state; create one per
   request row or manage caches per session).
 - For concurrent requests, run independent `Generate` calls in separate
-  goroutines — the `parallel` pool sizes itself to `GOMAXPROCS`.
-- Measure with `infer.Measure` before and after changes.
+  goroutines — the `internal/parallel` pool sizes itself to `GOMAXPROCS`.
+- Measure with `inference.Measure` before and after changes.
 
 ## 8. OpenAI-compatible API (`cmd/server`)
 
@@ -210,9 +210,9 @@ curl http://localhost:8080/v1/chat/completions \
 ```
 
 Tool calls are executed **server-side** by the `server` package: the model
-emits `<|tool_start|>…<|tool_end|>`, the registered `infer.Tool` set runs it in
+emits `<|tool_start|>…<|tool_end|>`, the registered `inference.Tool` set runs it in
 Go, and the result is fed back. The built-in calculator is registered by
 default; `cmd/server` also demonstrates registering a custom `now` tool — add
-your own by implementing `infer.Tool` and calling `registry.Register`.
+your own by implementing `inference.Tool` and calling `registry.Register`.
 
 Next: [Debugging guide](04-debugging.md).

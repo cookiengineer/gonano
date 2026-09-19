@@ -16,11 +16,11 @@ var errCorrupt = errors.New("parquet: corrupt snappy block")
 // format_description.txt.
 func snappyDecode(src []byte) ([]byte, error) {
 	// Read the uncompressed length varint.
-	length, n, err := uvarint(src)
+	length, consumed, err := uvarint(src)
 	if err != nil {
 		return nil, err
 	}
-	src = src[n:]
+	src = src[consumed:]
 	dst := make([]byte, 0, length)
 	pos := 0
 	for len(src) > 0 {
@@ -67,44 +67,44 @@ func snappyDecode(src []byte) ([]byte, error) {
 			if len(src) < 1 {
 				return nil, errCorrupt
 			}
-			length := 4 + int((tag>>2)&0x07)
+			copyLength := 4 + int((tag>>2)&0x07)
 			offset := int((tag&0xE0)<<3) | int(src[0])
 			src = src[1:]
 			if offset <= 0 || offset > pos {
 				return nil, errCorrupt
 			}
-			for i := 0; i < length; i++ {
-				dst = append(dst, dst[pos-offset+i])
+			for index := 0; index < copyLength; index++ {
+				dst = append(dst, dst[pos-offset+index])
 			}
-			pos += length
+			pos += copyLength
 		case 2: // copy, 2-byte offset
 			if len(src) < 2 {
 				return nil, errCorrupt
 			}
-			length := 1 + int(tag>>2)
+			copyLength := 1 + int(tag>>2)
 			offset := int(binary.LittleEndian.Uint16(src))
 			src = src[2:]
 			if offset <= 0 || offset > pos {
 				return nil, errCorrupt
 			}
-			for i := 0; i < length; i++ {
-				dst = append(dst, dst[pos-offset+i])
+			for index := 0; index < copyLength; index++ {
+				dst = append(dst, dst[pos-offset+index])
 			}
-			pos += length
+			pos += copyLength
 		case 3: // copy, 4-byte offset
 			if len(src) < 4 {
 				return nil, errCorrupt
 			}
-			length := 1 + int(tag>>2)
+			copyLength := 1 + int(tag>>2)
 			offset := int(binary.LittleEndian.Uint32(src))
 			src = src[4:]
 			if offset <= 0 || offset > pos {
 				return nil, errCorrupt
 			}
-			for i := 0; i < length; i++ {
-				dst = append(dst, dst[pos-offset+i])
+			for index := 0; index < copyLength; index++ {
+				dst = append(dst, dst[pos-offset+index])
 			}
-			pos += length
+			pos += copyLength
 		}
 	}
 	if pos != int(length) {
@@ -114,22 +114,22 @@ func snappyDecode(src []byte) ([]byte, error) {
 }
 
 func uvarint(src []byte) (uint64, int, error) {
-	var x uint64
-	var s uint
-	for i := 0; i < len(src); i++ {
-		b := src[i]
-		if b < 0x80 {
-			if i > 9 || (i == 9 && b > 1) {
+	var value uint64
+	var shift uint
+	for index := 0; index < len(src); index++ {
+		currentByte := src[index]
+		if currentByte < 0x80 {
+			if index > 9 || (index == 9 && currentByte > 1) {
 				return 0, 0, errCorrupt
 			}
-			return x | uint64(b)<<s, i + 1, nil
+			return value | uint64(currentByte)<<shift, index + 1, nil
 		}
-		x |= uint64(b&0x7f) << s
-		s += 7
+		value |= uint64(currentByte&0x7f) << shift
+		shift += 7
 	}
 	return 0, 0, errCorrupt
 }
 
-func loadUint24(b []byte) uint32 {
-	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16
+func loadUint24(buffer []byte) uint32 {
+	return uint32(buffer[0]) | uint32(buffer[1])<<8 | uint32(buffer[2])<<16
 }

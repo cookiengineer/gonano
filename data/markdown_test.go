@@ -7,22 +7,22 @@ import (
 	"testing"
 )
 
-func TestMarkdownSource(t *testing.T) {
-	dir := t.TempDir()
+func TestMarkdownSource(tests *testing.T) {
+	dir := tests.TempDir()
 	files := map[string]string{
-		"a.md": "# First\nThis is the first document.",
-		"b.md": "# Second\nThis is the second document.",
+		"a.md":  "# First\nThis is the first document.",
+		"b.md":  "# Second\nThis is the second document.",
 		"c.txt": "ignored",
 	}
 	for name, content := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
-			t.Fatal(err)
+			tests.Fatal(err)
 		}
 	}
 
 	src := NewMarkdownSource(dir, 2)
 	if src.NumFiles() != 2 {
-		t.Fatalf("NumFiles = %d, want 2", src.NumFiles())
+		tests.Fatalf("NumFiles = %d, want 2", src.NumFiles())
 	}
 
 	// First epoch: two documents (sorted order a.md then b.md).
@@ -31,30 +31,30 @@ func TestMarkdownSource(t *testing.T) {
 	got := append(append([]string{}, batch1...), batch2...)
 	want := []string{"# First\nThis is the first document.", "# Second\nThis is the second document."}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %q, want %q", got, want)
+		tests.Fatalf("got %q, want %q", got, want)
 	}
 
 	// Wraps: epoch increments.
 	_, state := src.Next()
 	if state.Epoch != 2 {
-		t.Fatalf("epoch = %d, want 2", state.Epoch)
+		tests.Fatalf("epoch = %d, want 2", state.Epoch)
 	}
 }
 
-func TestMarkdownSourceStripsBOM(t *testing.T) {
-	dir := t.TempDir()
+func TestMarkdownSourceStripsBOM(tests *testing.T) {
+	dir := tests.TempDir()
 	os.WriteFile(filepath.Join(dir, "x.md"), []byte("\ufeff# Title\nbody"), 0o644)
 	src := NewMarkdownSource(dir, 1)
 	batch, _ := src.Next()
 	if len(batch) != 1 || len(batch[0]) == 0 || batch[0][0] == 0xEF {
-		t.Fatalf("BOM not stripped: %q", batch)
+		tests.Fatalf("BOM not stripped: %q", batch)
 	}
 }
 
-func TestMarkdownSourceEmptyDir(t *testing.T) {
-	src := NewMarkdownSource(t.TempDir(), 1)
+func TestMarkdownSourceEmptyDir(tests *testing.T) {
+	src := NewMarkdownSource(tests.TempDir(), 1)
 	batch, _ := src.Next()
 	if batch != nil {
-		t.Fatalf("expected nil batch for empty dir, got %v", batch)
+		tests.Fatalf("expected nil batch for empty dir, got %v", batch)
 	}
 }

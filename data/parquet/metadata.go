@@ -4,23 +4,23 @@ package parquet
 
 // Type enum (parquet.Type).
 const (
-	typeBoolean          = 0
-	typeInt32            = 1
-	typeInt64            = 2
-	typeInt96            = 3
-	typeFloat            = 4
-	typeDouble           = 5
-	typeByteArray        = 6
-	typeFixedLenByteArr  = 7
+	typeBoolean         = 0
+	typeInt32           = 1
+	typeInt64           = 2
+	typeInt96           = 3
+	typeFloat           = 4
+	typeDouble          = 5
+	typeByteArray       = 6
+	typeFixedLenByteArr = 7
 )
 
 // Encoding enum (parquet.Encoding).
 const (
-	encPlain            = 0
-	encPlainDictionary  = 2
-	encRLE              = 3
-	encBitPacked        = 4
-	encRLE_Dictionary   = 8
+	encPlain           = 0
+	encPlainDictionary = 2
+	encRLE             = 3
+	encBitPacked       = 4
+	encRLE_Dictionary  = 8
 )
 
 // CompressionCodec enum (parquet.CompressionCodec).
@@ -51,15 +51,15 @@ type schemaElement struct {
 }
 
 type columnMetaData struct {
-	typ                    int32
-	encodings              []int32
-	pathInSchema           []string
-	codec                  int32
-	numValues              int64
-	totalUncompressedSize  int64
-	totalCompressedSize    int64
-	dataPageOffset         int64
-	dictionaryPageOffset   int64
+	typ                   int32
+	encodings             []int32
+	pathInSchema          []string
+	codec                 int32
+	numValues             int64
+	totalUncompressedSize int64
+	totalCompressedSize   int64
+	dataPageOffset        int64
+	dictionaryPageOffset  int64
 }
 
 type columnChunk struct {
@@ -82,10 +82,10 @@ type fileMetaData struct {
 }
 
 type dataPageHeader struct {
-	numValues         int32
-	encoding          int32
-	defLevelEncoding  int32
-	repLevelEncoding  int32
+	numValues        int32
+	encoding         int32
+	defLevelEncoding int32
+	repLevelEncoding int32
 }
 
 type dictionaryPageHeader struct {
@@ -94,45 +94,45 @@ type dictionaryPageHeader struct {
 }
 
 type pageHeader struct {
-	typ                 int32
-	uncompressedSize    int32
-	compressedSize      int32
-	data                *dataPageHeader
-	dictionary          *dictionaryPageHeader
+	typ              int32
+	uncompressedSize int32
+	compressedSize   int32
+	data             *dataPageHeader
+	dictionary       *dictionaryPageHeader
 }
 
-// listHeader reads a compact-protocol list header, returning the element count
-// and element type.
-func (r *compactReader) listHeader() (int, byte, error) {
-	b, err := r.byte()
+// readListHeader reads a compact-protocol list header, returning the element
+// count and element type.
+func (reader *compactReader) readListHeader() (int, byte, error) {
+	header, err := reader.byte()
 	if err != nil {
 		return 0, 0, err
 	}
-	size := int(b >> 4)
-	elemType := b & 0x0F
+	size := int(header >> 4)
+	elemType := header & 0x0F
 	if size == 15 {
-		u, err := r.uvarint()
+		encoded, err := reader.uvarint()
 		if err != nil {
 			return 0, 0, err
 		}
-		size = int(u)
+		size = int(encoded)
 	}
 	return size, elemType, nil
 }
 
-func (r *compactReader) readString() (string, error) {
-	b, err := r.binary()
+func (reader *compactReader) readString() (string, error) {
+	raw, err := reader.binary()
 	if err != nil {
 		return "", err
 	}
-	return string(b), nil
+	return string(raw), nil
 }
 
 func parseFileMetaData(data []byte) (fileMetaData, error) {
-	r := newCompactReader(data)
+	reader := newCompactReader(data)
 	var meta fileMetaData
 	for {
-		id, typ, ok, err := r.fieldHeader()
+		id, typ, ok, err := reader.readFieldHeader()
 		if err != nil {
 			return meta, err
 		}
@@ -141,19 +141,19 @@ func parseFileMetaData(data []byte) (fileMetaData, error) {
 		}
 		switch id {
 		case 1:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
 				return meta, err
 			}
-			meta.version = int32(v)
+			meta.version = int32(value)
 		case 2:
-			meta.schema, err = parseSchemaElementList(r)
+			meta.schema, err = parseSchemaElementList(reader)
 		case 3:
-			meta.numRows, err = r.zigzag()
+			meta.numRows, err = reader.zigzag()
 		case 4:
-			meta.rowGroups, err = parseRowGroupList(r)
+			meta.rowGroups, err = parseRowGroupList(reader)
 		default:
-			err = r.skipValue(typ)
+			err = reader.skipValue(typ)
 		}
 		if err != nil {
 			return meta, err
@@ -162,8 +162,8 @@ func parseFileMetaData(data []byte) (fileMetaData, error) {
 	return meta, nil
 }
 
-func parseSchemaElementList(r *compactReader) ([]schemaElement, error) {
-	size, elemType, err := r.listHeader()
+func parseSchemaElementList(reader *compactReader) ([]schemaElement, error) {
+	size, elemType, err := reader.readListHeader()
 	if err != nil {
 		return nil, err
 	}
@@ -171,8 +171,8 @@ func parseSchemaElementList(r *compactReader) ([]schemaElement, error) {
 		return nil, errBadCompact
 	}
 	out := make([]schemaElement, size)
-	for i := 0; i < size; i++ {
-		out[i], err = parseSchemaElement(r)
+	for index := 0; index < size; index++ {
+		out[index], err = parseSchemaElement(reader)
 		if err != nil {
 			return nil, err
 		}
@@ -180,56 +180,56 @@ func parseSchemaElementList(r *compactReader) ([]schemaElement, error) {
 	return out, nil
 }
 
-func parseSchemaElement(r *compactReader) (schemaElement, error) {
-	last := r.enterStruct()
-	defer r.exitStruct(last)
-	var e schemaElement
+func parseSchemaElement(reader *compactReader) (schemaElement, error) {
+	previousFieldID := reader.enterStruct()
+	defer reader.exitStruct(previousFieldID)
+	var element schemaElement
 	for {
-		id, typ, ok, err := r.fieldHeader()
+		id, typ, ok, err := reader.readFieldHeader()
 		if err != nil {
-			return e, err
+			return element, err
 		}
 		if !ok {
-			return e, nil
+			return element, nil
 		}
 		switch id {
 		case 1:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
-				return e, err
+				return element, err
 			}
-			e.typ = int32(v)
+			element.typ = int32(value)
 		case 2:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
-				return e, err
+				return element, err
 			}
-			e.typeLength = int32(v)
+			element.typeLength = int32(value)
 		case 3:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
-				return e, err
+				return element, err
 			}
-			e.repetition = int32(v)
+			element.repetition = int32(value)
 		case 4:
-			e.name, err = r.readString()
+			element.name, err = reader.readString()
 		case 5:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
-				return e, err
+				return element, err
 			}
-			e.numChildren = int32(v)
+			element.numChildren = int32(value)
 		default:
-			err = r.skipValue(typ)
+			err = reader.skipValue(typ)
 		}
 		if err != nil {
-			return e, err
+			return element, err
 		}
 	}
 }
 
-func parseRowGroupList(r *compactReader) ([]rowGroup, error) {
-	size, elemType, err := r.listHeader()
+func parseRowGroupList(reader *compactReader) ([]rowGroup, error) {
+	size, elemType, err := reader.readListHeader()
 	if err != nil {
 		return nil, err
 	}
@@ -237,8 +237,8 @@ func parseRowGroupList(r *compactReader) ([]rowGroup, error) {
 		return nil, errBadCompact
 	}
 	out := make([]rowGroup, size)
-	for i := 0; i < size; i++ {
-		out[i], err = parseRowGroup(r)
+	for index := 0; index < size; index++ {
+		out[index], err = parseRowGroup(reader)
 		if err != nil {
 			return nil, err
 		}
@@ -246,36 +246,36 @@ func parseRowGroupList(r *compactReader) ([]rowGroup, error) {
 	return out, nil
 }
 
-func parseRowGroup(r *compactReader) (rowGroup, error) {
-	last := r.enterStruct()
-	defer r.exitStruct(last)
-	var g rowGroup
+func parseRowGroup(reader *compactReader) (rowGroup, error) {
+	previousFieldID := reader.enterStruct()
+	defer reader.exitStruct(previousFieldID)
+	var group rowGroup
 	for {
-		id, typ, ok, err := r.fieldHeader()
+		id, typ, ok, err := reader.readFieldHeader()
 		if err != nil {
-			return g, err
+			return group, err
 		}
 		if !ok {
-			return g, nil
+			return group, nil
 		}
 		switch id {
 		case 1:
-			g.columns, err = parseColumnChunkList(r)
+			group.columns, err = parseColumnChunkList(reader)
 		case 2:
-			g.totalByteSize, err = r.zigzag()
+			group.totalByteSize, err = reader.zigzag()
 		case 3:
-			g.numRows, err = r.zigzag()
+			group.numRows, err = reader.zigzag()
 		default:
-			err = r.skipValue(typ)
+			err = reader.skipValue(typ)
 		}
 		if err != nil {
-			return g, err
+			return group, err
 		}
 	}
 }
 
-func parseColumnChunkList(r *compactReader) ([]columnChunk, error) {
-	size, elemType, err := r.listHeader()
+func parseColumnChunkList(reader *compactReader) ([]columnChunk, error) {
+	size, elemType, err := reader.readListHeader()
 	if err != nil {
 		return nil, err
 	}
@@ -283,8 +283,8 @@ func parseColumnChunkList(r *compactReader) ([]columnChunk, error) {
 		return nil, errBadCompact
 	}
 	out := make([]columnChunk, size)
-	for i := 0; i < size; i++ {
-		out[i], err = parseColumnChunk(r)
+	for index := 0; index < size; index++ {
+		out[index], err = parseColumnChunk(reader)
 		if err != nil {
 			return nil, err
 		}
@@ -292,100 +292,100 @@ func parseColumnChunkList(r *compactReader) ([]columnChunk, error) {
 	return out, nil
 }
 
-func parseColumnChunk(r *compactReader) (columnChunk, error) {
-	last := r.enterStruct()
-	defer r.exitStruct(last)
-	var c columnChunk
+func parseColumnChunk(reader *compactReader) (columnChunk, error) {
+	previousFieldID := reader.enterStruct()
+	defer reader.exitStruct(previousFieldID)
+	var chunk columnChunk
 	for {
-		id, typ, ok, err := r.fieldHeader()
+		id, typ, ok, err := reader.readFieldHeader()
 		if err != nil {
-			return c, err
+			return chunk, err
 		}
 		if !ok {
-			return c, nil
+			return chunk, nil
 		}
 		switch id {
 		case 1:
-			c.filePath, err = r.readString()
+			chunk.filePath, err = reader.readString()
 		case 2:
-			c.fileOffset, err = r.zigzag()
+			chunk.fileOffset, err = reader.zigzag()
 		case 3:
 			if typ != ctStruct {
-				err = r.skipValue(typ)
+				err = reader.skipValue(typ)
 			} else {
-				c.meta, err = parseColumnMetaData(r)
+				chunk.meta, err = parseColumnMetaData(reader)
 			}
 		default:
-			err = r.skipValue(typ)
+			err = reader.skipValue(typ)
 		}
 		if err != nil {
-			return c, err
+			return chunk, err
 		}
 	}
 }
 
-func parseColumnMetaData(r *compactReader) (*columnMetaData, error) {
-	last := r.enterStruct()
-	defer r.exitStruct(last)
-	m := &columnMetaData{}
+func parseColumnMetaData(reader *compactReader) (*columnMetaData, error) {
+	previousFieldID := reader.enterStruct()
+	defer reader.exitStruct(previousFieldID)
+	metadata := &columnMetaData{}
 	for {
-		id, typ, ok, err := r.fieldHeader()
+		id, typ, ok, err := reader.readFieldHeader()
 		if err != nil {
-			return m, err
+			return metadata, err
 		}
 		if !ok {
-			return m, nil
+			return metadata, nil
 		}
 		switch id {
 		case 1:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
-				return m, err
+				return metadata, err
 			}
-			m.typ = int32(v)
+			metadata.typ = int32(value)
 		case 2:
-			m.encodings, err = readI32List(r)
+			metadata.encodings, err = readI32List(reader)
 		case 3:
-			m.pathInSchema, err = readStringList(r)
+			metadata.pathInSchema, err = readStringList(reader)
 		case 4:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
-				return m, err
+				return metadata, err
 			}
-			m.codec = int32(v)
+			metadata.codec = int32(value)
 		case 5:
-			m.numValues, err = r.zigzag()
+			metadata.numValues, err = reader.zigzag()
 		case 6:
-			m.totalUncompressedSize, err = r.zigzag()
+			metadata.totalUncompressedSize, err = reader.zigzag()
 		case 7:
-			m.totalCompressedSize, err = r.zigzag()
+			metadata.totalCompressedSize, err = reader.zigzag()
 		case 9:
-			m.dataPageOffset, err = r.zigzag()
+			metadata.dataPageOffset, err = reader.zigzag()
 		case 11:
-			m.dictionaryPageOffset, err = r.zigzag()
+			metadata.dictionaryPageOffset, err = reader.zigzag()
 		default:
-			err = r.skipValue(typ)
+			err = reader.skipValue(typ)
 		}
 		if err != nil {
-			return m, err
+			return metadata, err
 		}
 	}
 }
 
-func readI32List(r *compactReader) ([]int32, error) {
-	size, elemType, err := r.listHeader()
+func readI32List(reader *compactReader) ([]int32, error) {
+	size, elemType, err := reader.readListHeader()
 	if err != nil {
 		return nil, err
 	}
 	out := make([]int32, size)
-	for i := 0; i < size; i++ {
+	for index := 0; index < size; index++ {
 		switch elemType {
 		case ctI16, ctI32, ctI64:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
 				return nil, err
 			}
-			out[i] = int32(v)
+			out[index] = int32(value)
 		default:
 			return nil, errBadCompact
 		}
@@ -393,8 +393,8 @@ func readI32List(r *compactReader) ([]int32, error) {
 	return out, nil
 }
 
-func readStringList(r *compactReader) ([]string, error) {
-	size, elemType, err := r.listHeader()
+func readStringList(reader *compactReader) ([]string, error) {
+	size, elemType, err := reader.readListHeader()
 	if err != nil {
 		return nil, err
 	}
@@ -402,8 +402,8 @@ func readStringList(r *compactReader) ([]string, error) {
 		return nil, errBadCompact
 	}
 	out := make([]string, size)
-	for i := 0; i < size; i++ {
-		out[i], err = r.readString()
+	for index := 0; index < size; index++ {
+		out[index], err = reader.readString()
 		if err != nil {
 			return nil, err
 		}

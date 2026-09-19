@@ -8,19 +8,19 @@ import (
 
 // Thrift Compact Protocol types.
 const (
-	ctStop         = 0x00
-	ctBoolTrue     = 0x01
-	ctBoolFalse    = 0x02
-	ctByte         = 0x03
-	ctI16          = 0x04
-	ctI32          = 0x05
-	ctI64          = 0x06
-	ctDouble       = 0x07
-	ctBinary       = 0x08
-	ctList         = 0x09
-	ctSet          = 0x0A
-	ctMap          = 0x0B
-	ctStruct       = 0x0C
+	ctStop      = 0x00
+	ctBoolTrue  = 0x01
+	ctBoolFalse = 0x02
+	ctByte      = 0x03
+	ctI16       = 0x04
+	ctI32       = 0x05
+	ctI64       = 0x06
+	ctDouble    = 0x07
+	ctBinary    = 0x08
+	ctList      = 0x09
+	ctSet       = 0x0A
+	ctMap       = 0x0B
+	ctStruct    = 0x0C
 )
 
 var errBadCompact = errors.New("parquet: corrupt thrift compact data")
@@ -36,133 +36,133 @@ func newCompactReader(data []byte) *compactReader {
 	return &compactReader{data: data}
 }
 
-func (r *compactReader) byte() (byte, error) {
-	if r.pos >= len(r.data) {
+func (reader *compactReader) byte() (byte, error) {
+	if reader.pos >= len(reader.data) {
 		return 0, errBadCompact
 	}
-	b := r.data[r.pos]
-	r.pos++
-	return b, nil
+	value := reader.data[reader.pos]
+	reader.pos++
+	return value, nil
 }
 
-func (r *compactReader) uvarint() (uint64, error) {
-	var x uint64
-	var s uint
-	for i := 0; ; i++ {
-		if r.pos >= len(r.data) {
+func (reader *compactReader) uvarint() (uint64, error) {
+	var value uint64
+	var shift uint
+	for index := 0; ; index++ {
+		if reader.pos >= len(reader.data) {
 			return 0, errBadCompact
 		}
-		b := r.data[r.pos]
-		r.pos++
-		if b < 0x80 {
-			return x | uint64(b)<<s, nil
+		currentByte := reader.data[reader.pos]
+		reader.pos++
+		if currentByte < 0x80 {
+			return value | uint64(currentByte)<<shift, nil
 		}
-		x |= uint64(b&0x7f) << s
-		s += 7
+		value |= uint64(currentByte&0x7f) << shift
+		shift += 7
 	}
 }
 
-func (r *compactReader) zigzag() (int64, error) {
-	u, err := r.uvarint()
+func (reader *compactReader) zigzag() (int64, error) {
+	encoded, err := reader.uvarint()
 	if err != nil {
 		return 0, err
 	}
 	// zigzag decode: (u >> 1) ^ -(u & 1)
-	return int64(u>>1) ^ -int64(u&1), nil
+	return int64(encoded>>1) ^ -int64(encoded&1), nil
 }
 
-func (r *compactReader) binary() ([]byte, error) {
-	n, err := r.uvarint()
+func (reader *compactReader) binary() ([]byte, error) {
+	size, err := reader.uvarint()
 	if err != nil {
 		return nil, err
 	}
-	if int(n) > len(r.data)-r.pos {
+	if int(size) > len(reader.data)-reader.pos {
 		return nil, errBadCompact
 	}
-	b := r.data[r.pos : r.pos+int(n)]
-	r.pos += int(n)
-	return b, nil
+	raw := reader.data[reader.pos : reader.pos+int(size)]
+	reader.pos += int(size)
+	return raw, nil
 }
 
-func (r *compactReader) double() (float64, error) {
-	if r.pos+8 > len(r.data) {
+func (reader *compactReader) double() (float64, error) {
+	if reader.pos+8 > len(reader.data) {
 		return 0, errBadCompact
 	}
-	v := binary.LittleEndian.Uint64(r.data[r.pos:])
-	r.pos += 8
-	return math.Float64frombits(v), nil
+	bits := binary.LittleEndian.Uint64(reader.data[reader.pos:])
+	reader.pos += 8
+	return math.Float64frombits(bits), nil
 }
 
-// fieldHeader reads the next field header. It returns (fieldID, type, true),
+// readFieldHeader reads the next field header. It returns (fieldID, type, true),
 // or (0, ctStop, false) at the stop field.
-func (r *compactReader) fieldHeader() (int, byte, bool, error) {
-	b, err := r.byte()
+func (reader *compactReader) readFieldHeader() (int, byte, bool, error) {
+	header, err := reader.byte()
 	if err != nil {
 		return 0, 0, false, err
 	}
-	if b == ctStop {
+	if header == ctStop {
 		return 0, ctStop, false, nil
 	}
-	typ := b & 0x0F
-	delta := int(b >> 4)
+	typ := header & 0x0F
+	delta := int(header >> 4)
 	fieldID := 0
 	if delta == 0 {
 		// Long form: field id is a zigzag i16.
-		u, err := r.uvarint()
+		encoded, err := reader.uvarint()
 		if err != nil {
 			return 0, 0, false, err
 		}
-		fieldID = int(int16(u>>1) ^ -int16(u&1))
+		fieldID = int(int16(encoded>>1) ^ -int16(encoded&1))
 	} else {
-		fieldID = r.lastFieldID + delta
+		fieldID = reader.lastFieldID + delta
 	}
-	r.lastFieldID = fieldID
+	reader.lastFieldID = fieldID
 	return fieldID, typ, true, nil
 }
 
 // skipValue skips a value of the given compact type.
-func (r *compactReader) skipValue(typ byte) error {
+func (reader *compactReader) skipValue(typ byte) error {
 	switch typ {
 	case ctBoolTrue, ctBoolFalse:
 		return nil
 	case ctByte:
-		_, err := r.byte()
+		_, err := reader.byte()
 		return err
 	case ctI16, ctI32, ctI64:
-		_, err := r.uvarint()
+		_, err := reader.uvarint()
 		return err
 	case ctDouble:
-		_, err := r.double()
+		_, err := reader.double()
 		return err
 	case ctBinary:
-		_, err := r.binary()
+		_, err := reader.binary()
 		return err
 	case ctList, ctSet:
-		return r.skipList()
+		return reader.skipList()
 	case ctStruct:
-		return r.skipStruct()
+		return reader.skipStruct()
 	case ctMap:
-		return r.skipMap()
+		return reader.skipMap()
 	}
 	return errBadCompact
 }
 
-func (r *compactReader) skipList() error {
-	b, err := r.byte()
+func (reader *compactReader) skipList() error {
+	header, err := reader.byte()
 	if err != nil {
 		return err
 	}
-	size := int(b >> 4)
-	elemType := b & 0x0F
+	size := int(header >> 4)
+	elemType := header & 0x0F
 	if size == 15 {
-		u, err := r.uvarint()
+		encoded, err := reader.uvarint()
 		if err != nil {
 			return err
 		}
-		size = int(u)
+		size = int(encoded)
 	}
-	for i := 0; i < size; i++ {
-		if err := r.skipValue(elemType); err != nil {
+	for index := 0; index < size; index++ {
+		if err := reader.skipValue(elemType); err != nil {
 			return err
 		}
 	}
@@ -171,52 +171,52 @@ func (r *compactReader) skipList() error {
 
 // enterStruct saves the current field-id context and resets it, because field
 // ids restart from zero inside each nested struct.
-func (r *compactReader) enterStruct() int {
-	last := r.lastFieldID
-	r.lastFieldID = 0
-	return last
+func (reader *compactReader) enterStruct() int {
+	previousFieldID := reader.lastFieldID
+	reader.lastFieldID = 0
+	return previousFieldID
 }
 
-func (r *compactReader) exitStruct(last int) {
-	r.lastFieldID = last
+func (reader *compactReader) exitStruct(previousFieldID int) {
+	reader.lastFieldID = previousFieldID
 }
 
-func (r *compactReader) skipStruct() error {
-	last := r.enterStruct()
-	defer r.exitStruct(last)
+func (reader *compactReader) skipStruct() error {
+	previousFieldID := reader.enterStruct()
+	defer reader.exitStruct(previousFieldID)
 	for {
-		_, typ, ok, err := r.fieldHeader()
+		_, typ, ok, err := reader.readFieldHeader()
 		if err != nil {
 			return err
 		}
 		if !ok {
 			return nil
 		}
-		if err := r.skipValue(typ); err != nil {
+		if err := reader.skipValue(typ); err != nil {
 			return err
 		}
 	}
 }
 
-func (r *compactReader) skipMap() error {
-	size, err := r.uvarint()
+func (reader *compactReader) skipMap() error {
+	size, err := reader.uvarint()
 	if err != nil {
 		return err
 	}
 	if size == 0 {
 		return nil
 	}
-	b, err := r.byte()
+	typesHeader, err := reader.byte()
 	if err != nil {
 		return err
 	}
-	keyType := b >> 4
-	valType := b & 0x0F
-	for i := 0; i < int(size); i++ {
-		if err := r.skipValue(keyType); err != nil {
+	keyType := typesHeader >> 4
+	valType := typesHeader & 0x0F
+	for index := 0; index < int(size); index++ {
+		if err := reader.skipValue(keyType); err != nil {
 			return err
 		}
-		if err := r.skipValue(valType); err != nil {
+		if err := reader.skipValue(valType); err != nil {
 			return err
 		}
 	}

@@ -16,7 +16,7 @@ GOEXPERIMENT=simd go test ./...;
 ```
 
 - Vector width is auto-selected from the CPU (128/256/512-bit; AVX-512 via `GODEBUG=simd=512`).
-- Numeric precision is **float32** everywhere; parallelism is goroutine-per-op via the `parallel` package.
+- Numeric precision is **float32** everywhere; parallelism is goroutine-per-op via the `internal/parallel` package.
 
 ## Quickstart
 
@@ -119,28 +119,34 @@ step-by-step training, export, deployment, and debugging guides.
 
 | Package             | Responsibility |
 |:--------------------|:-----------------------------------------------------------------------------------------------------------------|
-| `tensor`            | Dense float32/int32 tensors + SIMD kernels (matmul, softmax, RMSNorm, reductions)                                |
-| `nn`                | Linear, embedding, initializers                                                                                  |
+| `kernels`           | The numeric backend contract (`Backend`): elementwise, reductions, matmul, softmax/RMSNorm, flash attention      |
+| `kernels/simd`      | Production SIMD implementation of `kernels.Backend` (AVX-512/AVX2, goroutine-parallel)                           |
+| `kernels/scalar`    | Portable pure-Go reference implementation used for parity tests and hosts without SIMD                            |
+| `tensors`           | Dense float32/int32 tensor types plus high-level ops that delegate to the active kernel backend                   |
 | `model`             | The nanochat GPT transformer (RoPE, QK-norm, GQA, value embeddings, sliding windows) + training forward/backward |
-| `optim`             | AdamW + Muon (Polar Express) + MuonAdamW                                                                         |
+| `model/layers`      | Neural-network building blocks: linear layers, embeddings, initializers                                          |
+| `model/checkpoint`  | Versioned binary checkpoint save/load + GGUF export                                                              |
+| `optimizer`         | AdamW + Muon (Polar Express) + MuonAdamW                                                                         |
 | `tokenizer`         | Byte-level BPE training/inference + chat rendering                                                               |
 | `data`              | Parquet reader, Snappy, HF-Hub download, Markdown source, BOS-aligned dataloaders                                |
-| `train`             | Scaling laws, schedulers, pretraining/SFT/RL loops                                                               |
-| `infer`             | KV-cache engine, sampler, calculator tool, benchmark                                                             |
+| `trainer`           | Scaling laws, schedulers, pretraining/SFT/RL loops                                                               |
+| `inference`         | KV-cache engine, sampler, calculator tool, benchmark                                                             |
 | `server`            | OpenAI-compatible HTTP API (chat completions, streaming, tool calls)                                             |
-| `eval`              | BPB, CORE, ChatCORE + `eval/tasks` (MMLU/GSM8K/ARC/HumanEval/SmolTalk)                                           |
-| `exec`              | Sandboxed Python execution (HumanEval)                                                                           |
-| `checkpoint`        | Versioned binary checkpoint save/load + GGUF export                                                              |
-| `parallel`          | Goroutine worker pool                                                                                            |
-| `device`, `logging` | Hardware detection, logging/metrics                                                                              |
+| `evaluator`         | BPB, CORE, ChatCORE + `evaluator/tasks` (MMLU/GSM8K/ARC/HumanEval/SmolTalk)                                      |
+| `executor`          | Sandboxed Python execution (HumanEval)                                                                           |
+| `internal/parallel` | Goroutine worker pool                                                                                            |
+| `internal/device`, `internal/logging` | Hardware detection, logging/metrics                                                            |
 
-See `guides/00-architecture-overview.md` for how the components fit together.
+Swap backends at runtime with `tensors.UseKernelBackend(scalar.New())`; the
+default is `kernels/simd`. See `guides/00-architecture-overview.md` for how the
+components fit together.
 
 ## Testing
 
-Every feature has unit tests, including scalar-vs-SIMD parity tests, numerical
-gradient checks of the backprop, and an end-to-end train, save, load, generate
-test:
+Every feature has unit tests: scalar-vs-SIMD parity tests for the entire
+`kernels.Backend` contract (including flash attention), numerical gradient
+checks of the backprop (including grouped-query attention), and an end-to-end
+train, save, load, generate test.
 
 ```bash
 GOEXPERIMENT=simd go test -race ./...;

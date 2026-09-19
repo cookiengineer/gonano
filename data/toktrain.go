@@ -26,9 +26,9 @@ func TrainTokenizer(provider DocProvider, vocabSize, maxChars int) map[string]in
 			break // wrapped around: we have seen the whole dataset once
 		}
 		for _, doc := range docs {
-			for _, p := range tokenizer.SplitPieces(doc) {
-				pieces = append(pieces, p)
-				total += len(p)
+			for _, piece := range tokenizer.SplitPieces(doc) {
+				pieces = append(pieces, piece)
+				total += len(piece)
 			}
 		}
 		if total >= maxChars {

@@ -20,70 +20,72 @@ type Reader struct {
 
 // Open opens a Parquet file and parses its footer metadata.
 func Open(path string) (*Reader, error) {
-	f, err := os.Open(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	st, err := f.Stat()
+	fileInfo, err := file.Stat()
 	if err != nil {
-		f.Close()
+		file.Close()
 		return nil, err
 	}
-	size := st.Size()
+	size := fileInfo.Size()
 	if size < 12 {
-		f.Close()
+		file.Close()
 		return nil, errBadParquet
 	}
 	// Footer: 4-byte metadata length + "PAR1". Verify leading magic too.
 	tail := make([]byte, 8)
-	if _, err := f.ReadAt(tail, size-8); err != nil {
-		f.Close()
+	if _, err := file.ReadAt(tail, size-8); err != nil {
+		file.Close()
 		return nil, err
 	}
 	if string(tail[4:]) != "PAR1" {
-		f.Close()
+		file.Close()
 		return nil, errBadParquet
 	}
 	metaLen := int64(binary.LittleEndian.Uint32(tail[:4]))
 	if metaLen <= 0 || metaLen > size-8 {
-		f.Close()
+		file.Close()
 		return nil, errBadParquet
 	}
 	metaBytes := make([]byte, metaLen)
-	if _, err := f.ReadAt(metaBytes, size-8-metaLen); err != nil {
-		f.Close()
+	if _, err := file.ReadAt(metaBytes, size-8-metaLen); err != nil {
+		file.Close()
 		return nil, err
 	}
 	meta, err := parseFileMetaData(metaBytes)
 	if err != nil {
-		f.Close()
+		file.Close()
 		return nil, err
 	}
-	return &Reader{file: f, meta: meta}, nil
+	return &Reader{file: file, meta: meta}, nil
 }
 
 // Close closes the underlying file.
-func (r *Reader) Close() error { return r.file.Close() }
+func (reader *Reader) Close() error { return reader.file.Close() }
 
 // NumRowGroups returns the number of row groups.
-func (r *Reader) NumRowGroups() int { return len(r.meta.rowGroups) }
+func (reader *Reader) NumRowGroups() int { return len(reader.meta.rowGroups) }
 
 // NumRows returns the total number of rows in the file.
-func (r *Reader) NumRows() int64 { return r.meta.numRows }
+func (reader *Reader) NumRows() int64 { return reader.meta.numRows }
 
 // RowGroupNumRows returns the number of rows in a row group.
-func (r *Reader) RowGroupNumRows(i int) int64 { return r.meta.rowGroups[i].numRows }
+func (reader *Reader) RowGroupNumRows(rowGroupIndex int) int64 {
+	return reader.meta.rowGroups[rowGroupIndex].numRows
+}
 
 // ColumnNames returns the leaf column names (flat columns only).
-func (r *Reader) ColumnNames() []string {
+func (reader *Reader) ColumnNames() []string {
 	seen := map[string]bool{}
 	var names []string
-	for _, rg := range r.meta.rowGroups {
-		for _, cc := range rg.columns {
-			if cc.meta == nil || len(cc.meta.pathInSchema) == 0 {
+	for _, rowGroup := range reader.meta.rowGroups {
+		for _, chunk := range rowGroup.columns {
+			if chunk.meta == nil || len(chunk.meta.pathInSchema) == 0 {
 				continue
 			}
-			name := cc.meta.pathInSchema[len(cc.meta.pathInSchema)-1]
+			name := chunk.meta.pathInSchema[len(chunk.meta.pathInSchema)-1]
 			if !seen[name] {
 				seen[name] = true
 				names = append(names, name)
@@ -94,97 +96,97 @@ func (r *Reader) ColumnNames() []string {
 }
 
 // findChunk locates the column chunk for a named flat column in a row group.
-func (r *Reader) findChunk(rgIdx int, name string) (columnChunk, bool) {
-	for _, cc := range r.meta.rowGroups[rgIdx].columns {
-		if cc.meta != nil && len(cc.meta.pathInSchema) > 0 &&
-			cc.meta.pathInSchema[len(cc.meta.pathInSchema)-1] == name {
-			return cc, true
+func (reader *Reader) findChunk(rowGroupIndex int, name string) (columnChunk, bool) {
+	for _, chunk := range reader.meta.rowGroups[rowGroupIndex].columns {
+		if chunk.meta != nil && len(chunk.meta.pathInSchema) > 0 &&
+			chunk.meta.pathInSchema[len(chunk.meta.pathInSchema)-1] == name {
+			return chunk, true
 		}
 	}
 	return columnChunk{}, false
 }
 
 // ReadColumnStrings reads a flat BYTE_ARRAY column for a row group as strings.
-func (r *Reader) ReadColumnStrings(rgIdx int, name string) ([]string, error) {
-	cc, ok := r.findChunk(rgIdx, name)
+func (reader *Reader) ReadColumnStrings(rowGroupIndex int, name string) ([]string, error) {
+	chunk, ok := reader.findChunk(rowGroupIndex, name)
 	if !ok {
 		return nil, fmt.Errorf("parquet: column %q not found", name)
 	}
-	values, err := r.readColumnValues(cc)
+	values, err := reader.readColumnValues(chunk)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]string, len(values))
-	for i, v := range values {
-		out[i] = string(v)
+	for index, value := range values {
+		out[index] = string(value)
 	}
 	return out, nil
 }
 
 // ReadColumnBytes reads a flat BYTE_ARRAY column as raw bytes.
-func (r *Reader) ReadColumnBytes(rgIdx int, name string) ([][]byte, error) {
-	cc, ok := r.findChunk(rgIdx, name)
+func (reader *Reader) ReadColumnBytes(rowGroupIndex int, name string) ([][]byte, error) {
+	chunk, ok := reader.findChunk(rowGroupIndex, name)
 	if !ok {
 		return nil, fmt.Errorf("parquet: column %q not found", name)
 	}
-	return r.readColumnValues(cc)
+	return reader.readColumnValues(chunk)
 }
 
 // ReadColumnInt64 reads a flat INT32 or INT64 column as int64.
-func (r *Reader) ReadColumnInt64(rgIdx int, name string) ([]int64, error) {
-	cc, ok := r.findChunk(rgIdx, name)
+func (reader *Reader) ReadColumnInt64(rowGroupIndex int, name string) ([]int64, error) {
+	chunk, ok := reader.findChunk(rowGroupIndex, name)
 	if !ok {
 		return nil, fmt.Errorf("parquet: column %q not found", name)
 	}
-	dict, pages, err := r.readPages(cc)
+	dict, pages, err := reader.readPages(chunk)
 	if err != nil {
 		return nil, err
 	}
 	var out []int64
-	for _, p := range pages {
-		enc := p.encoding
-		switch enc {
+	for _, page := range pages {
+		encoding := page.encoding
+		switch encoding {
 		case encPlain:
-			if cc.meta.typ == typeInt32 {
-				vals, err := decodePlainInt32(p.data, int(p.numValues))
+			if chunk.meta.typ == typeInt32 {
+				vals, err := decodePlainInt32(page.data, int(page.numValues))
 				if err != nil {
 					return nil, err
 				}
-				for _, v := range vals {
-					out = append(out, int64(v))
+				for _, value := range vals {
+					out = append(out, int64(value))
 				}
 			} else {
-				vals, err := decodePlainInt64(p.data, int(p.numValues))
+				vals, err := decodePlainInt64(page.data, int(page.numValues))
 				if err != nil {
 					return nil, err
 				}
 				out = append(out, vals...)
 			}
 		case encRLE_Dictionary:
-			bitWidth := bitWidthForDict(len(dict))
-			idxs, err := decodeRLEBitPacked(p.data, bitWidth, int(p.numValues))
+			bitWidth := computeDictBitWidth(len(dict))
+			idxs, err := decodeRLEBitPacked(page.data, bitWidth, int(page.numValues))
 			if err != nil {
 				return nil, err
 			}
-			for _, idx := range idxs {
-				if idx < 0 || int(idx) >= len(dict) {
+			for _, dictIndex := range idxs {
+				if dictIndex < 0 || int(dictIndex) >= len(dict) {
 					return nil, errBadEncoding
 				}
-				out = append(out, int64(dictInt(dict[idx])))
+				out = append(out, int64(decodeDictInt(dict[dictIndex])))
 			}
 		default:
-			return nil, fmt.Errorf("parquet: unsupported encoding %d for int column", enc)
+			return nil, fmt.Errorf("parquet: unsupported encoding %d for int column", encoding)
 		}
 	}
 	return out, nil
 }
 
-func dictInt(b []byte) int32 {
-	if len(b) == 4 {
-		return int32(binary.LittleEndian.Uint32(b))
+func decodeDictInt(encoded []byte) int32 {
+	if len(encoded) == 4 {
+		return int32(binary.LittleEndian.Uint32(encoded))
 	}
-	if len(b) == 8 {
-		return int32(binary.LittleEndian.Uint64(b))
+	if len(encoded) == 8 {
+		return int32(binary.LittleEndian.Uint64(encoded))
 	}
 	// Fallback: decode as text? Not expected for int columns.
 	return 0
@@ -192,34 +194,34 @@ func dictInt(b []byte) int32 {
 
 // readColumnValues reads a BYTE_ARRAY column, handling PLAIN and
 // RLE_DICTIONARY encodings.
-func (r *Reader) readColumnValues(cc columnChunk) ([][]byte, error) {
-	dict, pages, err := r.readPages(cc)
+func (reader *Reader) readColumnValues(chunk columnChunk) ([][]byte, error) {
+	dict, pages, err := reader.readPages(chunk)
 	if err != nil {
 		return nil, err
 	}
 	var out [][]byte
-	for _, p := range pages {
-		switch p.encoding {
+	for _, page := range pages {
+		switch page.encoding {
 		case encPlain:
-			vals, err := decodePlainByteArray(p.data, int(p.numValues))
+			vals, err := decodePlainByteArray(page.data, int(page.numValues))
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, vals...)
 		case encRLE_Dictionary:
-			bitWidth := bitWidthForDict(len(dict))
-			idxs, err := decodeRLEBitPacked(p.data, bitWidth, int(p.numValues))
+			bitWidth := computeDictBitWidth(len(dict))
+			idxs, err := decodeRLEBitPacked(page.data, bitWidth, int(page.numValues))
 			if err != nil {
 				return nil, err
 			}
-			for _, idx := range idxs {
-				if idx < 0 || int(idx) >= len(dict) {
+			for _, dictIndex := range idxs {
+				if dictIndex < 0 || int(dictIndex) >= len(dict) {
 					return nil, errBadEncoding
 				}
-				out = append(out, dict[idx])
+				out = append(out, dict[dictIndex])
 			}
 		default:
-			return nil, fmt.Errorf("parquet: unsupported encoding %d", p.encoding)
+			return nil, fmt.Errorf("parquet: unsupported encoding %d", page.encoding)
 		}
 	}
 	return out, nil
@@ -233,51 +235,51 @@ type rawPage struct {
 
 // readPages reads all pages of a column chunk, returning the dictionary
 // entries (empty if no dictionary) and the data pages.
-func (r *Reader) readPages(cc columnChunk) ([][]byte, []rawPage, error) {
-	if cc.meta == nil {
+func (reader *Reader) readPages(chunk columnChunk) ([][]byte, []rawPage, error) {
+	if chunk.meta == nil {
 		return nil, nil, errBadParquet
 	}
 	var dict [][]byte
 	var pages []rawPage
 
-	if cc.meta.dictionaryPageOffset > 0 {
-		hdr, data, err := r.readPageAt(cc.meta.dictionaryPageOffset, cc.meta.codec)
+	if chunk.meta.dictionaryPageOffset > 0 {
+		header, data, err := reader.readPageAt(chunk.meta.dictionaryPageOffset, chunk.meta.codec)
 		if err != nil {
 			return nil, nil, err
 		}
-		if hdr.dictionary == nil {
+		if header.dictionary == nil {
 			return nil, nil, errBadParquet
 		}
-		dict, err = decodePlainByteArray(data, int(hdr.dictionary.numValues))
+		dict, err = decodePlainByteArray(data, int(header.dictionary.numValues))
 		if err != nil {
 			return nil, nil, err
 		}
 	}
 
-	offset := cc.meta.dataPageOffset
+	offset := chunk.meta.dataPageOffset
 	if offset == 0 {
-		offset = cc.fileOffset
+		offset = chunk.fileOffset
 	}
 	var total int64
-	for total < cc.meta.numValues {
-		hdr, data, err := r.readPageAt(offset, cc.meta.codec)
+	for total < chunk.meta.numValues {
+		header, data, err := reader.readPageAt(offset, chunk.meta.codec)
 		if err != nil {
 			return nil, nil, err
 		}
-		if hdr.typ == pageDictionary {
-			offset += hdr.headerLen + int64(hdr.compressedSize)
+		if header.typ == pageDictionary {
+			offset += header.headerLen + int64(header.compressedSize)
 			continue
 		}
-		if hdr.data == nil {
+		if header.data == nil {
 			return nil, nil, errBadParquet
 		}
 		pages = append(pages, rawPage{
-			numValues: hdr.data.numValues,
-			encoding:  hdr.data.encoding,
+			numValues: header.data.numValues,
+			encoding:  header.data.encoding,
 			data:      data,
 		})
-		total += int64(hdr.data.numValues)
-		offset += hdr.headerLen + int64(hdr.compressedSize)
+		total += int64(header.data.numValues)
+		offset += header.headerLen + int64(header.compressedSize)
 	}
 	return dict, pages, nil
 }
@@ -293,28 +295,28 @@ type rawPageHeader struct {
 
 // readPageAt reads and decompresses a single page starting at the given file
 // offset.
-func (r *Reader) readPageAt(offset int64, codec int32) (rawPageHeader, []byte, error) {
+func (reader *Reader) readPageAt(offset int64, codec int32) (rawPageHeader, []byte, error) {
 	const headerWindow = 1 << 16
-	win := make([]byte, headerWindow)
-	n, err := r.file.ReadAt(win, offset)
+	window := make([]byte, headerWindow)
+	bytesRead, err := reader.file.ReadAt(window, offset)
 	if err != nil && err != io.EOF {
 		return rawPageHeader{}, nil, err
 	}
-	win = win[:n]
-	hdr, consumed, err := parsePageHeader(win)
+	window = window[:bytesRead]
+	header, consumed, err := parsePageHeader(window)
 	if err != nil {
 		return rawPageHeader{}, nil, err
 	}
-	hdr.headerLen = int64(consumed)
-	compressed := make([]byte, hdr.compressedSize)
-	if _, err := r.file.ReadAt(compressed, offset+int64(consumed)); err != nil {
+	header.headerLen = int64(consumed)
+	compressed := make([]byte, header.compressedSize)
+	if _, err := reader.file.ReadAt(compressed, offset+int64(consumed)); err != nil {
 		return rawPageHeader{}, nil, err
 	}
 	data, err := decompress(compressed, codec)
 	if err != nil {
 		return rawPageHeader{}, nil, err
 	}
-	return hdr, data, nil
+	return header, data, nil
 }
 
 func decompress(data []byte, codec int32) ([]byte, error) {
@@ -329,124 +331,124 @@ func decompress(data []byte, codec int32) ([]byte, error) {
 }
 
 func parsePageHeader(data []byte) (rawPageHeader, int, error) {
-	r := newCompactReader(data)
-	var h rawPageHeader
+	reader := newCompactReader(data)
+	var header rawPageHeader
 	for {
-		id, typ, ok, err := r.fieldHeader()
+		id, typ, ok, err := reader.readFieldHeader()
 		if err != nil {
-			return h, 0, err
+			return header, 0, err
 		}
 		if !ok {
-			return h, r.pos, nil
+			return header, reader.pos, nil
 		}
 		switch id {
 		case 1:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
-				return h, 0, err
+				return header, 0, err
 			}
-			h.typ = int32(v)
+			header.typ = int32(value)
 		case 2:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
-				return h, 0, err
+				return header, 0, err
 			}
-			h.uncompressedSize = int32(v)
+			header.uncompressedSize = int32(value)
 		case 3:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
-				return h, 0, err
+				return header, 0, err
 			}
-			h.compressedSize = int32(v)
+			header.compressedSize = int32(value)
 		case 5:
-			h.data, err = parseDataPageHeader(r)
+			header.data, err = parseDataPageHeader(reader)
 		case 7:
-			h.dictionary, err = parseDictionaryPageHeader(r)
+			header.dictionary, err = parseDictionaryPageHeader(reader)
 		default:
-			err = r.skipValue(typ)
+			err = reader.skipValue(typ)
 		}
 		if err != nil {
-			return h, 0, err
+			return header, 0, err
 		}
 	}
 }
 
-func parseDataPageHeader(r *compactReader) (*dataPageHeader, error) {
-	last := r.enterStruct()
-	defer r.exitStruct(last)
-	h := &dataPageHeader{}
+func parseDataPageHeader(reader *compactReader) (*dataPageHeader, error) {
+	previousFieldID := reader.enterStruct()
+	defer reader.exitStruct(previousFieldID)
+	header := &dataPageHeader{}
 	for {
-		id, typ, ok, err := r.fieldHeader()
+		id, typ, ok, err := reader.readFieldHeader()
 		if err != nil {
-			return h, err
+			return header, err
 		}
 		if !ok {
-			return h, nil
+			return header, nil
 		}
 		switch id {
 		case 1:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
-				return h, err
+				return header, err
 			}
-			h.numValues = int32(v)
+			header.numValues = int32(value)
 		case 2:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
-				return h, err
+				return header, err
 			}
-			h.encoding = int32(v)
+			header.encoding = int32(value)
 		case 3:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
-				return h, err
+				return header, err
 			}
-			h.defLevelEncoding = int32(v)
+			header.defLevelEncoding = int32(value)
 		case 4:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
-				return h, err
+				return header, err
 			}
-			h.repLevelEncoding = int32(v)
+			header.repLevelEncoding = int32(value)
 		default:
-			err = r.skipValue(typ)
+			err = reader.skipValue(typ)
 		}
 		if err != nil {
-			return h, err
+			return header, err
 		}
 	}
 }
 
-func parseDictionaryPageHeader(r *compactReader) (*dictionaryPageHeader, error) {
-	last := r.enterStruct()
-	defer r.exitStruct(last)
-	h := &dictionaryPageHeader{}
+func parseDictionaryPageHeader(reader *compactReader) (*dictionaryPageHeader, error) {
+	previousFieldID := reader.enterStruct()
+	defer reader.exitStruct(previousFieldID)
+	header := &dictionaryPageHeader{}
 	for {
-		id, typ, ok, err := r.fieldHeader()
+		id, typ, ok, err := reader.readFieldHeader()
 		if err != nil {
-			return h, err
+			return header, err
 		}
 		if !ok {
-			return h, nil
+			return header, nil
 		}
 		switch id {
 		case 1:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
-				return h, err
+				return header, err
 			}
-			h.numValues = int32(v)
+			header.numValues = int32(value)
 		case 2:
-			v, err := r.zigzag()
+			value, err := reader.zigzag()
 			if err != nil {
-				return h, err
+				return header, err
 			}
-			h.encoding = int32(v)
+			header.encoding = int32(value)
 		default:
-			err = r.skipValue(typ)
+			err = reader.skipValue(typ)
 		}
 		if err != nil {
-			return h, err
+			return header, err
 		}
 	}
 }

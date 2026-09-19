@@ -10,10 +10,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/cookiengineer/gonano/checkpoint"
 	"github.com/cookiengineer/gonano/data"
-	"github.com/cookiengineer/gonano/infer"
-	"github.com/cookiengineer/gonano/logging"
+	"github.com/cookiengineer/gonano/inference"
+	"github.com/cookiengineer/gonano/internal/logging"
+	"github.com/cookiengineer/gonano/model/checkpoint"
 	"github.com/cookiengineer/gonano/tokenizer"
 )
 
@@ -34,77 +34,77 @@ func main() {
 		*baseDir = data.BaseDir()
 	}
 
-	tok, err := tokenizer.LoadTokenizer(filepath.Join(*baseDir, "tokenizer", "tokenizer.json"))
+	tokenizer, err := tokenizer.LoadTokenizer(filepath.Join(*baseDir, "tokenizer", "tokenizer.json"))
 	if err != nil {
 		// The benchmark uses a synthetic prompt and never decodes text, so a
 		// real tokenizer is not required — fall back to a byte-level one.
 		logger.Warn("no tokenizer found; using a byte-level tokenizer for the benchmark", "err", err)
-		tok = byteTokenizer()
+		tokenizer = byteTokenizer()
 	}
 	meta, params, err := checkpoint.LoadAny(*modelPath)
 	if err != nil {
 		logger.Error("load checkpoint", "err", err)
 		os.Exit(1)
 	}
-	m := checkpoint.LoadModel(meta, params)
-	engine := infer.NewEngine(m, tok)
+	model := checkpoint.LoadModel(meta, params)
+	engine := inference.NewEngine(model, tokenizer)
 
 	// Clamp the prompt so prompt+decode fits the model context.
 	maxPrompt := meta.ModelConfig.SequenceLen - *decodeTokens
 	if *promptTokens > maxPrompt {
 		*promptTokens = maxPrompt
 	}
-	prompt := []int{tok.BOSTokenID()}
+	prompt := []int{tokenizer.BOSTokenID()}
 	for len(prompt) < *promptTokens {
 		prompt = append(prompt, 1)
 	}
 
 	fmt.Printf("%-6s %-10s %-12s %-10s %-12s\n", "batch", "TTFT(ms)", "TPOT(ms)", "tok/s", "decode tok/s")
-	for _, bs := range parseBatchSizes(*batchSizes) {
-		meas := infer.Measure(engine, prompt, bs, *decodeTokens, 0, 0, 42)
-		var sum time.Duration
-		for _, s := range meas.StepTimes {
-			sum += s
+	for _, batchSize := range parseBatchSizes(*batchSizes) {
+		measurement := inference.Measure(engine, prompt, batchSize, *decodeTokens, 0, 0, 42)
+		var totalStepTime time.Duration
+		for _, stepTime := range measurement.StepTimes {
+			totalStepTime += stepTime
 		}
-		tpot := time.Duration(0)
-		if len(meas.StepTimes) > 0 {
-			tpot = sum / time.Duration(len(meas.StepTimes))
+		timePerOutputToken := time.Duration(0)
+		if len(measurement.StepTimes) > 0 {
+			timePerOutputToken = totalStepTime / time.Duration(len(measurement.StepTimes))
 		}
 		// Overall throughput includes the prefill (TTFT).
-		tokPerSec := float64(bs*meas.NumTokens) / (meas.TTFT + sum).Seconds()
+		tokensPerSecond := float64(batchSize*measurement.NumTokens) / (measurement.TTFT + totalStepTime).Seconds()
 		// Pure decode throughput excludes the prefill and is the number to
 		// watch when serving (decode is memory-bandwidth-bound).
-		decodeStr := "-"
-		if sum > 0 {
-			decodeTokPerSec := float64(bs*len(meas.StepTimes)) / sum.Seconds()
-			decodeStr = fmt.Sprintf("%-12.0f", decodeTokPerSec)
+		decodeRate := "-"
+		if totalStepTime > 0 {
+			decodeTokensPerSecond := float64(batchSize*len(measurement.StepTimes)) / totalStepTime.Seconds()
+			decodeRate = fmt.Sprintf("%-12.0f", decodeTokensPerSecond)
 		}
 		fmt.Printf("%-6d %-10.2f %-12.3f %-10.0f %s\n",
-			bs, meas.TTFT.Seconds()*1000, tpot.Seconds()*1000, tokPerSec, decodeStr)
+			batchSize, measurement.TTFT.Seconds()*1000, timePerOutputToken.Seconds()*1000, tokensPerSecond, decodeRate)
 	}
 }
 
-func parseBatchSizes(s string) []int {
-	var out []int
-	num := 0
-	for _, r := range s {
-		if r == ',' {
-			out = append(out, num)
-			num = 0
+func parseBatchSizes(spec string) []int {
+	var sizes []int
+	value := 0
+	for _, character := range spec {
+		if character == ',' {
+			sizes = append(sizes, value)
+			value = 0
 			continue
 		}
-		num = num*10 + int(r-'0')
+		value = value*10 + int(character-'0')
 	}
-	out = append(out, num)
-	return out
+	sizes = append(sizes, value)
+	return sizes
 }
 
 // byteTokenizer builds a byte-level BPE tokenizer (256 single-byte ranks plus
 // the standard special tokens), used only when no trained tokenizer exists.
 func byteTokenizer() *tokenizer.Tokenizer {
 	ranks := make(map[string]int, 256)
-	for i := 0; i < 256; i++ {
-		ranks[string([]byte{byte(i)})] = i
+	for index := 0; index < 256; index++ {
+		ranks[string([]byte{byte(index)})] = index
 	}
 	return tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
 }

@@ -4,98 +4,98 @@ package model
 // and num_scaling_params.
 
 // MatmulParams returns the number of parameters participating in matrix
-// multiplications with the token stream (every nn.Linear weight). Embeddings
+// multiplications with the token stream (every layers.Linear weight). Embeddings
 // and scalar parameters are excluded.
-func (m *Transformer) MatmulParams() int {
+func (model *Transformer) MatmulParams() int {
 	total := 0
-	for _, block := range m.h {
-		total += block.Attn.cq.Weight.Numel()
-		total += block.Attn.ck.Weight.Numel()
-		total += block.Attn.cv.Weight.Numel()
-		total += block.Attn.cproj.Weight.Numel()
-		if block.Attn.veGate != nil {
-			total += block.Attn.veGate.Weight.Numel()
+	for _, block := range model.blocks {
+		total += block.attention.queryProjection.Weight.Numel()
+		total += block.attention.keyProjection.Weight.Numel()
+		total += block.attention.valueProjection.Weight.Numel()
+		total += block.attention.outputProjection.Weight.Numel()
+		if block.attention.valueEmbeddingGate != nil {
+			total += block.attention.valueEmbeddingGate.Weight.Numel()
 		}
-		total += block.MLP.CFc.Weight.Numel()
-		total += block.MLP.CProj.Weight.Numel()
+		total += block.mlp.inputProjection.Weight.Numel()
+		total += block.mlp.outputProjection.Weight.Numel()
 	}
-	total += m.lm.Weight.Numel()
-	total += m.smearGate.Weight.Numel()
+	total += model.lmHead.Weight.Numel()
+	total += model.smearGate.Weight.Numel()
 	return total
 }
 
 // EstimateFlopsPerToken returns the FLOPs per token for a full forward+backward
 // pass, following nanochat's formula: 6 flops per matmul param plus attention
 // flops (12*h*q*effective_seq per layer, capped by the sliding window).
-func (m *Transformer) EstimateFlopsPerToken() float64 {
-	h := m.Config.NumHead
-	q := m.Config.HeadDim()
-	t := m.Config.SequenceLen
-	attn := 0.0
-	for _, w := range m.windowSizes {
-		window := w[0]
-		eff := t
-		if window >= 0 && window < eff {
-			eff = window
+func (model *Transformer) EstimateFlopsPerToken() float64 {
+	headCount := model.Config.NumHead
+	headDimension := model.Config.HeadDim()
+	sequenceLength := model.Config.SequenceLen
+	attentionFlops := 0.0
+	for _, windowSize := range model.windowSizes {
+		window := windowSize[0]
+		effectiveLength := sequenceLength
+		if window >= 0 && window < effectiveLength {
+			effectiveLength = window
 		}
-		attn += 12 * float64(h) * float64(q) * float64(eff)
+		attentionFlops += 12 * float64(headCount) * float64(headDimension) * float64(effectiveLength)
 	}
-	return 6*float64(m.MatmulParams()) + attn
+	return 6*float64(model.MatmulParams()) + attentionFlops
 }
 
 // EstimateDecodeFlops returns the forward FLOPs to decode one token at the
 // given context length.
-func (m *Transformer) EstimateDecodeFlops(contextLen int) float64 {
-	h := m.Config.NumHead
-	q := m.Config.HeadDim()
-	attn := 0.0
-	for _, w := range m.windowSizes {
-		window := w[0]
-		eff := contextLen
-		if window >= 0 && window < eff {
-			eff = window
+func (model *Transformer) EstimateDecodeFlops(contextLength int) float64 {
+	headCount := model.Config.NumHead
+	headDimension := model.Config.HeadDim()
+	attentionFlops := 0.0
+	for _, windowSize := range model.windowSizes {
+		window := windowSize[0]
+		effectiveLength := contextLength
+		if window >= 0 && window < effectiveLength {
+			effectiveLength = window
 		}
-		attn += 4 * float64(h) * float64(q) * float64(eff)
+		attentionFlops += 4 * float64(headCount) * float64(headDimension) * float64(effectiveLength)
 	}
-	return 2*float64(m.MatmulParams()) + attn
+	return 2*float64(model.MatmulParams()) + attentionFlops
 }
 
 // EstimatePrefillFlops returns the forward FLOPs to prefill numTokens tokens.
-func (m *Transformer) EstimatePrefillFlops(numTokens int) float64 {
-	h := m.Config.NumHead
-	q := m.Config.HeadDim()
-	attn := 0.0
-	for _, w := range m.windowSizes {
-		window := w[0]
-		weff := window
+func (model *Transformer) EstimatePrefillFlops(numTokens int) float64 {
+	headCount := model.Config.NumHead
+	headDimension := model.Config.HeadDim()
+	attentionFlops := 0.0
+	for _, windowSize := range model.windowSizes {
+		window := windowSize[0]
+		effectiveWindow := window
 		if window < 0 || window > numTokens {
-			weff = numTokens
+			effectiveWindow = numTokens
 		}
-		attended := float64(weff)*(float64(weff)+1)/2 + float64(numTokens-weff)*float64(weff)
-		attn += 4 * float64(h) * float64(q) * attended
+		attendedTokens := float64(effectiveWindow)*(float64(effectiveWindow)+1)/2 + float64(numTokens-effectiveWindow)*float64(effectiveWindow)
+		attentionFlops += 4 * float64(headCount) * float64(headDimension) * attendedTokens
 	}
-	return 2*float64(m.MatmulParams())*float64(numTokens) + attn
+	return 2*float64(model.MatmulParams())*float64(numTokens) + attentionFlops
 }
 
 // KVBytesPerToken returns the bytes to store one token of KV cache across all
 // layers (float32).
-func (m *Transformer) KVBytesPerToken() int {
-	headDim := m.Config.HeadDim()
-	return m.Config.NumLayer * 2 * m.Config.NumKVHead * headDim * 4
+func (model *Transformer) KVBytesPerToken() int {
+	headDimension := model.Config.HeadDim()
+	return model.Config.NumLayer * 2 * model.Config.NumKVHead * headDimension * 4
 }
 
 // KVReadBytes returns the bytes of KV cache read by one decode step at the
 // given context length (sliding-window layers read only the recent window).
-func (m *Transformer) KVReadBytes(contextLen int) int {
-	headDim := m.Config.HeadDim()
+func (model *Transformer) KVReadBytes(contextLength int) int {
+	headDimension := model.Config.HeadDim()
 	total := 0
-	for _, w := range m.windowSizes {
-		window := w[0]
-		eff := contextLen
-		if window >= 0 && window < eff {
-			eff = window
+	for _, windowSize := range model.windowSizes {
+		window := windowSize[0]
+		effectiveLength := contextLength
+		if window >= 0 && window < effectiveLength {
+			effectiveLength = window
 		}
-		total += 2 * m.Config.NumKVHead * headDim * 4 * eff
+		total += 2 * model.Config.NumKVHead * headDimension * 4 * effectiveLength
 	}
 	return total
 }
@@ -104,74 +104,74 @@ func (m *Transformer) KVReadBytes(contextLen int) int {
 // num_scaling_params. Kaplan/Chinchilla differ on which groups to include;
 // callers (scaling laws) pick the combination that fits best.
 type ScalingParams struct {
-	WTE                   int
-	ValueEmbeds           int
-	LMHead                int
-	TransformerMatrices   int
-	Scalars               int
-	Total                 int
+	WTE                 int
+	ValueEmbeds         int
+	LMHead              int
+	TransformerMatrices int
+	Scalars             int
+	Total               int
 }
 
 // ScalingParamsForConfig returns the number of scaling parameters
 // (transformer matrices + lm_head) for a config, computed without building a
 // model. This is the count nanochat uses for its scaling-law fits.
-func ScalingParamsForConfig(cfg Config) int64 {
-	cfg.Validate()
-	e := cfg.EmbedDim
-	perBlock := 12 * e * e // cq, ck, cv, cproj (4*E*E) + c_fc, c_proj (8*E*E)
-	numVE := (cfg.NumLayer + 1) / 2
-	transformerMatrices := int64(cfg.NumLayer)*int64(perBlock) + int64(numVE)*int64(12*cfg.NumKVHead)
-	lmHead := int64(cfg.EmbedDim) * int64(cfg.PaddedVocab())
+func ScalingParamsForConfig(config Config) int64 {
+	config.Validate()
+	embeddingDimension := config.EmbedDim
+	perBlock := 12 * embeddingDimension * embeddingDimension // cq, ck, cv, cproj (4*E*E) + c_fc, c_proj (8*E*E)
+	numValueEmbeddings := (config.NumLayer + 1) / 2
+	transformerMatrices := int64(config.NumLayer)*int64(perBlock) + int64(numValueEmbeddings)*int64(12*config.NumKVHead)
+	lmHead := int64(config.EmbedDim) * int64(config.PaddedVocab())
 	return transformerMatrices + lmHead
 }
 
 // EstimateFlopsPerTokenForConfig returns the FLOPs per token for a config,
 // computed formulaically without building a model.
-func EstimateFlopsPerTokenForConfig(cfg Config) float64 {
-	cfg.Validate()
-	e := cfg.EmbedDim
-	perBlock := 12 * e * e
-	numVE := (cfg.NumLayer + 1) / 2
-	matmulParams := int64(cfg.NumLayer)*int64(perBlock) +
-		int64(numVE)*int64(12*cfg.NumKVHead) +
-		int64(e)*int64(cfg.PaddedVocab()) + 24 // lm_head + smear_gate
+func EstimateFlopsPerTokenForConfig(config Config) float64 {
+	config.Validate()
+	embeddingDimension := config.EmbedDim
+	perBlock := 12 * embeddingDimension * embeddingDimension
+	numValueEmbeddings := (config.NumLayer + 1) / 2
+	matmulParameters := int64(config.NumLayer)*int64(perBlock) +
+		int64(numValueEmbeddings)*int64(12*config.NumKVHead) +
+		int64(embeddingDimension)*int64(config.PaddedVocab()) + 24 // lm_head + smear_gate
 
-	h := cfg.NumHead
-	q := cfg.HeadDim()
-	t := cfg.SequenceLen
-	attn := 0.0
-	for _, w := range cfg.WindowSizes() {
-		window := w[0]
-		eff := t
-		if window >= 0 && window < eff {
-			eff = window
+	headCount := config.NumHead
+	headDimension := config.HeadDim()
+	sequenceLength := config.SequenceLen
+	attentionFlops := 0.0
+	for _, windowSize := range config.WindowSizes() {
+		window := windowSize[0]
+		effectiveLength := sequenceLength
+		if window >= 0 && window < effectiveLength {
+			effectiveLength = window
 		}
-		attn += 12 * float64(h) * float64(q) * float64(eff)
+		attentionFlops += 12 * float64(headCount) * float64(headDimension) * float64(effectiveLength)
 	}
-	return 6*float64(matmulParams) + attn
+	return 6*float64(matmulParameters) + attentionFlops
 }
 
 // NumScalingParams returns the per-group parameter counts.
-func (m *Transformer) NumScalingParams() ScalingParams {
-	var p ScalingParams
-	p.WTE = m.wte.Weight.Numel()
-	for _, ve := range m.valueEmbeds {
-		p.ValueEmbeds += ve.Weight.Numel()
+func (model *Transformer) NumScalingParams() ScalingParams {
+	var scalingParams ScalingParams
+	scalingParams.WTE = model.tokenEmbedding.Weight.Numel()
+	for _, valueEmbedding := range model.valueEmbeds {
+		scalingParams.ValueEmbeds += valueEmbedding.Weight.Numel()
 	}
-	p.LMHead = m.lm.Weight.Numel()
-	for _, block := range m.h {
-		p.TransformerMatrices += block.Attn.cq.Weight.Numel()
-		p.TransformerMatrices += block.Attn.ck.Weight.Numel()
-		p.TransformerMatrices += block.Attn.cv.Weight.Numel()
-		p.TransformerMatrices += block.Attn.cproj.Weight.Numel()
-		if block.Attn.veGate != nil {
-			p.TransformerMatrices += block.Attn.veGate.Weight.Numel()
+	scalingParams.LMHead = model.lmHead.Weight.Numel()
+	for _, block := range model.blocks {
+		scalingParams.TransformerMatrices += block.attention.queryProjection.Weight.Numel()
+		scalingParams.TransformerMatrices += block.attention.keyProjection.Weight.Numel()
+		scalingParams.TransformerMatrices += block.attention.valueProjection.Weight.Numel()
+		scalingParams.TransformerMatrices += block.attention.outputProjection.Weight.Numel()
+		if block.attention.valueEmbeddingGate != nil {
+			scalingParams.TransformerMatrices += block.attention.valueEmbeddingGate.Weight.Numel()
 		}
-		p.TransformerMatrices += block.MLP.CFc.Weight.Numel()
-		p.TransformerMatrices += block.MLP.CProj.Weight.Numel()
+		scalingParams.TransformerMatrices += block.mlp.inputProjection.Weight.Numel()
+		scalingParams.TransformerMatrices += block.mlp.outputProjection.Weight.Numel()
 	}
-	p.Scalars = m.residLambdas.Numel() + m.x0Lambdas.Numel() +
-		m.smearGate.Weight.Numel() + m.smearLambda.Numel() + m.backoutLambda.Numel()
-	p.Total = p.WTE + p.ValueEmbeds + p.LMHead + p.TransformerMatrices + p.Scalars
-	return p
+	scalingParams.Scalars = model.residLambdas.Numel() + model.x0Lambdas.Numel() +
+		model.smearGate.Weight.Numel() + model.smearLambda.Numel() + model.backoutLambda.Numel()
+	scalingParams.Total = scalingParams.WTE + scalingParams.ValueEmbeds + scalingParams.LMHead + scalingParams.TransformerMatrices + scalingParams.Scalars
+	return scalingParams
 }

@@ -15,7 +15,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cookiengineer/gonano/logging"
+	"github.com/cookiengineer/gonano/internal/logging"
 	"github.com/cookiengineer/gonano/tokenizer"
 )
 
@@ -23,43 +23,43 @@ import (
 const markdownVocabSize = 4096
 
 func main() {
-	out := flag.String("out", "tokenizer/defaults", "output directory")
+	outputDir := flag.String("out", "tokenizer/defaults", "output directory")
 	flag.Parse()
 
 	logger := logging.Default(slog.LevelInfo)
-	os.MkdirAll(*out, 0o755)
+	os.MkdirAll(*outputDir, 0o755)
 
 	// Byte-level default.
-	byteTok := byteTokenizer()
-	if err := byteTok.Save(filepath.Join(*out, "byte.json")); err != nil {
+	byteLevelTokenizer := byteTokenizer()
+	if err := byteLevelTokenizer.Save(filepath.Join(*outputDir, "byte.json")); err != nil {
 		logger.Error("save byte.json", "err", err)
 		os.Exit(1)
 	}
 
 	// Markdown default: train BPE over representative Markdown.
 	var pieces []string
-	for _, doc := range markdownCorpus {
-		pieces = append(pieces, tokenizer.SplitPieces(doc)...)
+	for _, document := range markdownCorpus {
+		pieces = append(pieces, tokenizer.SplitPieces(document)...)
 	}
 	numMerges := markdownVocabSize - 256 - len(tokenizer.SpecialTokens)
 	ranks := tokenizer.TrainBPE(pieces, numMerges)
-	mdTok := tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
-	if err := mdTok.Save(filepath.Join(*out, "markdown.json")); err != nil {
+	markdownTokenizer := tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
+	if err := markdownTokenizer.Save(filepath.Join(*outputDir, "markdown.json")); err != nil {
 		logger.Error("save markdown.json", "err", err)
 		os.Exit(1)
 	}
 
 	logger.Info("wrote default tokenizers",
-		"byte_vocab", byteTok.VocabSize(),
-		"markdown_vocab", mdTok.VocabSize(),
-		"dir", *out,
+		"byte_vocab", byteLevelTokenizer.VocabSize(),
+		"markdown_vocab", markdownTokenizer.VocabSize(),
+		"dir", *outputDir,
 	)
 }
 
 func byteTokenizer() *tokenizer.Tokenizer {
 	ranks := make(map[string]int, 256)
-	for i := 0; i < 256; i++ {
-		ranks[string([]byte{byte(i)})] = i
+	for index := 0; index < 256; index++ {
+		ranks[string([]byte{byte(index)})] = index
 	}
 	return tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
 }

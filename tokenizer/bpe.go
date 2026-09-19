@@ -6,31 +6,33 @@ import "container/heap"
 type pair [2]int
 
 type pairEntry struct {
-	p     pair
-	count int
+	symbolPair pair
+	count      int
 }
 
 // pairHeap is a max-heap ordered by count (then by symbols for determinism).
 type pairHeap []pairEntry
 
-func (h pairHeap) Len() int { return len(h) }
-func (h pairHeap) Less(i, j int) bool {
-	if h[i].count != h[j].count {
-		return h[i].count > h[j].count
+func (entries pairHeap) Len() int { return len(entries) }
+func (entries pairHeap) Less(first, second int) bool {
+	if entries[first].count != entries[second].count {
+		return entries[first].count > entries[second].count
 	}
-	if h[i].p[0] != h[j].p[0] {
-		return h[i].p[0] < h[j].p[0]
+	if entries[first].symbolPair[0] != entries[second].symbolPair[0] {
+		return entries[first].symbolPair[0] < entries[second].symbolPair[0]
 	}
-	return h[i].p[1] < h[j].p[1]
+	return entries[first].symbolPair[1] < entries[second].symbolPair[1]
 }
-func (h pairHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *pairHeap) Push(x any)        { *h = append(*h, x.(pairEntry)) }
-func (h *pairHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
-	return x
+func (entries pairHeap) Swap(first, second int) {
+	entries[first], entries[second] = entries[second], entries[first]
+}
+func (entries *pairHeap) Push(value any) { *entries = append(*entries, value.(pairEntry)) }
+func (entries *pairHeap) Pop() any {
+	old := *entries
+	count := len(old)
+	value := old[count-1]
+	*entries = old[:count-1]
+	return value
 }
 
 // TrainBPE trains byte-level BPE over the given pieces (already split by the
@@ -43,117 +45,118 @@ func (h *pairHeap) Pop() any {
 // training tractable for large corpora.
 func TrainBPE(pieces []string, numMerges int) map[string]int {
 	symbols := make([][]int, len(pieces))
-	for i, p := range pieces {
-		symbols[i] = make([]int, len(p))
-		for j := 0; j < len(p); j++ {
-			symbols[i][j] = int(p[j])
+	for pieceIndex, piece := range pieces {
+		symbols[pieceIndex] = make([]int, len(piece))
+		for byteIndex := 0; byteIndex < len(piece); byteIndex++ {
+			symbols[pieceIndex][byteIndex] = int(piece[byteIndex])
 		}
 	}
 
 	tokenBytes := make([][]byte, 256+numMerges)
-	for i := 0; i < 256; i++ {
-		tokenBytes[i] = []byte{byte(i)}
+	for tokenID := 0; tokenID < 256; tokenID++ {
+		tokenBytes[tokenID] = []byte{byte(tokenID)}
 	}
 
 	pairCount := map[pair]int{}
 	pairMembers := map[pair]map[int]struct{}{}
 	touched := map[pair]bool{}
 
-	addPiecePairs := func(pi int) {
-		s := symbols[pi]
-		for j := 0; j+1 < len(s); j++ {
-			p := pair{s[j], s[j+1]}
-			pairCount[p]++
-			touched[p] = true
-			m := pairMembers[p]
-			if m == nil {
-				m = map[int]struct{}{}
-				pairMembers[p] = m
+	addPiecePairs := func(pieceIndex int) {
+		sequence := symbols[pieceIndex]
+		for pairIndex := 0; pairIndex+1 < len(sequence); pairIndex++ {
+			symbolPair := pair{sequence[pairIndex], sequence[pairIndex+1]}
+			pairCount[symbolPair]++
+			touched[symbolPair] = true
+			memberSet := pairMembers[symbolPair]
+			if memberSet == nil {
+				memberSet = map[int]struct{}{}
+				pairMembers[symbolPair] = memberSet
 			}
-			m[pi] = struct{}{}
+			memberSet[pieceIndex] = struct{}{}
 		}
 	}
-	removePiecePairs := func(pi int) {
-		s := symbols[pi]
-		for j := 0; j+1 < len(s); j++ {
-			p := pair{s[j], s[j+1]}
-			pairCount[p]--
-			touched[p] = true
-			if m := pairMembers[p]; m != nil {
-				delete(m, pi)
-				if len(m) == 0 {
-					delete(pairMembers, p)
+	removePiecePairs := func(pieceIndex int) {
+		sequence := symbols[pieceIndex]
+		for pairIndex := 0; pairIndex+1 < len(sequence); pairIndex++ {
+			symbolPair := pair{sequence[pairIndex], sequence[pairIndex+1]}
+			pairCount[symbolPair]--
+			touched[symbolPair] = true
+			if memberSet := pairMembers[symbolPair]; memberSet != nil {
+				delete(memberSet, pieceIndex)
+				if len(memberSet) == 0 {
+					delete(pairMembers, symbolPair)
 				}
 			}
 		}
 	}
 
-	for pi := range symbols {
-		addPiecePairs(pi)
+	for pieceIndex := range symbols {
+		addPiecePairs(pieceIndex)
 	}
 
-	h := &pairHeap{}
-	heap.Init(h)
-	for p, c := range pairCount {
-		heap.Push(h, pairEntry{p, c})
+	mergeHeap := &pairHeap{}
+	heap.Init(mergeHeap)
+	for symbolPair, count := range pairCount {
+		heap.Push(mergeHeap, pairEntry{symbolPair, count})
 	}
 
 	ranks := make(map[string]int, 256+numMerges)
-	for i := 0; i < 256; i++ {
-		ranks[string(tokenBytes[i])] = i
+	for tokenID := 0; tokenID < 256; tokenID++ {
+		ranks[string(tokenBytes[tokenID])] = tokenID
 	}
 
 	for merge := 0; merge < numMerges; merge++ {
-		var pe pairEntry
-		ok := false
-		for h.Len() > 0 {
-			pe = heap.Pop(h).(pairEntry)
-			if pairCount[pe.p] == pe.count && pe.count > 0 {
-				ok = true
+		var topEntry pairEntry
+		found := false
+		for mergeHeap.Len() > 0 {
+			topEntry = heap.Pop(mergeHeap).(pairEntry)
+			if pairCount[topEntry.symbolPair] == topEntry.count && topEntry.count > 0 {
+				found = true
 				break
 			}
 		}
-		if !ok {
+		if !found {
 			break // no more mergeable pairs
 		}
 
-		a, b := pe.p[0], pe.p[1]
-		c := 256 + merge
-		tokenBytes[c] = append(append([]byte(nil), tokenBytes[a]...), tokenBytes[b]...)
-		ranks[string(tokenBytes[c])] = c
+		leftSymbol, rightSymbol := topEntry.symbolPair[0], topEntry.symbolPair[1]
+		newSymbol := 256 + merge
+		tokenBytes[newSymbol] = append(append([]byte(nil), tokenBytes[leftSymbol]...), tokenBytes[rightSymbol]...)
+		ranks[string(tokenBytes[newSymbol])] = newSymbol
 
 		// Snapshot the pieces containing this pair, then update them.
-		members := pairMembers[pe.p]
+		members := pairMembers[topEntry.symbolPair]
 		pieceList := make([]int, 0, len(members))
-		for pi := range members {
-			pieceList = append(pieceList, pi)
+		for pieceIndex := range members {
+			pieceList = append(pieceList, pieceIndex)
 		}
 		clear(touched)
-		for _, pi := range pieceList {
-			removePiecePairs(pi)
-			symbols[pi] = mergePairs(symbols[pi], a, b, c)
-			addPiecePairs(pi)
+		for _, pieceIndex := range pieceList {
+			removePiecePairs(pieceIndex)
+			symbols[pieceIndex] = mergePairs(symbols[pieceIndex], leftSymbol, rightSymbol, newSymbol)
+			addPiecePairs(pieceIndex)
 		}
 		// Re-insert fresh entries for every pair whose count changed.
-		for p := range touched {
-			heap.Push(h, pairEntry{p, pairCount[p]})
+		for symbolPair := range touched {
+			heap.Push(mergeHeap, pairEntry{symbolPair, pairCount[symbolPair]})
 		}
 	}
 	return ranks
 }
 
-// mergePairs replaces all non-overlapping occurrences of (a, b) with c in a
-// left-to-right pass, matching the standard BPE merge semantics.
-func mergePairs(s []int, a, b, c int) []int {
-	out := make([]int, 0, len(s))
-	i := 0
-	for i < len(s) {
-		if i+1 < len(s) && s[i] == a && s[i+1] == b {
-			out = append(out, c)
-			i += 2
+// mergePairs replaces all non-overlapping occurrences of (leftSymbol,
+// rightSymbol) with mergedSymbol in a left-to-right pass, matching the
+// standard BPE merge semantics.
+func mergePairs(symbols []int, leftSymbol, rightSymbol, mergedSymbol int) []int {
+	out := make([]int, 0, len(symbols))
+	index := 0
+	for index < len(symbols) {
+		if index+1 < len(symbols) && symbols[index] == leftSymbol && symbols[index+1] == rightSymbol {
+			out = append(out, mergedSymbol)
+			index += 2
 		} else {
-			out = append(out, s[i])
-			i++
+			out = append(out, symbols[index])
+			index++
 		}
 	}
 	return out

@@ -1,9 +1,9 @@
 package model
 
 import (
-	"github.com/cookiengineer/gonano/nn"
-	"github.com/cookiengineer/gonano/parallel"
-	"github.com/cookiengineer/gonano/tensor"
+	"github.com/cookiengineer/gonano/internal/parallel"
+	"github.com/cookiengineer/gonano/model/layers"
+	"github.com/cookiengineer/gonano/tensors"
 )
 
 // normEps is the epsilon used in RMSNorm, matching torch's RMSNorm default.
@@ -12,187 +12,174 @@ const normEps = 1e-6
 // qkScale is nanochat's "sharper attention" scaling, split across Q and K.
 const qkScale = 1.2
 
-// veGateChannels is the number of leading embedding channels the value-embedding
-// gate reads.
+// veGateChannels is the number of leading embedding channels the
+// value-embedding gate reads.
 const veGateChannels = 12
 
 // veGateScale multiplies the sigmoid gate so it ranges over (0, 3).
 const veGateScale = 3.0
 
-// maskedScore replaces disallowed attention positions before softmax. It is a
-// large negative finite value so that exp() underflows to zero.
-const maskedScore = -1e30
-
-// normLastDim applies stateless RMSNorm over the last dimension of an
+// normalizeLastDim applies stateless RMSNorm over the last dimension of an
 // arbitrary-rank tensor.
-func normLastDim(x *tensor.Tensor) *tensor.Tensor {
-	last := x.Shape[len(x.Shape)-1]
-	rows := x.Numel() / last
-	return tensor.RMSNormLastDim(x.Reshape(rows, last), normEps).Reshape(x.Shape...)
+func normalizeLastDim(input *tensors.Tensor) *tensors.Tensor {
+	lastDimension := input.Shape[len(input.Shape)-1]
+	rowCount := input.Numel() / lastDimension
+	return tensors.RMSNormLastDim(input.Reshape(rowCount, lastDimension), normEps).Reshape(input.Shape...)
 }
 
-// toBH transposes [B,T,H,D] to [B,H,T,D], making per-(batch,head) slices
-// contiguous for the attention kernels.
-func toBH(x *tensor.Tensor) *tensor.Tensor {
-	b, t, h, d := x.Shape[0], x.Shape[1], x.Shape[2], x.Shape[3]
-	out := tensor.New(b, h, t, d)
-	src, dst := x.Data, out.Data
-	parallel.Default().For(0, b*h, func(i int) {
-		bb := i / h
-		hh := i % h
-		for tt := 0; tt < t; tt++ {
-			s := ((bb*t+tt)*h + hh) * d
-			copy(dst[((bb*h+hh)*t+tt)*d:], src[s:s+d])
+// toBatchHeadLayout transposes [batch, sequence, head, dim] to
+// [batch, head, sequence, dim], making per-(batch, head) slices contiguous for
+// the attention kernels.
+func toBatchHeadLayout(input *tensors.Tensor) *tensors.Tensor {
+	batchSize, sequenceLength, headCount, headDimension := input.Shape[0], input.Shape[1], input.Shape[2], input.Shape[3]
+	output := tensors.New(batchSize, headCount, sequenceLength, headDimension)
+	source, destination := input.Data, output.Data
+	parallel.Default().For(0, batchSize*headCount, func(index int) {
+		batchIndex := index / headCount
+		headIndex := index % headCount
+		for position := 0; position < sequenceLength; position++ {
+			sourceOffset := ((batchIndex*sequenceLength+position)*headCount + headIndex) * headDimension
+			copy(destination[((batchIndex*headCount+headIndex)*sequenceLength+position)*headDimension:], source[sourceOffset:sourceOffset+headDimension])
 		}
 	})
-	return out
+	return output
 }
 
-// toBT transposes [B,H,T,D] back to [B,T,H,D].
-func toBT(x *tensor.Tensor) *tensor.Tensor {
-	b, h, t, d := x.Shape[0], x.Shape[1], x.Shape[2], x.Shape[3]
-	out := tensor.New(b, t, h, d)
-	src, dst := x.Data, out.Data
-	parallel.Default().For(0, b*h, func(i int) {
-		bb := i / h
-		hh := i % h
-		for tt := 0; tt < t; tt++ {
-			s := ((bb*h+hh)*t + tt) * d
-			copy(dst[((bb*t+tt)*h+hh)*d:], src[s:s+d])
+// toBatchSequenceLayout transposes [batch, head, sequence, dim] back to
+// [batch, sequence, head, dim].
+func toBatchSequenceLayout(input *tensors.Tensor) *tensors.Tensor {
+	batchSize, headCount, sequenceLength, headDimension := input.Shape[0], input.Shape[1], input.Shape[2], input.Shape[3]
+	output := tensors.New(batchSize, sequenceLength, headCount, headDimension)
+	source, destination := input.Data, output.Data
+	parallel.Default().For(0, batchSize*headCount, func(index int) {
+		batchIndex := index / headCount
+		headIndex := index % headCount
+		for position := 0; position < sequenceLength; position++ {
+			sourceOffset := ((batchIndex*headCount+headIndex)*sequenceLength + position) * headDimension
+			copy(destination[((batchIndex*sequenceLength+position)*headCount+headIndex)*headDimension:], source[sourceOffset:sourceOffset+headDimension])
 		}
 	})
-	return out
+	return output
 }
 
-// attentionHead computes softmax(q @ k^T, masked) @ v for a single head. q is
-// [tq,D], k and v are [tk,D], and t0 is the global position of the first
-// query token (nonzero during KV-cache decode). window < 0 means full context.
-func attentionHead(q, k, v []float32, tq, tk, d, t0, window int) []float32 {
-	q2 := tensor.NewWithData([]int{tq, d}, q)
-	k2 := tensor.NewWithData([]int{tk, d}, k)
-	scores := tensor.MatMulTransB(q2, k2)
-	sd := scores.Data
-	for i := 0; i < tq; i++ {
-		qpos := t0 + i
-		for j := 0; j < tk; j++ {
-			if j > qpos || (window >= 0 && qpos-j > window) {
-				sd[i*tk+j] = maskedScore
-			}
-		}
-	}
-	probs := tensor.SoftmaxLastDim(scores)
-	v2 := tensor.NewWithData([]int{tk, d}, v)
-	return tensor.MatMul(probs, v2).Data
+// headSlice returns the contiguous [sequenceLength, headDimension] block for
+// the head identified by index inside a [batch, head, sequence, dim] buffer.
+func headSlice(data []float32, index, sequenceLength, headDimension int) []float32 {
+	start := index * sequenceLength * headDimension
+	return data[start : start+sequenceLength*headDimension]
 }
 
 // CausalSelfAttention is a multi-head (grouped-query) causal attention layer
 // with QK-norm, rotary embeddings, and an optional value-embedding gate.
 type CausalSelfAttention struct {
-	numHead   int
-	numKVHead int
-	embedDim  int
-	headDim   int
+	queryHeadCount     int
+	keyValueHeadCount  int
+	embeddingDimension int
+	headDimension      int
 
-	cq    *nn.Linear
-	ck    *nn.Linear
-	cv    *nn.Linear
-	cproj *nn.Linear
+	queryProjection  *layers.Linear
+	keyProjection    *layers.Linear
+	valueProjection  *layers.Linear
+	outputProjection *layers.Linear
 
-	veGate *nn.Linear // nil on layers without value embeddings
+	valueEmbeddingGate *layers.Linear // nil on layers without value embeddings
 }
 
-// NewCausalSelfAttention builds an attention layer. hasVE selects whether the
-// ResFormer value-embedding gate is present on this layer.
-func NewCausalSelfAttention(cfg Config, hasVE bool) *CausalSelfAttention {
-	headDim := cfg.HeadDim()
-	a := &CausalSelfAttention{
-		numHead:   cfg.NumHead,
-		numKVHead: cfg.NumKVHead,
-		embedDim:  cfg.EmbedDim,
-		headDim:   headDim,
-		cq:        nn.NewLinear(cfg.EmbedDim, cfg.NumHead*headDim),
-		ck:        nn.NewLinear(cfg.EmbedDim, cfg.NumKVHead*headDim),
-		cv:        nn.NewLinear(cfg.EmbedDim, cfg.NumKVHead*headDim),
-		cproj:     nn.NewLinear(cfg.EmbedDim, cfg.EmbedDim),
+// NewCausalSelfAttention builds an attention layer. hasValueEmbedding selects
+// whether the ResFormer value-embedding gate is present on this layer.
+func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool) *CausalSelfAttention {
+	headDimension := configuration.HeadDim()
+	attention := &CausalSelfAttention{
+		queryHeadCount:     configuration.NumHead,
+		keyValueHeadCount:  configuration.NumKVHead,
+		embeddingDimension: configuration.EmbedDim,
+		headDimension:      headDimension,
+		queryProjection:    layers.NewLinear(configuration.EmbedDim, configuration.NumHead*headDimension),
+		keyProjection:      layers.NewLinear(configuration.EmbedDim, configuration.NumKVHead*headDimension),
+		valueProjection:    layers.NewLinear(configuration.EmbedDim, configuration.NumKVHead*headDimension),
+		outputProjection:   layers.NewLinear(configuration.EmbedDim, configuration.EmbedDim),
 	}
-	if hasVE {
-		a.veGate = nn.NewLinear(veGateChannels, cfg.NumKVHead)
+	if hasValueEmbedding {
+		attention.valueEmbeddingGate = layers.NewLinear(veGateChannels, configuration.NumKVHead)
 	}
-	return a
+	return attention
 }
 
-// Forward computes attention for x of shape [B,T,C]. ve (value embeddings) is
-// non-nil on ResFormer layers. cos/sin are the rotary tables; t0 is the
-// position offset; window is the (left,right) sliding window; cache, when
-// non-nil, stores/reads KV. The result has shape [B,T,C].
-func (a *CausalSelfAttention) Forward(x, ve, cos, sin *tensor.Tensor, t0 int, window [2]int, cache *KVBuffer, layer int) *tensor.Tensor {
-	b, t, c := x.Shape[0], x.Shape[1], x.Shape[2]
-	_ = c
-	q := a.cq.Forward(x).Reshape(b, t, a.numHead, a.headDim)
-	k := a.ck.Forward(x).Reshape(b, t, a.numKVHead, a.headDim)
-	v := a.cv.Forward(x).Reshape(b, t, a.numKVHead, a.headDim)
+// Forward computes attention for input of shape [batch, sequence, embedding].
+// valueEmbedding is non-nil on ResFormer layers. cosine/sine are the rotary
+// tables; positionOffset is the position of the first query; window is the
+// (left, right) sliding window; cache, when non-nil, stores and reads KV. The
+// result has shape [batch, sequence, embedding].
+func (attention *CausalSelfAttention) Forward(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, cache *KVBuffer, layer int) *tensors.Tensor {
+	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
+	query := attention.queryProjection.Forward(input).Reshape(batchSize, sequenceLength, attention.queryHeadCount, attention.headDimension)
+	key := attention.keyProjection.Forward(input).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+	value := attention.valueProjection.Forward(input).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
 
-	if ve != nil {
-		ve4 := ve.Reshape(b, t, a.numKVHead, a.headDim)
-		gate := a.veGate.Forward(sliceChannels(x, 0, t, veGateChannels)) // [B,T,Hkv]
-		gate = tensor.Scale(tensor.Sigmoid(gate), veGateScale)
-		v = addGateTimesVE(v, gate, ve4)
+	if valueEmbedding != nil {
+		valueEmbeddingHeads := valueEmbedding.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+		gate := attention.valueEmbeddingGate.Forward(sliceChannels(input, 0, sequenceLength, veGateChannels)) // [B,T,Hkv]
+		gate = tensors.Scale(tensors.Sigmoid(gate), veGateScale)
+		value = addGateTimesValueEmbedding(value, gate, valueEmbeddingHeads)
 	}
 
-	q = ApplyRotary(q, cos, sin, t0)
-	k = ApplyRotary(k, cos, sin, t0)
+	query = ApplyRotary(query, cosine, sine, positionOffset)
+	key = ApplyRotary(key, cosine, sine, positionOffset)
 
-	q = tensor.Scale(normLastDim(q), qkScale)
-	k = tensor.Scale(normLastDim(k), qkScale)
+	query = tensors.Scale(normalizeLastDim(query), qkScale)
+	key = tensors.Scale(normalizeLastDim(key), qkScale)
 
-	// Transpose to [B,H,T,D] so per-head slices are contiguous.
-	qBH := toBH(q)     // [B, Hq, T, D]
-	kBH := toBH(k)     // [B, Hkv, T, D]
-	vBH := toBH(v)     // [B, Hkv, T, D]
+	// Transpose to [batch, head, sequence, dim] so per-head slices are
+	// contiguous.
+	queryHeadMajor := toBatchHeadLayout(query)
+	keyHeadMajor := toBatchHeadLayout(key)
+	valueHeadMajor := toBatchHeadLayout(value)
 
-	headRatio := a.numHead / a.numKVHead
-	outBH := tensor.New(b, a.numHead, t, a.headDim)
-	d := a.headDim
+	headRatio := attention.queryHeadCount / attention.keyValueHeadCount
+	outputHeadMajor := tensors.New(batchSize, attention.queryHeadCount, sequenceLength, attention.headDimension)
+	headDimension := attention.headDimension
 
-	parallel.Default().For(0, b*a.numHead, func(i int) {
-		bb := i / a.numHead
-		hq := i % a.numHead
-		kvh := hq / headRatio
-		qh := qBH.Data[((bb*a.numHead+hq)*t)*d : ((bb*a.numHead+hq)*t+t)*d]
-		var kFull, vFull []float32
-		pos := t0
+	parallel.Default().For(0, batchSize*attention.queryHeadCount, func(index int) {
+		batchIndex := index / attention.queryHeadCount
+		queryHead := index % attention.queryHeadCount
+		keyValueHead := queryHead / headRatio
+
+		queryHeadData := headSlice(queryHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
+		outputHeadData := headSlice(outputHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
+
+		var keyFull, valueFull []float32
 		if cache != nil {
 			// Write k/v for this (batch, kv-head) into the cache and read the
 			// full prefix as the available context.
-			kNew := kBH.Data[((bb*a.numKVHead+kvh)*t)*d : ((bb*a.numKVHead+kvh)*t+t)*d]
-			vNew := vBH.Data[((bb*a.numKVHead+kvh)*t)*d : ((bb*a.numKVHead+kvh)*t+t)*d]
-			kFull, vFull = cache.writeKeyValue(layer, bb, kvh, kNew, vNew)
+			keyNew := headSlice(keyHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
+			valueNew := headSlice(valueHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
+			keyFull, valueFull = cache.writeKeyValue(layer, batchIndex, keyValueHead, keyNew, valueNew)
 		} else {
-			kFull = kBH.Data[((bb*a.numKVHead+kvh)*t)*d : ((bb*a.numKVHead+kvh)*t+t)*d]
-			vFull = vBH.Data[((bb*a.numKVHead+kvh)*t)*d : ((bb*a.numKVHead+kvh)*t+t)*d]
+			keyFull = headSlice(keyHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
+			valueFull = headSlice(valueHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
 		}
-		tk := len(kFull) / d
-		oh := attentionHead(qh, kFull, vFull, t, tk, d, pos, window[0])
-		copy(outBH.Data[((bb*a.numHead+hq)*t)*d:], oh)
+		keyLength := len(keyFull) / headDimension
+		tensors.AttentionForward(queryHeadData, keyFull, valueFull, outputHeadData, nil, sequenceLength, keyLength, headDimension, positionOffset, window[0])
 	})
 
-	out := toBT(outBH).Reshape(b, t, a.numHead*a.headDim)
-	return a.cproj.Forward(out)
+	output := toBatchSequenceLayout(outputHeadMajor).Reshape(batchSize, sequenceLength, attention.queryHeadCount*attention.headDimension)
+	return attention.outputProjection.Forward(output)
 }
 
-// addGateTimesVE computes v + gate * ve, where gate (shape [B,T,Hkv]) scales
-// each row of ve (shape [B,T,Hkv,D]) before adding to v.
-func addGateTimesVE(v, gate, ve *tensor.Tensor) *tensor.Tensor {
-	b, t, h, d := v.Shape[0], v.Shape[1], v.Shape[2], v.Shape[3]
-	out := v.Clone()
-	rows := b * t * h
-	od, vd, gd := out.Data, ve.Data, gate.Data
-	for r := 0; r < rows; r++ {
-		g := gd[r]
-		base := r * d
-		for j := 0; j < d; j++ {
-			od[base+j] += g * vd[base+j]
+// addGateTimesValueEmbedding computes value + gate * valueEmbedding, where gate
+// (shape [batch, sequence, head]) scales each row of valueEmbedding (shape
+// [batch, sequence, head, dim]) before adding to value.
+func addGateTimesValueEmbedding(value, gate, valueEmbedding *tensors.Tensor) *tensors.Tensor {
+	batchSize, sequenceLength, headCount, headDimension := value.Shape[0], value.Shape[1], value.Shape[2], value.Shape[3]
+	output := value.Clone()
+	rowCount := batchSize * sequenceLength * headCount
+	outputData, valueEmbeddingData, gateData := output.Data, valueEmbedding.Data, gate.Data
+	for row := 0; row < rowCount; row++ {
+		scale := gateData[row]
+		base := row * headDimension
+		for dimension := 0; dimension < headDimension; dimension++ {
+			outputData[base+dimension] += scale * valueEmbeddingData[base+dimension]
 		}
 	}
-	return out
+	return output
 }

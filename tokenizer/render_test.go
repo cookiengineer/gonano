@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestRenderConversation(t *testing.T) {
+func TestRenderConversation(tests *testing.T) {
 	ranks := TrainBPE([]string{"hello world", "hi there", "the sky is blue"}, 30)
 	tok := NewTokenizer(ranks, SpecialTokens)
 
@@ -25,14 +25,14 @@ func TestRenderConversation(t *testing.T) {
 	want = append(want, tok.EncodeSpecial("<|assistant_end|>"))
 
 	if !reflect.DeepEqual(ids, want) {
-		t.Fatalf("ids mismatch:\n got %v\nwant %v", ids, want)
+		tests.Fatalf("ids mismatch:\n got %v\nwant %v", ids, want)
 	}
 	if len(mask) != len(ids) {
-		t.Fatalf("mask length %d != ids length %d", len(mask), len(ids))
+		tests.Fatalf("mask length %d != ids length %d", len(mask), len(ids))
 	}
 }
 
-func TestRenderConversationAssistantMasked(t *testing.T) {
+func TestRenderConversationAssistantMasked(tests *testing.T) {
 	ranks := TrainBPE([]string{"hello"}, 5)
 	tok := NewTokenizer(ranks, SpecialTokens)
 	conv := &Conversation{Messages: []Message{
@@ -43,37 +43,37 @@ func TestRenderConversationAssistantMasked(t *testing.T) {
 	assistantStart := tok.EncodeSpecial("<|assistant_start|>")
 	assistantEnd := tok.EncodeSpecial("<|assistant_end|>")
 	startIdx, endIdx := -1, -1
-	for i, id := range ids {
-		if id == assistantStart {
-			startIdx = i
+	for index, tokenID := range ids {
+		if tokenID == assistantStart {
+			startIdx = index
 		}
-		if id == assistantEnd && endIdx == -1 {
-			endIdx = i
+		if tokenID == assistantEnd && endIdx == -1 {
+			endIdx = index
 		}
 	}
 	if startIdx < 0 || endIdx < 0 || endIdx <= startIdx {
-		t.Fatalf("assistant markers not found: %d..%d", startIdx, endIdx)
+		tests.Fatalf("assistant markers not found: %d..%d", startIdx, endIdx)
 	}
-	for i, id := range ids {
+	for index, tokenID := range ids {
 		switch {
-		case i == startIdx:
-			if mask[i] != 0 {
-				t.Fatalf("assistant_start at %d mask = %d, want 0", i, mask[i])
+		case index == startIdx:
+			if mask[index] != 0 {
+				tests.Fatalf("assistant_start at %d mask = %d, want 0", index, mask[index])
 			}
-		case i > startIdx && i <= endIdx:
+		case index > startIdx && index <= endIdx:
 			// Content tokens and the assistant_end token are supervision targets.
-			if mask[i] != 1 {
-				t.Fatalf("assistant target %d at %d mask = %d, want 1", id, i, mask[i])
+			if mask[index] != 1 {
+				tests.Fatalf("assistant target %d at %d mask = %d, want 1", tokenID, index, mask[index])
 			}
 		default:
-			if mask[i] != 0 {
-				t.Fatalf("non-assistant token %d at %d mask = %d, want 0", id, i, mask[i])
+			if mask[index] != 0 {
+				tests.Fatalf("non-assistant token %d at %d mask = %d, want 0", tokenID, index, mask[index])
 			}
 		}
 	}
 }
 
-func TestRenderConversationSystemMerge(t *testing.T) {
+func TestRenderConversationSystemMerge(tests *testing.T) {
 	ranks := TrainBPE([]string{"system prompt user text assistant text"}, 20)
 	tok := NewTokenizer(ranks, SpecialTokens)
 	conv := &Conversation{Messages: []Message{
@@ -84,11 +84,11 @@ func TestRenderConversationSystemMerge(t *testing.T) {
 	ids, _ := tok.RenderConversation(conv, 2048)
 	decoded := tok.Decode(ids)
 	if decoded != "<|bos|><|user_start|>system prompt\n\nuser text<|user_end|><|assistant_start|>assistant text<|assistant_end|>" {
-		t.Fatalf("system merge decoded = %q", decoded)
+		tests.Fatalf("system merge decoded = %q", decoded)
 	}
 }
 
-func TestRenderForCompletion(t *testing.T) {
+func TestRenderForCompletion(tests *testing.T) {
 	ranks := TrainBPE([]string{"question answer"}, 10)
 	tok := NewTokenizer(ranks, SpecialTokens)
 	conv := &Conversation{Messages: []Message{
@@ -98,16 +98,16 @@ func TestRenderForCompletion(t *testing.T) {
 	ids := tok.RenderForCompletion(conv)
 	last := ids[len(ids)-1]
 	if last != tok.EncodeSpecial("<|assistant_start|>") {
-		t.Fatalf("last id = %d, want assistant_start", last)
+		tests.Fatalf("last id = %d, want assistant_start", last)
 	}
 	// The assistant answer must not be present.
 	decoded := tok.Decode(ids)
 	if decoded == "" {
-		t.Fatal("empty completion")
+		tests.Fatal("empty completion")
 	}
 }
 
-func TestRenderConversationToolUse(t *testing.T) {
+func TestRenderConversationToolUse(tests *testing.T) {
 	ranks := TrainBPE([]string{"what is 2 plus 2", "4"}, 30)
 	tok := NewTokenizer(ranks, SpecialTokens)
 	conv := &Conversation{Messages: []Message{
@@ -124,13 +124,13 @@ func TestRenderConversationToolUse(t *testing.T) {
 		"<|assistant_start|><|tool_start|>2+2<|tool_end|>" +
 		"<|tool_output_start|>4<|tool_output_end|>The answer is 4.<|assistant_end|>"
 	if decoded != want {
-		t.Fatalf("tool-use decoded = %q\nwant %q", decoded, want)
+		tests.Fatalf("tool-use decoded = %q\nwant %q", decoded, want)
 	}
 	// Verify the tool_output region is masked 0 while tool_call and text are 1.
-	for i, id := range ids {
-		if id == tok.EncodeSpecial("<|tool_output_start|>") || id == tok.EncodeSpecial("<|tool_output_end|>") {
-			if mask[i] != 0 {
-				t.Fatalf("tool output special at %d mask = %d, want 0", i, mask[i])
+	for index, tokenID := range ids {
+		if tokenID == tok.EncodeSpecial("<|tool_output_start|>") || tokenID == tok.EncodeSpecial("<|tool_output_end|>") {
+			if mask[index] != 0 {
+				tests.Fatalf("tool output special at %d mask = %d, want 0", index, mask[index])
 			}
 		}
 	}

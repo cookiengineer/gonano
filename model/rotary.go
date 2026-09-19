@@ -3,58 +3,60 @@ package model
 import (
 	"math"
 
-	"github.com/cookiengineer/gonano/tensor"
+	"github.com/cookiengineer/gonano/tensors"
 )
 
 // rotaryBase is the RoPE frequency base used by nanochat.
 const rotaryBase = 100000
 
-// precomputeRotary returns cos and sin tables of shape [seqLen, headDim/2] for
-// the given head dimension. Positions stride over half the head dimension, as
-// in the standard RoPE formulation.
-func precomputeRotary(seqLen, headDim int) (cos, sin *tensor.Tensor) {
-	half := headDim / 2
-	cos = tensor.New(seqLen, half)
-	sin = tensor.New(seqLen, half)
-	for t := 0; t < seqLen; t++ {
-		for j := 0; j < half; j++ {
-			// inv_freq[j] = base^(-2j/headDim), then freq = t * inv_freq.
-			invFreq := math.Pow(rotaryBase, -2.0*float64(j)/float64(headDim))
-			freq := float64(t) * invFreq
-			cos.Set2(t, j, float32(math.Cos(freq)))
-			sin.Set2(t, j, float32(math.Sin(freq)))
+// precomputeRotary returns cosine and sine tables of shape
+// [sequenceLength, headDimension/2] for the given head dimension. Positions
+// stride over half the head dimension, as in the standard RoPE formulation.
+func precomputeRotary(sequenceLength, headDimension int) (cosine, sine *tensors.Tensor) {
+	halfDimension := headDimension / 2
+	cosine = tensors.New(sequenceLength, halfDimension)
+	sine = tensors.New(sequenceLength, halfDimension)
+	for position := 0; position < sequenceLength; position++ {
+		for frequencyIndex := 0; frequencyIndex < halfDimension; frequencyIndex++ {
+			// inv_freq[j] = base^(-2j/headDim), then freq = position * inv_freq.
+			inverseFrequency := math.Pow(rotaryBase, -2.0*float64(frequencyIndex)/float64(headDimension))
+			frequency := float64(position) * inverseFrequency
+			cosine.Set2(position, frequencyIndex, float32(math.Cos(frequency)))
+			sine.Set2(position, frequencyIndex, float32(math.Sin(frequency)))
 		}
 	}
-	return cos, sin
+	return cosine, sine
 }
 
-// ApplyRotary rotates the last dimension of x (shape [B,T,H,D]) using RoPE.
-// cos/sin have shape [seqLen, D/2]; t0 offsets the position of the first
-// token (nonzero during KV-cache decode). The result is a new tensor.
+// ApplyRotary rotates the last dimension of activations (shape [B,T,H,D]) using
+// RoPE. cosine/sine have shape [seqLen, D/2]; positionOffset offsets the
+// position of the first token (nonzero during KV-cache decode). The result is a
+// new tensors.
 //
-// For each token at position p = t0+t, the first and second halves of the last
-// dimension are rotated pairwise: y1 = x1*cos + x2*sin, y2 = -x1*sin + x2*cos.
-func ApplyRotary(x, cos, sin *tensor.Tensor, t0 int) *tensor.Tensor {
-	b, t, h, d := x.Shape[0], x.Shape[1], x.Shape[2], x.Shape[3]
-	half := d / 2
-	out := tensor.New(b, t, h, d)
-	xd, od := x.Data, out.Data
-	cd, sd := cos.Data, sin.Data
-	for bb := 0; bb < b; bb++ {
-		for tt := 0; tt < t; tt++ {
-			p := t0 + tt
-			c := cd[p*half : (p+1)*half]
-			s := sd[p*half : (p+1)*half]
-			for hh := 0; hh < h; hh++ {
-				base := ((bb*t+tt)*h + hh) * d
-				for j := 0; j < half; j++ {
-					x1 := xd[base+j]
-					x2 := xd[base+half+j]
-					od[base+j] = x1*c[j] + x2*s[j]
-					od[base+half+j] = -x1*s[j] + x2*c[j]
+// For each token at position p = positionOffset+sequenceIndex, the first and
+// second halves of the last dimension are rotated pairwise:
+// y1 = x1*cos + x2*sin, y2 = -x1*sin + x2*cos.
+func ApplyRotary(activations, cosine, sine *tensors.Tensor, positionOffset int) *tensors.Tensor {
+	batchSize, sequenceLength, headCount, headDimension := activations.Shape[0], activations.Shape[1], activations.Shape[2], activations.Shape[3]
+	halfDimension := headDimension / 2
+	output := tensors.New(batchSize, sequenceLength, headCount, headDimension)
+	inputData, outputData := activations.Data, output.Data
+	cosineData, sineData := cosine.Data, sine.Data
+	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		for sequenceIndex := 0; sequenceIndex < sequenceLength; sequenceIndex++ {
+			position := positionOffset + sequenceIndex
+			cosineWindow := cosineData[position*halfDimension : (position+1)*halfDimension]
+			sineWindow := sineData[position*halfDimension : (position+1)*halfDimension]
+			for headIndex := 0; headIndex < headCount; headIndex++ {
+				base := ((batchIndex*sequenceLength+sequenceIndex)*headCount + headIndex) * headDimension
+				for dimensionIndex := 0; dimensionIndex < halfDimension; dimensionIndex++ {
+					firstHalfValue := inputData[base+dimensionIndex]
+					secondHalfValue := inputData[base+halfDimension+dimensionIndex]
+					outputData[base+dimensionIndex] = firstHalfValue*cosineWindow[dimensionIndex] + secondHalfValue*sineWindow[dimensionIndex]
+					outputData[base+halfDimension+dimensionIndex] = -firstHalfValue*sineWindow[dimensionIndex] + secondHalfValue*cosineWindow[dimensionIndex]
 				}
 			}
 		}
 	}
-	return out
+	return output
 }

@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 
 	"github.com/cookiengineer/gonano/data"
-	"github.com/cookiengineer/gonano/logging"
+	"github.com/cookiengineer/gonano/internal/logging"
 )
 
 func main() {
@@ -20,14 +20,14 @@ func main() {
 	split := flag.String("split", "train", "dataset split")
 	num := flag.Int("num", 10, "number of shards to download")
 	workers := flag.Int("workers", 4, "parallel download workers")
-	out := flag.String("out", "", "output directory (default ~/.cache/gonano/base_data)")
+	outputDir := flag.String("out", "", "output directory (default ~/.cache/gonano/base_data)")
 	flag.Parse()
 
 	logger := logging.Default(slog.LevelInfo)
-	if *out == "" {
-		*out = filepath.Join(data.BaseDir(), "base_data")
+	if *outputDir == "" {
+		*outputDir = filepath.Join(data.BaseDir(), "base_data")
 	}
-	os.MkdirAll(*out, 0o755)
+	os.MkdirAll(*outputDir, 0o755)
 
 	shards, err := data.ListHFParquetShards(*repo, *config, *split)
 	if err != nil {
@@ -38,27 +38,27 @@ func main() {
 		logger.Error("no shards found for dataset", "repo", *repo)
 		os.Exit(1)
 	}
-	n := *num
-	if n < 0 || n > len(shards) {
-		n = len(shards)
+	shardCount := *num
+	if shardCount < 0 || shardCount > len(shards) {
+		shardCount = len(shards)
 	}
-	logger.Info("downloading shards", "total", n, "repo", *repo)
+	logger.Info("downloading shards", "total", shardCount, "repo", *repo)
 
-	results := make(chan error, n)
-	sem := make(chan struct{}, *workers)
-	for i := 0; i < n; i++ {
-		sem <- struct{}{}
-		go func(shardURL string, idx int) {
-			defer func() { <-sem }()
-			name := fmt.Sprintf("shard_%05d.parquet", idx)
-			results <- data.DownloadFile(shardURL, filepath.Join(*out, name))
-		}(shards[i], i)
+	results := make(chan error, shardCount)
+	semaphore := make(chan struct{}, *workers)
+	for index := 0; index < shardCount; index++ {
+		semaphore <- struct{}{}
+		go func(shardURL string, shardIndex int) {
+			defer func() { <-semaphore }()
+			name := fmt.Sprintf("shard_%05d.parquet", shardIndex)
+			results <- data.DownloadFile(shardURL, filepath.Join(*outputDir, name))
+		}(shards[index], index)
 	}
-	for i := 0; i < n; i++ {
+	for index := 0; index < shardCount; index++ {
 		if err := <-results; err != nil {
 			logger.Error("download failed", "err", err)
 			os.Exit(1)
 		}
 	}
-	logger.Info("download complete", "dir", *out)
+	logger.Info("download complete", "dir", *outputDir)
 }

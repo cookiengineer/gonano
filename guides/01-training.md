@@ -29,7 +29,7 @@ export GOEXPERIMENT=simd
 - Disk space for the dataset (a "sample-10BT" subset is ~10 GB; the full
   FineWeb-Edu corpus is terabytes).
 - Optionally, many CPU cores (training parallelizes across all cores
-  automatically via the `parallel` package).
+  automatically via the `internal/parallel` package).
 
 Verify the toolchain works:
 
@@ -55,7 +55,7 @@ GOEXPERIMENT=simd go test ./...
 There is **one complexity dial** — `--depth`, the number of transformer
 layers. Everything else (width, heads, batch size, learning rates, training
 horizon, weight decay) is derived automatically from the scaling laws in
-`train/scaling.go` (`DeriveHyperparams`).
+`trainer/scaling.go` (`DeriveHyperparams`).
 
 ---
 
@@ -215,15 +215,15 @@ Key flags (`cmd/base_train/main.go`):
 | `--base-dir` | checkpoint/tokenizer directory | `~/.cache/gonano` |
 | `--model-tag` | checkpoint subdirectory | `d<depth>` |
 
-What happens under the hood (`train/trainer.go`, `train/scaling.go`):
+What happens under the hood (`trainer/trainer.go`, `trainer/scaling.go`):
 
 1. `model.ConfigForDepth(depth, vocab, 64, 128, seqLen, "SSSL")` computes
    `n_embd = depth*64` (rounded up to a multiple of the 128-dim head).
-2. `train.DeriveHyperparams` computes the total batch size
+2. `trainer.DeriveHyperparams` computes the total batch size
    (`B ∝ D^0.383`, Power Laws), the LR scaling (`∝ √B`), and weight decay
    (T-epoch framework).
 3. `model.SetupOptimizer` routes embeddings/scalars to AdamW and 2-D matrices
-   to Muon (`optim/muon.go`).
+   to Muon (`optimizer/muon.go`).
 4. Each step runs `Trainer.TrainStep` (forward + backward) and
    `Trainer.StepOptimizer` (LR/momentum/weight-decay schedules).
 
@@ -246,7 +246,7 @@ go run ./cmd/base_eval --model ~/.cache/gonano/base_checkpoints/d4/model_000200.
 ```
 
 This prints samples and (with `--data-dir`) the bits-per-byte metric
-(`eval/bpb.go`). The DCLM CORE benchmark (`eval/core.go`) requires downloading
+(`evaluator/bpb.go`). The DCLM CORE benchmark (`evaluator/core.go`) requires downloading
 the evaluation bundle — see the debugging guide for how it is invoked.
 
 ---
@@ -263,7 +263,7 @@ go run ./cmd/chat_sft \
 
 SFT uses the best-fit packing loader (`data.NewSFTLoader`) with a loss mask so
 the model is only supervised on assistant completions. Production SFT loads
-SmolTalk + MMLU + GSM8K via the `eval/tasks` package; the `chat_sft` command
+SmolTalk + MMLU + GSM8K via the `evaluator/tasks` package; the `chat_sft` command
 uses synthetic conversations for demonstration.
 
 ---

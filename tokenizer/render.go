@@ -26,11 +26,11 @@ type Conversation struct {
 // loss mask of the same length. mask is 1 for assistant completion tokens (the
 // tokens the model is trained to produce) and 0 for user prompts, BOS, special
 // tokens, and tool outputs.
-func (t *Tokenizer) RenderConversation(conv *Conversation, maxTokens int) ([]int, []int) {
+func (tokenizer *Tokenizer) RenderConversation(conv *Conversation, maxTokens int) ([]int, []int) {
 	ids, mask := make([]int, 0), make([]int, 0)
 	add := func(tokenIDs []int, maskVal int) {
 		ids = append(ids, tokenIDs...)
-		for i := 0; i < len(tokenIDs); i++ {
+		for index := 0; index < len(tokenIDs); index++ {
 			mask = append(mask, maskVal)
 		}
 	}
@@ -42,42 +42,42 @@ func (t *Tokenizer) RenderConversation(conv *Conversation, maxTokens int) ([]int
 		messages = append([]Message{merged}, messages[2:]...)
 	}
 
-	bos := t.BOSTokenID()
-	userStart, userEnd := t.EncodeSpecial("<|user_start|>"), t.EncodeSpecial("<|user_end|>")
-	assistantStart, assistantEnd := t.EncodeSpecial("<|assistant_start|>"), t.EncodeSpecial("<|assistant_end|>")
-	toolStart, toolEnd := t.EncodeSpecial("<|tool_start|>"), t.EncodeSpecial("<|tool_end|>")
-	toolOutputStart, toolOutputEnd := t.EncodeSpecial("<|tool_output_start|>"), t.EncodeSpecial("<|tool_output_end|>")
+	bos := tokenizer.BOSTokenID()
+	userStart, userEnd := tokenizer.EncodeSpecial("<|user_start|>"), tokenizer.EncodeSpecial("<|user_end|>")
+	assistantStart, assistantEnd := tokenizer.EncodeSpecial("<|assistant_start|>"), tokenizer.EncodeSpecial("<|assistant_end|>")
+	toolStart, toolEnd := tokenizer.EncodeSpecial("<|tool_start|>"), tokenizer.EncodeSpecial("<|tool_end|>")
+	toolOutputStart, toolOutputEnd := tokenizer.EncodeSpecial("<|tool_output_start|>"), tokenizer.EncodeSpecial("<|tool_output_end|>")
 
 	add([]int{bos}, 0)
-	for i, msg := range messages {
-		if msg.Role == "user" {
+	for messageIndex, message := range messages {
+		if message.Role == "user" {
 			add([]int{userStart}, 0)
-			add(t.Encode(msg.Content), 0)
+			add(tokenizer.Encode(message.Content), 0)
 			add([]int{userEnd}, 0)
 			continue
 		}
 		// assistant
 		add([]int{assistantStart}, 0)
-		if len(msg.Parts) == 0 {
-			add(t.Encode(msg.Content), 1)
+		if len(message.Parts) == 0 {
+			add(tokenizer.Encode(message.Content), 1)
 		} else {
-			for _, part := range msg.Parts {
+			for _, part := range message.Parts {
 				switch part.Type {
 				case "text":
-					add(t.Encode(part.Text), 1)
+					add(tokenizer.Encode(part.Text), 1)
 				case "tool_call":
 					add([]int{toolStart}, 1)
-					add(t.Encode(part.Text), 1)
+					add(tokenizer.Encode(part.Text), 1)
 					add([]int{toolEnd}, 1)
 				case "tool_output":
 					add([]int{toolOutputStart}, 0)
-					add(t.Encode(part.Text), 0)
+					add(tokenizer.Encode(part.Text), 0)
 					add([]int{toolOutputEnd}, 0)
 				}
 			}
 		}
 		add([]int{assistantEnd}, 1)
-		_ = i
+		_ = messageIndex
 	}
 
 	if len(ids) > maxTokens {
@@ -90,10 +90,10 @@ func (t *Tokenizer) RenderConversation(conv *Conversation, maxTokens int) ([]int
 // RenderForCompletion tokenizes a conversation primed for the assistant to
 // complete it: the last assistant message is removed and the assistant-start
 // token is appended. Used during RL rollout generation.
-func (t *Tokenizer) RenderForCompletion(conv *Conversation) []int {
+func (tokenizer *Tokenizer) RenderForCompletion(conv *Conversation) []int {
 	messages := append([]Message(nil), conv.Messages...)
 	messages = messages[:len(messages)-1]
-	ids, _ := t.RenderConversation(&Conversation{Messages: messages, Extra: conv.Extra}, 1<<30)
-	ids = append(ids, t.EncodeSpecial("<|assistant_start|>"))
+	ids, _ := tokenizer.RenderConversation(&Conversation{Messages: messages, Extra: conv.Extra}, 1<<30)
+	ids = append(ids, tokenizer.EncodeSpecial("<|assistant_start|>"))
 	return ids
 }

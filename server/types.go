@@ -1,6 +1,6 @@
 // Package server implements an OpenAI-compatible HTTP API for the gonano model,
 // including chat completions (streaming and non-streaming) and tool-call
-// support. Tool calls are executed server-side through an infer.Registry of Go
+// support. Tool calls are executed server-side through an inference.Registry of Go
 // tools, so a single request can carry a full tool-using turn end to end.
 package server
 
@@ -94,9 +94,9 @@ type StreamDelta struct {
 
 // StreamChoice is one choice in a streamed chunk.
 type StreamChoice struct {
-	Index        int          `json:"index"`
-	Delta        StreamDelta  `json:"delta"`
-	FinishReason *string      `json:"finish_reason"`
+	Index        int         `json:"index"`
+	Delta        StreamDelta `json:"delta"`
+	FinishReason *string     `json:"finish_reason"`
 }
 
 // ChatCompletionChunk is one SSE data frame of a streamed response.

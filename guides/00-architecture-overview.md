@@ -16,24 +16,30 @@ wrappers that only parse flags and call the library.
 
 Think of the code as three stacked layers, plus a set of stand-alone tools.
 
-1. **The execution substrate** — `tensor` and `nn`. Everything numeric lives
-   here: dense float32 tensors, SIMD-accelerated kernels (matmul, softmax,
-   RMSNorm, reductions), and the two primitive layer types (`Linear`,
-   `Embedding`). This layer has no idea what a transformer or a tokenizer is.
+1. **The numeric core** — `kernels` (the backend contract), `kernels/simd`,
+   `kernels/scalar`, `tensors`, and `model/layers`. The `kernels.Backend` interface is the
+   API contract every other package computes through: elementwise vector ops,
+   reductions, matmul, fused softmax/RMSNorm, and flash attention. `kernels/simd`
+   is the production AVX-512 backend; `kernels/scalar` is a portable reference.
+   `tensors` owns the dense float32/int32 tensor types and the high-level ops
+   that delegate to the active backend, and `model/layers` adds the two primitive layer
+   types (`Linear`, `Embedding`). This layer has no idea what a transformer or a
+   tokenizer is.
 
 2. **The model** — `model`. This is the actual nanochat GPT transformer: the
    `Config` that defines its shape, the `Transformer` that owns the weights, and
    both the forward pass (`Forward`) and the training forward/backward pair
-   (`TrainForward`/`TrainBackward`). It is built out of `nn` primitives and
-   `tensor` kernels.
+   (`TrainForward`/`TrainBackward`). It is built out of `model/layers` primitives and
+   `tensors` ops, and its attention uses the flash-attention kernel.
 
-3. **The orchestration** — `train`, `infer`, `eval`, `data`, `tokenizer`. These
+3. **The orchestration** — `trainer`, `inference`, `evaluator`, `data`, `tokenizer`. These
    packages drive the model: producing data, running training loops, sampling
    completions, and scoring results.
 
-The stand-alone tools are `optim` (the optimizers), `checkpoint` (persistence),
-`exec` (sandboxed code execution for evaluations), and the small foundation
-packages `parallel`, `device`, and `logging`.
+The stand-alone tools are `optimizer` (the optimizers), `model/checkpoint`
+(persistence), `executor` (sandboxed code execution for evaluations), and the
+internal foundation packages `internal/parallel`, `internal/device`, and
+`internal/logging`.
 
 The reason for this split: training, inference, and the numeric core are
 decoupled, so each can be imported and understood on its own.
@@ -45,75 +51,116 @@ decoupled, so each can be imported and understood on its own.
 No package may import a package above it. Reading this list bottom-to-top is
 the same order the program bootstraps.
 
-1. `parallel`, `logging`, `device` — the leaves. A goroutine worker pool, an
+1. `internal/parallel`, `internal/logging`, `internal/device` — the leaves. A goroutine worker pool, an
    `slog` setup, and CPU capability detection (`simd.VectorBitSize`,
    `runtime.GOMAXPROCS`).
 
-2. `tensor` — depends only on `parallel`. Owns `Tensor` (row-major float32
-   data plus an optional gradient buffer) and every SIMD kernel.
+2. `kernels` — the backend contract. It is dependency-free and declares the
+   `Backend` interface (`Elementwise`, `Reductions`, `LinearAlgebra`, `Rows`,
+   `Attention`).
 
-3. `nn` — depends on `tensor` and `parallel`. `Linear` and `Embedding` wrap the
-   tensor matmul/gather kernels and add analytic gradients.
+3. `kernels/scalar` and `kernels/simd` — the implementations. `kernels/scalar` is
+   pure Go (no `simd` import); `kernels/simd` depends on `internal/parallel` and the
+   standard-library `simd` package and is the default backend.
 
-4. `model` — depends on `nn` and `tensor`. The transformer and its
-   forward/backward. It also imports `optim` in one place (`SetupOptimizer`
-   returns `optim.ParamGroup`s), which keeps parameter grouping next to the
+4. `tensors` — depends on `kernels` and `internal/parallel`. Owns `Tensor` (row-major
+   float32 data plus an optional gradient buffer), `Int32s`, and the high-level
+   operations that delegate to the active `kernels.Backend`. The default backend
+   is `kernels/simd`; `UseKernelBackend` swaps it (the scalar backend is used in
+   tests and portable builds).
+
+5. `model/layers` — depends on `tensors` and `internal/parallel`. `Linear` and `Embedding` wrap the
+   tensor matmul/gather operations and add analytic gradients.
+
+6. `model` — depends on `model/layers` and `tensors`. The transformer and its
+   forward/backward. It also imports `optimizer` in one place (`SetupOptimizer`
+   returns `optimizer.ParamGroup`s), which keeps parameter grouping next to the
    parameters.
 
-5. `optim` — depends on `tensor`. `MuonAdamW` routes parameter groups to
+7. `optimizer` — depends on `tensors`. `MuonAdamW` routes parameter groups to
    `AdamW` or `Muon`.
 
-6. `tokenizer` — depends on `parallel`. Byte-level BPE training and inference,
+8. `tokenizer` — depends on `internal/parallel`. Byte-level BPE training and inference,
    plus chat rendering. No dependency on the model.
 
-7. `data` — depends on `tokenizer`, `tensor`, and its own `data/parquet`
+9. `data` — depends on `tokenizer`, `tensors`, and its own `data/parquet`
    sub-package. Turns files into token tensors.
 
-8. `train` — depends on `model`, `optim`, `data`, `tensor`. The training loops
-   and hyperparameter derivation.
+10. `trainer` — depends on `model`, `optimizer`, `data`, `tensors`. The training
+    loops and hyperparameter derivation.
 
-9. `infer` — depends on `model`, `tokenizer`, `tensor`. The KV-cache engine,
-   sampler, and calculator tool.
+11. `inference` — depends on `model`, `tokenizer`, `tensors`. The KV-cache engine,
+    sampler, and calculator tool.
 
-10. `eval` — depends on `model`, `tokenizer`, `infer`, `tensor`, plus the
-    `eval/tasks` sub-package (which depends only on `tokenizer`).
+12. `evaluator` — depends on `model`, `tokenizer`, `inference`, `tensors`, plus the
+    `evaluator/tasks` sub-package (which depends only on `tokenizer`).
 
-11. `exec` and `checkpoint` — `exec` is a leaf (`os/exec` only); `checkpoint`
-    depends on `model` and `tensor`.
+13. `executor` and `model/checkpoint` — `executor` is a leaf (`os/exec` only);
+    `model/checkpoint` depends on `model` and `tensors`.
 
-12. `cmd/*` — the executables import the library packages they need.
+14. `cmd/*` — the executables import the library packages they need.
 
 This ordering is enforced implicitly (there are no import cycles); it is also
-why the KV cache (`model.KVBuffer`) lives in `model` rather than `infer` — the
-model's forward pass needs to write to it, and `model` may not import `infer`.
+why the KV cache (`model.KVBuffer`) lives in `model` rather than `inference` — the
+model's forward pass needs to write to it, and `model` may not import `inference`.
 
 ---
 
 ## 3. Package-by-package tour
 
-### 3.1 `tensor`
+### 3.1 `kernels`, `kernels/simd`, `kernels/scalar`
+
+1. `kernels` declares the `Backend` interface. It groups five contracts:
+   `Elementwise` (`Add`, `Subtract`, `Multiply`, `Divide`, `Scale`, `AddScaled`,
+   `Negate`, `Abs`, `Square`, `ReluSquared`, `Exp`, `Sigmoid`, `Tanh`, `Rsqrt`),
+   `Reductions` (`Sum`, `Max`, `ArgMax`), `LinearAlgebra` (`MatMul`,
+   `MatMulTransposed`, `DotProduct`), `Rows` (`SoftmaxLastDim`,
+   `RMSNormLastDim`), and `Attention` (`AttentionForward`,
+   `AttentionBackward`).
+
+2. `kernels/simd` is the production backend: vectorized over the
+   standard-library `simd` lanes and parallelized across CPU cores via
+   `internal/parallel`. Its fused `AttentionForward`/`AttentionBackward` implement flash
+   attention: the `[queryLength, keyLength]` score matrix is never materialized
+   — only a `[queryBlockSize, keyBlockSize]` tile and a
+   `[queryBlockSize, headDim]` accumulator are live, with the online softmax
+   statistics carried forward. The transcendental operations (`Exp`, `Sigmoid`,
+   `Tanh`, `Rsqrt`) fall back to `math` because the `simd` package exposes none.
+
+3. `kernels/scalar` implements the same contract in portable Go and is the
+   reference used by the scalar-vs-SIMD parity tests. It materializes the score
+   matrix, so agreement between the two backends validates the flash algorithm.
+
+4. Only `kernels/simd` imports the standard-library `simd` package; the rest of
+   the project computes through the contract. Receiver methods whose bodies
+   contain a `simd` intrinsic delegate to package-level `...Core` functions:
+   the Go compiler currently rejects a method that type-checks an intrinsic
+   whose name matches the enclosing method, so the delegation is required.
+
+### 3.2 `tensors`
 
 1. `Tensor` is `{ Shape []int, Data []float32, Grad []float32 }`; `Int32s` is
    the same idea for token ids and masks. Both are row-major and contiguous.
 
-2. The compute kernels are `MatMul` (`A @ B`) and `MatMulTransB` (`A @ Bᵀ`),
-   both tiled and parallelized over output rows via `parallel`.
+2. Every operation allocates a result and delegates the arithmetic to
+   `KernelBackend()`. The default is `kernels/simd`; tests and portable builds
+   can call `UseKernelBackend(scalar.New())`.
 
-3. Elementwise/normalization kernels: `RMSNormLastDim`, `SoftmaxLastDim`,
-   `Relu2`, `Sigmoid`, `Tanh`, `Softcap`, and reductions (`SumAll`, `MaxAll`,
-   `ArgMaxLastDim`).
+3. Operations: `MatMul`/`MatMulTransposed`, `Add`/`Subtract`/`Multiply`/`Divide`,
+   `Scale`, `AddScaled`, `Negate`, `Abs`, `Square`, `ReluSquared`, `Exp`,
+   `Sigmoid`, `Tanh`, `Rsqrt`, `Softcap`, `SoftmaxLastDim`, `RMSNormLastDim`,
+   reductions (`SumAll`, `MaxAll`, `ArgMax`, `SumLastDim`, `MaxLastDim`,
+   `ArgMaxLastDim`), and `AttentionForward`/`AttentionBackward`.
 
-4. Loss and gradients: `CrossEntropy`, `CrossEntropyPerPosition`, and
+4. Loss and gradients: `CrossEntropy`, `CrossEntropyPerPosition`,
    `CrossEntropyGrad` (the `softmax - onehot` gradient), plus the backward
-   primitives `MatMulBackward`, `RMSNormBackward`, `SoftcapBackward`,
-   `SigmoidBackward`, and `Relu2Backward`.
+   primitives `MatMulBackward`, `MatMulTransposedBackward`, `RMSNormBackward`,
+   `SoftcapBackward`, `SigmoidBackward`, `ReluSquaredBackward`, and
+   `ScaleBackward`.
 
 5. `RNG` wraps `math/rand/v2` and provides `SampleMultinomial`.
 
-The `simd` package is used only here (and in a tiny bit of `optim`); the rest
-of the project never touches `simd` directly.
-
-### 3.2 `nn`
+### 3.3 `model/layers`
 
 1. `Linear{Weight [out,in]}` — `Forward` is `x @ Wᵀ`, `Backward` accumulates
    `gradW = gradOutᵀ @ x` and returns `gradIn = gradOut @ W`. No biases
@@ -125,7 +172,7 @@ of the project never touches `simd` directly.
 3. `init.go` provides `InitNormal`, `InitUniform`, `InitZeros`, and
    `InitValue`.
 
-### 3.3 `model`
+### 3.4 `model`
 
 1. `Config` is the architecture description: `SequenceLen`, `VocabSize`,
    `NumLayer`, `NumHead`, `NumKVHead`, `EmbedDim`, `WindowPattern`.
@@ -152,10 +199,15 @@ of the project never touches `simd` directly.
 
 6. `KVBuffer` is the inference key/value cache (`model/kvcache.go`).
 
-7. `SetupOptimizer` mirrors nanochat: embeddings, `lm_head`, and scalars go to
+7. Attention (both `Forward` and `forwardTraining`/`backwardTraining`) calls
+   the flash-attention kernel. The training forward saves only the per-query
+   log-sum-exp (`[B,Hq,T]`) instead of the full `[B,Hq,T,T]` probability matrix,
+   and the backward recomputes probabilities from those statistics.
+
+8. `SetupOptimizer` mirrors nanochat: embeddings, `lm_head`, and scalars go to
    AdamW; the 2-D matrix weights go to Muon, grouped by shape.
 
-### 3.4 `optim`
+### 3.5 `optimizer`
 
 1. `ParamGroup` carries a `Kind` (AdamW or Muon) plus its hyperparameters.
 
@@ -167,7 +219,7 @@ of the project never touches `simd` directly.
    Nesterov momentum, MuonEq row equilibration, Polar-Express orthogonalization,
    Muon+ renormalization, variance reduction, and cautious weight decay.
 
-### 3.5 `tokenizer`
+### 3.6 `tokenizer`
 
 1. `SplitPieces` is a hand-written implementation of the GPT-4 regex split
    pattern (Go's RE2 rejects its possessive quantifiers and lookahead).
@@ -178,7 +230,7 @@ of the project never touches `simd` directly.
 3. `Tokenizer` encodes/decodes, renders conversations
    (`RenderConversation`/`RenderForCompletion`), and serializes to JSON.
 
-### 3.6 `data` and `data/parquet`
+### 3.7 `data` and `data/parquet`
 
 1. `data/parquet` is a minimal dependency-free Parquet reader (Thrift compact
    metadata, Snappy, PLAIN and RLE_DICTIONARY encodings) that reads a flat
@@ -195,7 +247,7 @@ of the project never touches `simd` directly.
 4. `hub.go` provides `ListHFParquetShards`, `DownloadFile`, and
    `DownloadWithLock` for pulling datasets off the HuggingFace Hub.
 
-### 3.7 `train`
+### 3.8 `trainer`
 
 1. `DeriveHyperparams` turns the depth dial into the training horizon, batch
    size, LR scale, and weight decay using the scaling laws.
@@ -208,7 +260,7 @@ of the project never touches `simd` directly.
 4. `TrainSFT` runs supervised fine-tuning; `PolicyGradientStep`/`RLStep`
    implement the GRPO/REINFORCE policy gradient.
 
-### 3.8 `infer`
+### 3.9 `inference`
 
 1. `Engine.Generate` runs a batch-1 prefill, replicates the KV cache, then
    loops: sample, run the tool-use state machine, and forward the next token
@@ -222,18 +274,18 @@ of the project never touches `simd` directly.
 
 4. `Measure` times TTFT and per-step decode latency.
 
-### 3.9 `eval`, `eval/tasks`, `exec`
+### 3.10 `evaluator`, `evaluator/tasks`, `executor`
 
-1. `eval` computes `BitsPerByte`, the DCLM CORE metric (`EvaluateTask`), and
+1. `evaluator` computes `BitsPerByte`, the DCLM CORE metric (`EvaluateTask`), and
    `ChatCORE` (`CategoricalAccuracy`/`GenerativeAccuracy`), plus a minimal YAML
    parser for `core.yaml`.
 
-2. `eval/tasks` defines the `Task` interface and `TaskMixture`, and the
+2. `evaluator/tasks` defines the `Task` interface and `TaskMixture`, and the
    datasets (MMLU, GSM8K, ARC, HumanEval, SmolTalk).
 
-3. `exec` runs untrusted Python (HumanEval) in a sandboxed subprocess.
+3. `executor` runs untrusted Python (HumanEval) in a sandboxed subprocess.
 
-### 3.10 `checkpoint`
+### 3.11 `model/checkpoint`
 
 1. `Save`/`Load` handle the native `.gn` format (magic, JSON metadata, raw
    float32 blobs).
@@ -244,10 +296,10 @@ of the project never touches `simd` directly.
 3. `LoadModel` rebuilds a `model.Transformer` from a loaded metadata+params
    pair, and `LoadAny` auto-detects `.gn` vs `.gguf`.
 
-### 3.11 `server`
+### 3.12 `server`
 
-1. `server.Server` wraps a model, tokenizer, `infer.Engine`, and an
-   `infer.Registry` of tools, exposing an OpenAI-compatible HTTP API
+1. `server.Server` wraps a model, tokenizer, `inference.Engine`, and an
+   `inference.Registry` of tools, exposing an OpenAI-compatible HTTP API
    (`POST /v1/chat/completions`, `GET /v1/models`).
 
 2. `renderMessages` translates OpenAI `system`/`user`/`assistant`/`tool`
@@ -271,7 +323,7 @@ Follow these steps to trace what `cmd/base_train` actually does.
    AdamW/Muon parameter groups.
 
 3. A `data.NewPretrainLoader` is built over a `ParquetSource` (or
-   `MarkdownSource`), and `train.NewTrainer` wraps the model + optimizer.
+   `MarkdownSource`), and `trainer.NewTrainer` wraps the model + optimizer.
 
 4. The training loop pulls a batch of token ids `x` and its shifted targets
    `y` from the loader. Each row begins with `<|bos|>` and is packed by the
@@ -280,7 +332,7 @@ Follow these steps to trace what `cmd/base_train` actually does.
 5. `Trainer.TrainStep` runs `Transformer.TrainForward`, which walks the
    transformer and saves activations, then computes `CrossEntropy` against `y`.
 
-6. `tensor.CrossEntropyGrad` produces the `softmax − onehot` gradient, and
+6. `tensors.CrossEntropyGrad` produces the `softmax − onehot` gradient, and
    `TrainBackward` flows it in reverse — through `lm_head`, the final RMSNorm,
    the backout, then each block's MLP and attention, the residual/smear
    connections, and finally back into the embedding table.
@@ -304,7 +356,7 @@ Follow these steps to trace `cmd/chat_cli`.
 1. `checkpoint.LoadAny` loads the weights (`.gn` or `.gguf`) and
    `checkpoint.LoadModel` rebuilds the `Transformer` from the stored config.
 
-2. `tokenizer.LoadTokenizer` loads the tokenizer; `infer.NewEngine` wraps both.
+2. `tokenizer.LoadTokenizer` loads the tokenizer; `inference.NewEngine` wraps both.
 
 3. `Engine.Generate` runs the prompt through `Forward` once with a batch-1
    `model.KVBuffer`, which stores one key/value tensor per layer and per
@@ -316,7 +368,7 @@ Follow these steps to trace `cmd/chat_cli`.
 5. In the decode loop, `SampleNextToken` picks the next token per row from the
    last logits, the tool-call state machine rewrites any
    `<|tool_start|>…<|tool_end|>` spans into tool outputs (via the registered
-   `infer.Tool` set), and the resulting token column is forwarded again
+   `inference.Tool` set), and the resulting token column is forwarded again
    through `Forward` against the KV cache.
 
 6. The loop ends when every row emits `<|assistant_end|>` or the token budget
@@ -349,10 +401,12 @@ shows higher tokens-per-second at larger batch sizes.
 
 1. `parallel.Pool` is a process-wide worker pool sized to `GOMAXPROCS`.
 
-2. `tensor` parallelizes matmul and reductions over output rows and fan out
-   tokenization in `data` and `tokenizer`.
+2. `kernels/simd` parallelizes matmul, reductions, and rowwise softmax/RMSNorm
+   across CPU cores; `data` and `tokenizer` fan out tokenization. Flash
+   attention is parallelized by the model over (batch, head) pairs while each
+   head streams over key blocks.
 
-3. `infer` gets parallelism for free by batching sample rows: the batched
+3. `inference` gets parallelism for free by batching sample rows: the batched
    matmuls are themselves parallelized.
 
 4. Training uses a single model copy with gradient accumulation; each
@@ -367,14 +421,17 @@ shows higher tokens-per-second at larger batch sizes.
 | The model architecture | `model/config.go`, `model/transformer.go` |
 | A single layer | `model/block.go`, `model/attention.go`, `model/mlp.go` |
 | The backprop math | `model/train.go`, `model/train_transformer.go` |
-| The optimizers | `optim/optimizer.go` (AdamW), `optim/muon.go` (Muon) |
-| The SIMD kernels | `tensor/matmul.go`, `tensor/norm.go`, `tensor/elementwise.go` |
+| The optimizers | `optimizer/optimizer.go` (AdamW), `optimizer/muon.go` (Muon) |
+| The kernel contract | `kernels/backend.go` |
+| The SIMD kernels | `kernels/simd/matmul.go`, `kernels/simd/norm.go`, `kernels/simd/elementwise.go` |
+| Flash attention | `kernels/simd/attention.go`, `kernels/scalar/attention.go` |
+| The scalar reference backend | `kernels/scalar/` |
 | Tokenizer internals | `tokenizer/splitter.go`, `tokenizer/bpe.go` |
 | Data loading | `data/dataloader.go`, `data/dataset.go` |
-| The training loop | `train/trainer.go`, `train/scaling.go` |
-| The inference engine | `infer/engine.go`, `infer/sampler.go` |
+| The training loop | `trainer/trainer.go`, `trainer/scaling.go` |
+| The inference engine | `inference/engine.go`, `inference/sampler.go` |
 | The OpenAI API server | `server/server.go`, `server/handler.go`, `cmd/server` |
-| Checkpoint/GGUF | `checkpoint/checkpoint.go`, `checkpoint/gguf.go` |
+| Checkpoint/GGUF | `model/checkpoint/checkpoint.go`, `model/checkpoint/gguf.go` |
 
 For a from-scratch walkthrough, continue with
 [00-quickstart.md](00-quickstart.md); for training specifics see

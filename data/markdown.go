@@ -29,11 +29,11 @@ func NewMarkdownSource(dir string, batchSize int) *MarkdownSource {
 		batchSize = 128
 	}
 	var paths []string
-	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+	_ = filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
-		if !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".md") {
+		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
 			paths = append(paths, path)
 		}
 		return nil
@@ -43,32 +43,32 @@ func NewMarkdownSource(dir string, batchSize int) *MarkdownSource {
 }
 
 // NumFiles returns the number of Markdown files found.
-func (s *MarkdownSource) NumFiles() int { return len(s.paths) }
+func (source *MarkdownSource) NumFiles() int { return len(source.paths) }
 
 // Next returns the next batch of up to batchSize documents.
-func (s *MarkdownSource) Next() ([]string, State) {
+func (source *MarkdownSource) Next() ([]string, State) {
 	for {
-		if len(s.pending) > 0 {
-			n := min(s.batchSize, len(s.pending))
-			batch := s.pending[:n]
-			s.pending = s.pending[n:]
-			return batch, s.lastState
+		if len(source.pending) > 0 {
+			count := min(source.batchSize, len(source.pending))
+			batch := source.pending[:count]
+			source.pending = source.pending[count:]
+			return batch, source.lastState
 		}
-		if len(s.paths) == 0 {
+		if len(source.paths) == 0 {
 			// No data: yield an empty batch (the caller decides how to handle it).
-			return nil, s.lastState
+			return nil, source.lastState
 		}
-		if s.idx >= len(s.paths) {
-			s.idx = 0
-			s.epoch++
+		if source.idx >= len(source.paths) {
+			source.idx = 0
+			source.epoch++
 		}
-		doc, err := os.ReadFile(s.paths[s.idx])
-		s.lastState = State{PQIndex: s.idx, RGIndex: 0, Epoch: s.epoch}
-		s.idx++
+		doc, err := os.ReadFile(source.paths[source.idx])
+		source.lastState = State{PQIndex: source.idx, RGIndex: 0, Epoch: source.epoch}
+		source.idx++
 		if err != nil {
 			continue
 		}
 		text := strings.TrimPrefix(string(doc), "\ufeff") // strip a UTF-8 BOM
-		s.pending = []string{text}
+		source.pending = []string{text}
 	}
 }

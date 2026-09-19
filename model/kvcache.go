@@ -1,115 +1,120 @@
 package model
 
-import "github.com/cookiengineer/gonano/tensor"
+import "github.com/cookiengineer/gonano/tensors"
 
 // KVBuffer is the key/value cache used during autoregressive inference. It
-// stores, for every layer and every batch row, a contiguous [maxSeqLen, D]
-// buffer per KV head. New keys/values are written in place; attention reads a
-// contiguous prefix as the available context.
+// stores, for every layer and every batch row, a contiguous
+// [maximumSequenceLength, headDimension] buffer per key/value head. New
+// keys/values are written in place; attention reads a contiguous prefix as the
+// available context.
 type KVBuffer struct {
-	batchSize int
-	maxSeqLen int
-	numLayers int
-	numKVHead int
-	headDim   int
+	batchSize             int
+	maximumSequenceLength int
+	layerCount            int
+	keyValueHeadCount     int
+	headDimension         int
 
-	// k[layer][row*numKVHead+head] is a [maxSeqLen, headDim] tensor.
-	k [][]*tensor.Tensor
-	v [][]*tensor.Tensor
+	// keyCache[layer][row*keyValueHeadCount+head] is a
+	// [maximumSequenceLength, headDimension] tensor.
+	keyCache   [][]*tensors.Tensor
+	valueCache [][]*tensors.Tensor
 
-	// seqLen is the current sequence length per batch row (all rows advance
-	// together, as in nanochat's engine).
-	seqLen int32
+	// sequenceLength is the current sequence length per batch row (all rows
+	// advance together, as in nanochat's engine).
+	sequenceLength int32
 
-	// prevEmbedding caches the previous token's post-norm embedding for the
+	// previousEmbedding caches the previous token's post-norm embedding for the
 	// smear mechanism during single-token decode.
-	prevEmbedding *tensor.Tensor
+	previousEmbedding *tensors.Tensor
 }
 
 // NewKVBuffer allocates a zeroed KV cache for the given model geometry.
-func NewKVBuffer(batchSize, maxSeqLen, numLayers, numKVHead, headDim int) *KVBuffer {
+func NewKVBuffer(batchSize, maximumSequenceLength, layerCount, keyValueHeadCount, headDimension int) *KVBuffer {
 	cache := &KVBuffer{
-		batchSize: batchSize,
-		maxSeqLen: maxSeqLen,
-		numLayers: numLayers,
-		numKVHead: numKVHead,
-		headDim:   headDim,
-		k:         make([][]*tensor.Tensor, numLayers),
-		v:         make([][]*tensor.Tensor, numLayers),
+		batchSize:             batchSize,
+		maximumSequenceLength: maximumSequenceLength,
+		layerCount:            layerCount,
+		keyValueHeadCount:     keyValueHeadCount,
+		headDimension:         headDimension,
+		keyCache:              make([][]*tensors.Tensor, layerCount),
+		valueCache:            make([][]*tensors.Tensor, layerCount),
 	}
-	for l := 0; l < numLayers; l++ {
-		cache.k[l] = make([]*tensor.Tensor, batchSize*numKVHead)
-		cache.v[l] = make([]*tensor.Tensor, batchSize*numKVHead)
-		for i := 0; i < batchSize*numKVHead; i++ {
-			cache.k[l][i] = tensor.New(maxSeqLen, headDim)
-			cache.v[l][i] = tensor.New(maxSeqLen, headDim)
+	for layer := 0; layer < layerCount; layer++ {
+		cache.keyCache[layer] = make([]*tensors.Tensor, batchSize*keyValueHeadCount)
+		cache.valueCache[layer] = make([]*tensors.Tensor, batchSize*keyValueHeadCount)
+		for index := 0; index < batchSize*keyValueHeadCount; index++ {
+			cache.keyCache[layer][index] = tensors.New(maximumSequenceLength, headDimension)
+			cache.valueCache[layer][index] = tensors.New(maximumSequenceLength, headDimension)
 		}
 	}
 	return cache
 }
 
 // Position returns the current sequence length (assumed uniform across rows).
-func (c *KVBuffer) Position() int { return int(c.seqLen) }
+func (cache *KVBuffer) Position() int { return int(cache.sequenceLength) }
 
-// Advance moves the cache position forward by n tokens.
-func (c *KVBuffer) Advance(n int) { c.seqLen += int32(n) }
+// Advance moves the cache position forward by tokenCount tokens.
+func (cache *KVBuffer) Advance(tokenCount int) { cache.sequenceLength += int32(tokenCount) }
 
 // NumLayers returns the number of layers.
-func (c *KVBuffer) NumLayers() int { return c.numLayers }
+func (cache *KVBuffer) NumLayers() int { return cache.layerCount }
 
 // BatchSize returns the number of batch rows.
-func (c *KVBuffer) BatchSize() int { return c.batchSize }
+func (cache *KVBuffer) BatchSize() int { return cache.batchSize }
 
 // Reset clears the cache and the smear state.
-func (c *KVBuffer) Reset() {
-	c.seqLen = 0
-	c.prevEmbedding = nil
+func (cache *KVBuffer) Reset() {
+	cache.sequenceLength = 0
+	cache.previousEmbedding = nil
 }
 
 // PrevEmbedding returns the cached previous-token embedding (may be nil).
-func (c *KVBuffer) PrevEmbedding() *tensor.Tensor { return c.prevEmbedding }
+func (cache *KVBuffer) PrevEmbedding() *tensors.Tensor { return cache.previousEmbedding }
 
 // SetPrevEmbedding stores the previous-token embedding for the smear step.
-func (c *KVBuffer) SetPrevEmbedding(x *tensor.Tensor) { c.prevEmbedding = x }
-
-// writeKeyValue copies the new k/v for layer l, row b, head h into the cache
-// at the current position, and returns the contiguous key/value prefix
-// [pos+T, D] available for attention.
-func (c *KVBuffer) writeKeyValue(layer, row, head int, kNew, vNew []float32) (kFull, vFull []float32) {
-	pos := int(c.seqLen)
-	t := len(kNew) / c.headDim
-	kBuf := c.k[layer][row*c.numKVHead+head].Data
-	vBuf := c.v[layer][row*c.numKVHead+head].Data
-	copy(kBuf[pos*c.headDim:], kNew)
-	copy(vBuf[pos*c.headDim:], vNew)
-	upto := (pos + t) * c.headDim
-	return kBuf[:upto], vBuf[:upto]
+func (cache *KVBuffer) SetPrevEmbedding(embedding *tensors.Tensor) {
+	cache.previousEmbedding = embedding
 }
 
-// PrefillFrom copies the cache contents (and smear state) of src into dst,
-// expanding a batch-1 cache into a larger batch. Used by the engine to
-// replicate a single-row prefill across many decode rows.
-func PrefillFrom(dst, src *KVBuffer) {
-	if dst.Position() != 0 {
+// writeKeyValue copies the new key/value for the given layer, row, and head
+// into the cache at the current position, and returns the contiguous
+// key/value prefix [position+tokenCount, headDimension] available for
+// attention.
+func (cache *KVBuffer) writeKeyValue(layer, row, head int, newKey, newValue []float32) (fullKey, fullValue []float32) {
+	position := int(cache.sequenceLength)
+	tokenCount := len(newKey) / cache.headDimension
+	keyBuffer := cache.keyCache[layer][row*cache.keyValueHeadCount+head].Data
+	valueBuffer := cache.valueCache[layer][row*cache.keyValueHeadCount+head].Data
+	copy(keyBuffer[position*cache.headDimension:], newKey)
+	copy(valueBuffer[position*cache.headDimension:], newValue)
+	end := (position + tokenCount) * cache.headDimension
+	return keyBuffer[:end], valueBuffer[:end]
+}
+
+// PrefillFrom copies the cache contents (and smear state) of source into
+// destination, expanding a batch-1 cache into a larger batch. It is used by the
+// engine to replicate a single-row prefill across many decode rows.
+func PrefillFrom(destination, source *KVBuffer) {
+	if destination.Position() != 0 {
 		panic("model: cannot prefill a non-empty KV cache")
 	}
-	pos := src.Position()
-	for l := 0; l < dst.numLayers; l++ {
-		for b := 0; b < dst.batchSize; b++ {
-			for h := 0; h < dst.numKVHead; h++ {
-				// src has batch 1, so its head index is just h.
-				copy(dst.k[l][b*dst.numKVHead+h].Data[:pos*dst.headDim], src.k[l][h].Data[:pos*src.headDim])
-				copy(dst.v[l][b*dst.numKVHead+h].Data[:pos*dst.headDim], src.v[l][h].Data[:pos*src.headDim])
+	position := source.Position()
+	for layer := 0; layer < destination.layerCount; layer++ {
+		for row := 0; row < destination.batchSize; row++ {
+			for head := 0; head < destination.keyValueHeadCount; head++ {
+				// source has batch 1, so its head index is just head.
+				copy(destination.keyCache[layer][row*destination.keyValueHeadCount+head].Data[:position*destination.headDimension], source.keyCache[layer][head].Data[:position*source.headDimension])
+				copy(destination.valueCache[layer][row*destination.keyValueHeadCount+head].Data[:position*destination.headDimension], source.valueCache[layer][head].Data[:position*source.headDimension])
 			}
 		}
 	}
-	dst.seqLen = src.seqLen
-	if src.prevEmbedding != nil {
+	destination.sequenceLength = source.sequenceLength
+	if source.previousEmbedding != nil {
 		// Expand the batch-1 previous embedding across all decode rows.
-		c := src.prevEmbedding.Shape[2]
-		dst.prevEmbedding = tensor.New(dst.batchSize, 1, c)
-		for b := 0; b < dst.batchSize; b++ {
-			copy(dst.prevEmbedding.Data[b*c:(b+1)*c], src.prevEmbedding.Data[:c])
+		channels := source.previousEmbedding.Shape[2]
+		destination.previousEmbedding = tensors.New(destination.batchSize, 1, channels)
+		for row := 0; row < destination.batchSize; row++ {
+			copy(destination.previousEmbedding.Data[row*channels:(row+1)*channels], source.previousEmbedding.Data[:channels])
 		}
 	}
 }

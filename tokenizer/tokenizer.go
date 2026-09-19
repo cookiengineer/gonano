@@ -7,7 +7,7 @@ import (
 	"os"
 	"sort"
 
-	"github.com/cookiengineer/gonano/parallel"
+	"github.com/cookiengineer/gonano/internal/parallel"
 )
 
 // Tokenizer is a byte-level BPE tokenizer: it encodes text to token ids and
@@ -34,35 +34,35 @@ func NewTokenizer(mergeableRanks map[string]int, specialTokens []string) *Tokeni
 	vocabNoSpecial := len(mergeableRanks)
 	vocabSize := vocabNoSpecial + len(specialTokens)
 
-	t := &Tokenizer{
+	tok := &Tokenizer{
 		mergeableRanks: mergeableRanks,
 		specialIDs:     make(map[string]int, len(specialTokens)),
 		specialNames:   make(map[int]string, len(specialTokens)),
 		tokenBytes:     make([][]byte, vocabSize),
 		vocabSize:      vocabSize,
 	}
-	for bytes, rank := range mergeableRanks {
-		t.tokenBytes[rank] = []byte(bytes)
+	for tokenText, rank := range mergeableRanks {
+		tok.tokenBytes[rank] = []byte(tokenText)
 	}
-	for i, name := range specialTokens {
-		id := vocabNoSpecial + i
-		t.specialIDs[name] = id
-		t.specialNames[id] = name
-		t.tokenBytes[id] = []byte(name)
+	for index, name := range specialTokens {
+		id := vocabNoSpecial + index
+		tok.specialIDs[name] = id
+		tok.specialNames[id] = name
+		tok.tokenBytes[id] = []byte(name)
 	}
-	t.bosTokenID = t.specialIDs["<|bos|>"]
-	return t
+	tok.bosTokenID = tok.specialIDs["<|bos|>"]
+	return tok
 }
 
 // VocabSize returns the total vocabulary size (mergeable + special).
-func (t *Tokenizer) VocabSize() int { return t.vocabSize }
+func (tokenizer *Tokenizer) VocabSize() int { return tokenizer.vocabSize }
 
 // BOSTokenID returns the id of the <|bos|> token.
-func (t *Tokenizer) BOSTokenID() int { return t.bosTokenID }
+func (tokenizer *Tokenizer) BOSTokenID() int { return tokenizer.bosTokenID }
 
 // EncodeSpecial returns the id of a single special token by name.
-func (t *Tokenizer) EncodeSpecial(name string) int {
-	id, ok := t.specialIDs[name]
+func (tokenizer *Tokenizer) EncodeSpecial(name string) int {
+	id, ok := tokenizer.specialIDs[name]
 	if !ok {
 		panic("tokenizer: unknown special token " + name)
 	}
@@ -70,15 +70,15 @@ func (t *Tokenizer) EncodeSpecial(name string) int {
 }
 
 // IsSpecial reports whether id is a special token.
-func (t *Tokenizer) IsSpecial(id int) bool {
-	_, ok := t.specialNames[id]
+func (tokenizer *Tokenizer) IsSpecial(id int) bool {
+	_, ok := tokenizer.specialNames[id]
 	return ok
 }
 
 // SpecialTokenIDs returns the sorted ids of all special tokens.
-func (t *Tokenizer) SpecialTokenIDs() []int {
-	ids := make([]int, 0, len(t.specialIDs))
-	for _, id := range t.specialIDs {
+func (tokenizer *Tokenizer) SpecialTokenIDs() []int {
+	ids := make([]int, 0, len(tokenizer.specialIDs))
+	for _, id := range tokenizer.specialIDs {
 		ids = append(ids, id)
 	}
 	sort.Ints(ids)
@@ -86,72 +86,72 @@ func (t *Tokenizer) SpecialTokenIDs() []int {
 }
 
 // Encode tokenizes text into token ids using the split pattern and BPE merge.
-func (t *Tokenizer) Encode(text string) []int {
+func (tokenizer *Tokenizer) Encode(text string) []int {
 	var ids []int
 	for _, piece := range SplitPieces(text) {
-		for _, part := range t.bpeMergePiece([]byte(piece)) {
-			ids = append(ids, t.mergeableRanks[string(part)])
+		for _, part := range tokenizer.bpeMergePiece([]byte(piece)) {
+			ids = append(ids, tokenizer.mergeableRanks[string(part)])
 		}
 	}
 	return ids
 }
 
 // EncodeBatch tokenizes many texts in parallel. It is goroutine-safe.
-func (t *Tokenizer) EncodeBatch(texts []string) [][]int {
+func (tokenizer *Tokenizer) EncodeBatch(texts []string) [][]int {
 	out := make([][]int, len(texts))
-	parallel.Default().For(0, len(texts), func(i int) {
-		out[i] = t.Encode(texts[i])
+	parallel.Default().For(0, len(texts), func(index int) {
+		out[index] = tokenizer.Encode(texts[index])
 	})
 	return out
 }
 
 // Decode reconstructs the byte string for a sequence of token ids. Special
 // tokens decode to their literal name; unknown ids are skipped.
-func (t *Tokenizer) Decode(ids []int) string {
+func (tokenizer *Tokenizer) Decode(ids []int) string {
 	buf := make([]byte, 0, len(ids))
 	for _, id := range ids {
-		if id >= 0 && id < len(t.tokenBytes) {
-			buf = append(buf, t.tokenBytes[id]...)
+		if id >= 0 && id < len(tokenizer.tokenBytes) {
+			buf = append(buf, tokenizer.tokenBytes[id]...)
 		}
 	}
 	return string(buf)
 }
 
 // DecodeSingleTokenBytes returns the raw bytes of a single token id.
-func (t *Tokenizer) DecodeSingleTokenBytes(id int) []byte {
-	if id >= 0 && id < len(t.tokenBytes) {
-		return t.tokenBytes[id]
+func (tokenizer *Tokenizer) DecodeSingleTokenBytes(id int) []byte {
+	if id >= 0 && id < len(tokenizer.tokenBytes) {
+		return tokenizer.tokenBytes[id]
 	}
 	return nil
 }
 
 // ByteCount returns the number of bytes a token represents, or 0 for unknown
 // ids and special tokens (special tokens carry no bytes for loss accounting).
-func (t *Tokenizer) ByteCount(id int) int {
-	if t.IsSpecial(id) {
+func (tokenizer *Tokenizer) ByteCount(id int) int {
+	if tokenizer.IsSpecial(id) {
 		return 0
 	}
-	return len(t.DecodeSingleTokenBytes(id))
+	return len(tokenizer.DecodeSingleTokenBytes(id))
 }
 
 // bpeMergePiece greedily merges a piece into mergeable tokens using the ranks
 // (lowest rank = earliest merge wins).
-func (t *Tokenizer) bpeMergePiece(piece []byte) [][]byte {
+func (tokenizer *Tokenizer) bpeMergePiece(piece []byte) [][]byte {
 	parts := make([][]byte, len(piece))
-	for i, b := range piece {
-		parts[i] = []byte{b}
+	for index, currentByte := range piece {
+		parts[index] = []byte{currentByte}
 	}
 	var buf []byte
 	for {
 		bestIdx := -1
 		bestRank := math.MaxInt
-		for i := 0; i+1 < len(parts); i++ {
+		for index := 0; index+1 < len(parts); index++ {
 			buf = buf[:0]
-			buf = append(buf, parts[i]...)
-			buf = append(buf, parts[i+1]...)
-			if r, ok := t.mergeableRanks[string(buf)]; ok && r < bestRank {
-				bestRank = r
-				bestIdx = i
+			buf = append(buf, parts[index]...)
+			buf = append(buf, parts[index+1]...)
+			if rank, ok := tokenizer.mergeableRanks[string(buf)]; ok && rank < bestRank {
+				bestRank = rank
+				bestIdx = index
 			}
 		}
 		if bestIdx < 0 {
@@ -165,8 +165,8 @@ func (t *Tokenizer) bpeMergePiece(piece []byte) [][]byte {
 
 // serialized is the on-disk JSON format for a tokenizer.
 type serialized struct {
-	Version int
-	Ranks   []rankEntry
+	Version  int
+	Ranks    []rankEntry
 	Specials []string
 }
 
@@ -176,36 +176,36 @@ type rankEntry struct {
 }
 
 // Save writes the tokenizer to path as JSON.
-func (t *Tokenizer) Save(path string) error {
-	s := serialized{Version: 1, Specials: append([]string(nil), SpecialTokens...)}
-	for bytes, rank := range t.mergeableRanks {
-		s.Ranks = append(s.Ranks, rankEntry{Rank: rank, Bytes: hex.EncodeToString([]byte(bytes))})
+func (tokenizer *Tokenizer) Save(path string) error {
+	saved := serialized{Version: 1, Specials: append([]string(nil), SpecialTokens...)}
+	for tokenText, rank := range tokenizer.mergeableRanks {
+		saved.Ranks = append(saved.Ranks, rankEntry{Rank: rank, Bytes: hex.EncodeToString([]byte(tokenText))})
 	}
-	sort.Slice(s.Ranks, func(i, j int) bool { return s.Ranks[i].Rank < s.Ranks[j].Rank })
-	b, err := json.MarshalIndent(s, "", "  ")
+	sort.Slice(saved.Ranks, func(first, second int) bool { return saved.Ranks[first].Rank < saved.Ranks[second].Rank })
+	data, err := json.MarshalIndent(saved, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o644)
+	return os.WriteFile(path, data, 0o644)
 }
 
 // LoadTokenizer reads a tokenizer saved by Save.
 func LoadTokenizer(path string) (*Tokenizer, error) {
-	b, err := os.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var s serialized
-	if err := json.Unmarshal(b, &s); err != nil {
+	var saved serialized
+	if err := json.Unmarshal(data, &saved); err != nil {
 		return nil, err
 	}
-	ranks := make(map[string]int, len(s.Ranks))
-	for _, e := range s.Ranks {
-		raw, err := hex.DecodeString(e.Bytes)
+	ranks := make(map[string]int, len(saved.Ranks))
+	for _, entry := range saved.Ranks {
+		raw, err := hex.DecodeString(entry.Bytes)
 		if err != nil {
 			return nil, err
 		}
-		ranks[string(raw)] = e.Rank
+		ranks[string(raw)] = entry.Rank
 	}
-	return NewTokenizer(ranks, s.Specials), nil
+	return NewTokenizer(ranks, saved.Specials), nil
 }

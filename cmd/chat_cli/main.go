@@ -9,10 +9,10 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cookiengineer/gonano/checkpoint"
 	"github.com/cookiengineer/gonano/data"
-	"github.com/cookiengineer/gonano/infer"
-	"github.com/cookiengineer/gonano/logging"
+	"github.com/cookiengineer/gonano/inference"
+	"github.com/cookiengineer/gonano/internal/logging"
+	"github.com/cookiengineer/gonano/model/checkpoint"
 	"github.com/cookiengineer/gonano/tokenizer"
 )
 
@@ -34,7 +34,7 @@ func main() {
 		*baseDir = data.BaseDir()
 	}
 
-	tok, err := tokenizer.LoadTokenizer(filepath.Join(*baseDir, "tokenizer", "tokenizer.json"))
+	tokenizer, err := tokenizer.LoadTokenizer(filepath.Join(*baseDir, "tokenizer", "tokenizer.json"))
 	if err != nil {
 		logger.Error("load tokenizer", "err", err)
 		os.Exit(1)
@@ -45,27 +45,27 @@ func main() {
 		logger.Error("load checkpoint", "err", err)
 		os.Exit(1)
 	}
-	m := checkpoint.LoadModel(meta, params)
-	engine := infer.NewEngine(m, tok)
+	model := checkpoint.LoadModel(meta, params)
+	engine := inference.NewEngine(model, tokenizer)
 
-	bos := tok.BOSTokenID()
-	userStart := tok.EncodeSpecial("<|user_start|>")
-	userEnd := tok.EncodeSpecial("<|user_end|>")
-	assistantStart := tok.EncodeSpecial("<|assistant_start|>")
-	assistantEnd := tok.EncodeSpecial("<|assistant_end|>")
+	bos := tokenizer.BOSTokenID()
+	userStart := tokenizer.EncodeSpecial("<|user_start|>")
+	userEnd := tokenizer.EncodeSpecial("<|user_end|>")
+	assistantStart := tokenizer.EncodeSpecial("<|assistant_start|>")
+	assistantEnd := tokenizer.EncodeSpecial("<|assistant_end|>")
 
 	respond := func(text string) {
-		conv := []int{bos, userStart}
-		conv = append(conv, tok.Encode(text)...)
-		conv = append(conv, userEnd, assistantStart)
+		conversation := []int{bos, userStart}
+		conversation = append(conversation, tokenizer.Encode(text)...)
+		conversation = append(conversation, userEnd, assistantStart)
 		fmt.Print("Assistant: ")
-		gen := engine.Generate(conv, 1, *maxTokens, float32(*temperature), *topK, 42)
-		gen(func(column, mask []int) bool {
+		generator := engine.Generate(conversation, 1, *maxTokens, float32(*temperature), *topK, 42)
+		generator(func(column, mask []int) bool {
 			token := column[0]
 			if token == assistantEnd {
 				return false
 			}
-			fmt.Print(tok.Decode([]int{token}))
+			fmt.Print(tokenizer.Decode([]int{token}))
 			return true
 		})
 		fmt.Println()

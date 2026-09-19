@@ -3,7 +3,7 @@ package server
 import (
 	"fmt"
 
-	"github.com/cookiengineer/gonano/infer"
+	"github.com/cookiengineer/gonano/inference"
 	"github.com/cookiengineer/gonano/model"
 	"github.com/cookiengineer/gonano/tokenizer"
 )
@@ -14,21 +14,21 @@ import (
 type Server struct {
 	Model     *model.Transformer
 	Tokenizer *tokenizer.Tokenizer
-	Engine    *infer.Engine
-	Tools     *infer.Registry
+	Engine    *inference.Engine
+	Tools     *inference.Registry
 	ModelName string
 }
 
 // NewServer builds a Server. tools may be nil, in which case the engine's
 // built-in calculator registry is used.
-func NewServer(m *model.Transformer, tok *tokenizer.Tokenizer, tools *infer.Registry, modelName string) *Server {
-	engine := infer.NewEngine(m, tok)
+func NewServer(transformer *model.Transformer, tokenizerImpl *tokenizer.Tokenizer, tools *inference.Registry, modelName string) *Server {
+	engine := inference.NewEngine(transformer, tokenizerImpl)
 	if tools != nil {
 		engine.Tools = tools
 	}
 	return &Server{
-		Model:     m,
-		Tokenizer: tok,
+		Model:     transformer,
+		Tokenizer: tokenizerImpl,
 		Engine:    engine,
 		Tools:     engine.Tools,
 		ModelName: modelName,
@@ -46,82 +46,82 @@ type rowResult struct {
 
 // generate runs n samples of autoregressive generation and parses each row
 // into its natural-language content, tool calls, and finish reason.
-func (s *Server) generate(prompt []int, temperature float32, topK, maxTokens, n int, seed uint64) []rowResult {
-	tok := s.Tokenizer
-	results := make([]rowResult, n)
+func (server *Server) generate(prompt []int, temperature float32, topK, maxTokens, numSamples int, seed uint64) []rowResult {
+	tokenizerImpl := server.Tokenizer
+	results := make([]rowResult, numSamples)
 
-	toolStart := tok.EncodeSpecial("<|tool_start|>")
-	toolEnd := tok.EncodeSpecial("<|tool_end|>")
-	assistantEnd := tok.EncodeSpecial("<|assistant_end|>")
-	bos := tok.BOSTokenID()
+	toolStart := tokenizerImpl.EncodeSpecial("<|tool_start|>")
+	toolEnd := tokenizerImpl.EncodeSpecial("<|tool_end|>")
+	assistantEnd := tokenizerImpl.EncodeSpecial("<|assistant_end|>")
+	bosToken := tokenizerImpl.BOSTokenID()
 
 	var sampled [][]int
 	var callArgs [][]int
-	inCall := make([]bool, n)
-	finished := make([]bool, n)
-	sampled = make([][]int, n)
-	callArgs = make([][]int, n)
+	inToolCall := make([]bool, numSamples)
+	finished := make([]bool, numSamples)
+	sampled = make([][]int, numSamples)
+	callArgs = make([][]int, numSamples)
 	callCounter := 0
 
-	gen := s.Engine.Generate(prompt, n, maxTokens, temperature, topK, seed)
-	gen(func(column, mask []int) bool {
-		for i := 0; i < n; i++ {
-			if finished[i] {
+	generate := server.Engine.Generate(prompt, numSamples, maxTokens, temperature, topK, seed)
+	generate(func(column, mask []int) bool {
+		for index := 0; index < numSamples; index++ {
+			if finished[index] {
 				continue
 			}
-			if mask[i] == 0 {
+			if mask[index] == 0 {
 				// Forced tokens are tool outputs; the model already saw them.
 				continue
 			}
-			tk := column[i]
-			switch tk {
+			token := column[index]
+			switch token {
 			case toolStart:
-				inCall[i] = true
-				callArgs[i] = nil
+				inToolCall[index] = true
+				callArgs[index] = nil
 			case toolEnd:
-				if inCall[i] {
-					args := tok.Decode(callArgs[i])
-					name, _, ok := s.Tools.ExecuteTool(args)
+				if inToolCall[index] {
+					arguments := tokenizerImpl.Decode(callArgs[index])
+					name, _, ok := server.Tools.ExecuteTool(arguments)
 					if !ok {
 						name = "unknown"
 					}
-					results[i].toolCalls = append(results[i].toolCalls, ToolCall{
+					results[index].toolCalls = append(results[index].toolCalls, ToolCall{
 						ID:       fmt.Sprintf("call_%d", callCounter),
 						Type:     "function",
-						Function: FunctionCall{Name: name, Arguments: args},
+						Function: FunctionCall{Name: name, Arguments: arguments},
 					})
 					callCounter++
-					inCall[i] = false
-					callArgs[i] = nil
+					inToolCall[index] = false
+					callArgs[index] = nil
 				}
-			case assistantEnd, bos:
-				finished[i] = true
+			case assistantEnd, bosToken:
+				finished[index] = true
 			default:
-				if inCall[i] {
-					callArgs[i] = append(callArgs[i], tk)
+				if inToolCall[index] {
+					callArgs[index] = append(callArgs[index], token)
 				} else {
-					sampled[i] = append(sampled[i], tk)
+					sampled[index] = append(sampled[index], token)
 				}
 			}
 		}
-		for _, f := range finished {
-			if !f {
+		for _, done := range finished {
+			if !done {
 				return true
 			}
 		}
 		return false
 	})
 
-	for i := 0; i < n; i++ {
-		results[i].content = tok.Decode(sampled[i])
-		results[i].finish = "stop"
-		if !finished[i] {
-			results[i].finish = "length"
+	for index := 0; index < numSamples; index++ {
+		results[index].content = tokenizerImpl.Decode(sampled[index])
+		results[index].finish = "stop"
+		if !finished[index] {
+			results[index].finish = "length"
 		}
-		results[i].promptLen = len(prompt)
-		results[i].completion = len(sampled[i])
-		for _, c := range results[i].toolCalls {
-			results[i].completion += len(tok.Encode(c.Function.Arguments))
+		results[index].promptLen = len(prompt)
+		results[index].completion = len(sampled[index])
+		for _, toolCall := range results[index].toolCalls {
+			results[index].completion += len(tokenizerImpl.Encode(toolCall.Function.Arguments))
 		}
 	}
 	return results
@@ -129,50 +129,50 @@ func (s *Server) generate(prompt []int, temperature float32, topK, maxTokens, n 
 
 // renderMessages converts OpenAI messages into a prompt token sequence primed
 // for the assistant to complete.
-func (s *Server) renderMessages(messages []ChatMessage, tools []ToolDef) []int {
-	tok := s.Tokenizer
-	ids := []int{tok.BOSTokenID()}
+func (server *Server) renderMessages(messages []ChatMessage, tools []ToolDef) []int {
+	tokenizerImpl := server.Tokenizer
+	ids := []int{tokenizerImpl.BOSTokenID()}
 
 	messages = mergeSystemMessage(messages)
 	if len(tools) > 0 {
 		// Advise the model about the tools it may invoke.
 		names := make([]string, 0, len(tools))
-		for _, t := range tools {
-			names = append(names, t.Function.Name)
+		for _, tool := range tools {
+			names = append(names, tool.Function.Name)
 		}
 		messages = append([]ChatMessage{{Role: "system", Content: toolsSystemPrompt(names)}}, messages...)
 		messages = mergeSystemMessage(messages)
 	}
 
-	userStart := tok.EncodeSpecial("<|user_start|>")
-	userEnd := tok.EncodeSpecial("<|user_end|>")
-	assistantStart := tok.EncodeSpecial("<|assistant_start|>")
-	assistantEnd := tok.EncodeSpecial("<|assistant_end|>")
-	toolStart := tok.EncodeSpecial("<|tool_start|>")
-	toolEnd := tok.EncodeSpecial("<|tool_end|>")
-	toolOutputStart := tok.EncodeSpecial("<|tool_output_start|>")
-	toolOutputEnd := tok.EncodeSpecial("<|tool_output_end|>")
+	userStart := tokenizerImpl.EncodeSpecial("<|user_start|>")
+	userEnd := tokenizerImpl.EncodeSpecial("<|user_end|>")
+	assistantStart := tokenizerImpl.EncodeSpecial("<|assistant_start|>")
+	assistantEnd := tokenizerImpl.EncodeSpecial("<|assistant_end|>")
+	toolStart := tokenizerImpl.EncodeSpecial("<|tool_start|>")
+	toolEnd := tokenizerImpl.EncodeSpecial("<|tool_end|>")
+	toolOutputStart := tokenizerImpl.EncodeSpecial("<|tool_output_start|>")
+	toolOutputEnd := tokenizerImpl.EncodeSpecial("<|tool_output_end|>")
 
-	for _, m := range messages {
-		switch m.Role {
+	for _, message := range messages {
+		switch message.Role {
 		case "user":
 			ids = append(ids, userStart)
-			ids = append(ids, tok.Encode(m.Content)...)
+			ids = append(ids, tokenizerImpl.Encode(message.Content)...)
 			ids = append(ids, userEnd)
 		case "assistant":
 			ids = append(ids, assistantStart)
-			if m.Content != "" {
-				ids = append(ids, tok.Encode(m.Content)...)
+			if message.Content != "" {
+				ids = append(ids, tokenizerImpl.Encode(message.Content)...)
 			}
-			for _, tc := range m.ToolCalls {
+			for _, toolCall := range message.ToolCalls {
 				ids = append(ids, toolStart)
-				ids = append(ids, tok.Encode(tc.Function.Arguments)...)
+				ids = append(ids, tokenizerImpl.Encode(toolCall.Function.Arguments)...)
 				ids = append(ids, toolEnd)
 			}
 			ids = append(ids, assistantEnd)
 		case "tool":
 			ids = append(ids, toolOutputStart)
-			ids = append(ids, tok.Encode(m.Content)...)
+			ids = append(ids, tokenizerImpl.Encode(message.Content)...)
 			ids = append(ids, toolOutputEnd)
 		}
 	}
@@ -191,15 +191,15 @@ func mergeSystemMessage(messages []ChatMessage) []ChatMessage {
 }
 
 func toolsSystemPrompt(names []string) string {
-	s := "You may call the following tools by writing " +
+	prompt := "You may call the following tools by writing " +
 		"<|tool_start|>EXPRESSION<|tool_end|>. The result will be provided to you. Available tools: "
-	for i, n := range names {
-		if i > 0 {
-			s += ", "
+	for index, name := range names {
+		if index > 0 {
+			prompt += ", "
 		}
-		s += n
+		prompt += name
 	}
-	return s + "."
+	return prompt + "."
 }
 
 // generationOptions carries the decoded sampling parameters for a request.
@@ -207,33 +207,33 @@ type generationOptions struct {
 	temperature float32
 	topK        int
 	maxTokens   int
-	n           int
+	numSamples  int
 	seed        uint64
 }
 
-// options resolves the sampling parameters from a request.
-func options(req ChatCompletionRequest, defaultMaxTokens int) generationOptions {
+// resolveOptions resolves the sampling parameters from a request.
+func resolveOptions(chatRequest ChatCompletionRequest, defaultMaxTokens int) generationOptions {
 	temperature := float32(0.7)
-	if req.Temperature != nil {
-		temperature = *req.Temperature
+	if chatRequest.Temperature != nil {
+		temperature = *chatRequest.Temperature
 	}
-	n := req.N
-	if n < 1 {
-		n = 1
+	numSamples := chatRequest.N
+	if numSamples < 1 {
+		numSamples = 1
 	}
-	maxTokens := req.MaxTokens
+	maxTokens := chatRequest.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = defaultMaxTokens
 	}
 	seed := uint64(42)
-	if req.Seed != nil {
-		seed = *req.Seed
+	if chatRequest.Seed != nil {
+		seed = *chatRequest.Seed
 	}
 	return generationOptions{
 		temperature: temperature,
-		topK:        req.TopK,
+		topK:        chatRequest.TopK,
 		maxTokens:   maxTokens,
-		n:           n,
+		numSamples:  numSamples,
 		seed:        seed,
 	}
 }

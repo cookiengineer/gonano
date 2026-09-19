@@ -47,39 +47,39 @@ func NewParquetSource(paths []string, batchSize int) *ParquetSource {
 
 // Next returns the next batch of up to batchSize documents. It cycles forever,
 // wrapping to the start of the dataset (and incrementing the epoch) at the end.
-func (s *ParquetSource) Next() ([]string, State) {
+func (source *ParquetSource) Next() ([]string, State) {
 	for {
-		if len(s.pending) > 0 {
-			n := min(s.batchSize, len(s.pending))
-			batch := s.pending[:n]
-			s.pending = s.pending[n:]
-			return batch, s.lastState
+		if len(source.pending) > 0 {
+			count := min(source.batchSize, len(source.pending))
+			batch := source.pending[:count]
+			source.pending = source.pending[count:]
+			return batch, source.lastState
 		}
-		if s.reader == nil {
-			if s.pqIdx >= len(s.paths) {
-				s.pqIdx = 0
-				s.epoch++
+		if source.reader == nil {
+			if source.pqIdx >= len(source.paths) {
+				source.pqIdx = 0
+				source.epoch++
 			}
-			r, err := parquet.Open(s.paths[s.pqIdx])
+			openedReader, err := parquet.Open(source.paths[source.pqIdx])
 			if err != nil {
-				panic(fmt.Sprintf("data: open parquet %s: %v", s.paths[s.pqIdx], err))
+				panic(fmt.Sprintf("data: open parquet %s: %v", source.paths[source.pqIdx], err))
 			}
-			s.reader = r
-			s.curRG = 0
+			source.reader = openedReader
+			source.curRG = 0
 		}
-		if s.curRG >= s.reader.NumRowGroups() {
-			s.reader.Close()
-			s.reader = nil
-			s.pqIdx++
+		if source.curRG >= source.reader.NumRowGroups() {
+			source.reader.Close()
+			source.reader = nil
+			source.pqIdx++
 			continue
 		}
-		docs, err := s.reader.ReadColumnStrings(s.curRG, "text")
+		docs, err := source.reader.ReadColumnStrings(source.curRG, "text")
 		if err != nil {
-			panic(fmt.Sprintf("data: read %s row group %d: %v", s.paths[s.pqIdx], s.curRG, err))
+			panic(fmt.Sprintf("data: read %s row group %d: %v", source.paths[source.pqIdx], source.curRG, err))
 		}
-		s.lastState = State{PQIndex: s.pqIdx, RGIndex: s.curRG, Epoch: s.epoch}
-		s.pending = docs
-		s.curRG++
+		source.lastState = State{PQIndex: source.pqIdx, RGIndex: source.curRG, Epoch: source.epoch}
+		source.pending = docs
+		source.curRG++
 	}
 }
 
@@ -91,8 +91,8 @@ func ListParquetFiles(dir string) []string {
 		return nil
 	}
 	var paths []string
-	for _, e := range entries {
-		name := e.Name()
+	for _, entry := range entries {
+		name := entry.Name()
 		if strings.HasSuffix(name, ".parquet") && !strings.HasSuffix(name, ".tmp") {
 			paths = append(paths, filepath.Join(dir, name))
 		}

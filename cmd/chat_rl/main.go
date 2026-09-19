@@ -8,15 +8,15 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cookiengineer/gonano/checkpoint"
 	"github.com/cookiengineer/gonano/data"
-	"github.com/cookiengineer/gonano/eval/tasks"
-	"github.com/cookiengineer/gonano/infer"
-	"github.com/cookiengineer/gonano/logging"
-	"github.com/cookiengineer/gonano/optim"
-	"github.com/cookiengineer/gonano/tensor"
+	"github.com/cookiengineer/gonano/evaluator/tasks"
+	"github.com/cookiengineer/gonano/inference"
+	"github.com/cookiengineer/gonano/internal/logging"
+	"github.com/cookiengineer/gonano/model/checkpoint"
+	"github.com/cookiengineer/gonano/optimizer"
+	"github.com/cookiengineer/gonano/tensors"
 	"github.com/cookiengineer/gonano/tokenizer"
-	"github.com/cookiengineer/gonano/train"
+	"github.com/cookiengineer/gonano/trainer"
 )
 
 func main() {
@@ -35,7 +35,7 @@ func main() {
 	if *baseDir == "" {
 		*baseDir = data.BaseDir()
 	}
-	tok, err := tokenizer.LoadTokenizer(filepath.Join(*baseDir, "tokenizer", "tokenizer.json"))
+	tokenizer, err := tokenizer.LoadTokenizer(filepath.Join(*baseDir, "tokenizer", "tokenizer.json"))
 	if err != nil {
 		logger.Error("load tokenizer", "err", err)
 		os.Exit(1)
@@ -45,87 +45,87 @@ func main() {
 		logger.Error("load checkpoint", "err", err)
 		os.Exit(1)
 	}
-	m := checkpoint.LoadModel(meta, params)
-	engine := infer.NewEngine(m, tok)
+	model := checkpoint.LoadModel(meta, params)
+	engine := inference.NewEngine(model, tokenizer)
 
-	gsm := tasks.NewGSM8KFromRows([]tasks.GSM8KRow{
+	gsm8k := tasks.NewGSM8KFromRows([]tasks.GSM8KRow{
 		{Question: "What is 2+2?", Answer: "#### 4"},
 		{Question: "What is 3+3?", Answer: "#### 6"},
 	})
 
-	groups := m.SetupOptimizer(0.004, 0.2, 0.02, 0.0, 0.5)
-	for i := range groups {
-		groups[i].LR *= 0.05
+	groups := model.SetupOptimizer(0.004, 0.2, 0.02, 0.0, 0.5)
+	for index := range groups {
+		groups[index].LR *= 0.05
 	}
-	opt := optim.NewMuonAdamW(groups)
+	optimizer := optimizer.NewMuonAdamW(groups)
 
 	for step := 0; step < *numSteps; step++ {
-		conv := gsm.GetExample(step % gsm.NumExamples())
-		prompt := tok.RenderForCompletion(conv)
+		conversation := gsm8k.GetExample(step % gsm8k.NumExamples())
+		prompt := tokenizer.RenderForCompletion(conversation)
 		results, _ := engine.GenerateBatch(prompt, *numSamples, 32, 1.0, 50, uint64(step))
 
 		rewards := make([]float32, len(results))
-		for i, r := range results {
-			completion := tok.Decode(r[len(prompt):])
-			rewards[i] = gsm.Reward(conv, completion)
+		for sampleIndex, rollout := range results {
+			completion := tokenizer.Decode(rollout[len(prompt):])
+			rewards[sampleIndex] = gsm8k.Reward(conversation, completion)
 		}
 		var mean float32
-		for _, r := range rewards {
-			mean += r
+		for _, reward := range rewards {
+			mean += reward
 		}
 		mean /= float32(len(rewards))
 		advantages := make([]float32, len(rewards))
-		for i, r := range rewards {
-			advantages[i] = r - mean
+		for sampleIndex, reward := range rewards {
+			advantages[sampleIndex] = reward - mean
 		}
 
 		// Build a padded batch of rollouts.
 		maxLen := 0
-		for _, r := range results {
-			if len(r) > maxLen {
-				maxLen = len(r)
+		for _, rollout := range results {
+			if len(rollout) > maxLen {
+				maxLen = len(rollout)
 			}
 		}
-		pad := tok.EncodeSpecial("<|assistant_end|>")
+		padToken := tokenizer.EncodeSpecial("<|assistant_end|>")
 		inputs := make([][]int, len(results))
 		targets := make([][]int, len(results))
-		for i, r := range results {
-			padded := append([]int(nil), r...)
+		for sampleIndex, rollout := range results {
+			padded := append([]int(nil), rollout...)
 			for len(padded) < maxLen {
-				padded = append(padded, pad)
+				padded = append(padded, padToken)
 			}
-			inputs[i] = padded[:len(padded)-1]
-			targets[i] = padded[1:]
+			inputs[sampleIndex] = padded[:len(padded)-1]
+			targets[sampleIndex] = padded[1:]
 			// Mask forced/prompt tokens: only train on sampled tokens.
-			mask := len(prompt)
-			for j := range targets[i] {
-				if j < mask {
-					targets[i][j] = -1
+			promptLength := len(prompt)
+			for targetIndex := range targets[sampleIndex] {
+				if targetIndex < promptLength {
+					targets[sampleIndex][targetIndex] = -1
 				}
 			}
 		}
-		x := int32sFrom(inputs)
-		y := int32sFrom(targets)
-		loss := train.RLStep(m, opt, x, y, advantages, float32(maxLen))
+		inputTensor := int32sFrom(inputs)
+		targetTensor := int32sFrom(targets)
+		loss := trainer.RLStep(model, optimizer, inputTensor, targetTensor, advantages, float32(maxLen))
 		logger.Info("rl", "step", step, "loss", fmt.Sprintf("%.4f", loss), "mean_reward", fmt.Sprintf("%.2f", mean))
 	}
 
 	if *outPath != "" {
-		outMeta := checkpoint.Meta{Step: *numSteps, ModelConfig: m.Config}
-		if err := checkpoint.Save(*outPath, outMeta, m.NamedParameters()); err != nil {
+		outMeta := checkpoint.Meta{Step: *numSteps, ModelConfig: model.Config}
+		if err := checkpoint.Save(*outPath, outMeta, model.NamedParameters()); err != nil {
 			logger.Error("save", "err", err)
 			os.Exit(1)
 		}
 	}
 }
 
-func int32sFrom(rows [][]int) *tensor.Int32s {
+func int32sFrom(rows [][]int) *tensors.Int32s {
 	shape := []int{len(rows), len(rows[0])}
-	data := make([]int32, 0, len(rows)*len(rows[0]))
-	for _, r := range rows {
-		for _, v := range r {
-			data = append(data, int32(v))
+	values := make([]int32, 0, len(rows)*len(rows[0]))
+	for _, row := range rows {
+		for _, value := range row {
+			values = append(values, int32(value))
 		}
 	}
-	return tensor.NewInt32sWithData(shape, data)
+	return tensors.NewInt32sWithData(shape, values)
 }

@@ -58,16 +58,16 @@ func downloadOnce(url, path string) error {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
+	file, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
-		f.Close()
+	if _, err := io.Copy(file, resp.Body); err != nil {
+		file.Close()
 		os.Remove(tmp)
 		return err
 	}
-	if err := f.Close(); err != nil {
+	if err := file.Close(); err != nil {
 		os.Remove(tmp)
 		return err
 	}
@@ -155,8 +155,8 @@ func FetchHFRows(repoID, config, split string, offset, length int) ([]map[string
 		return nil, 0, err
 	}
 	rows := make([]map[string]json.RawMessage, len(body.Rows))
-	for i, r := range body.Rows {
-		rows[i] = r.Row
+	for index, hfRow := range body.Rows {
+		rows[index] = hfRow.Row
 	}
 	return rows, body.NumRowsTotal, nil
 }

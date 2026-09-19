@@ -1,7 +1,7 @@
 package model
 
 import (
-	"github.com/cookiengineer/gonano/tensor"
+	"github.com/cookiengineer/gonano/tensors"
 )
 
 // This file implements the training forward/backward passes. Unlike the
@@ -9,305 +9,252 @@ import (
 // that TrainBackward can compute exact gradients via backpropagation. The
 // analytic gradients are verified against finite differences in tests.
 
-// softmaxBackward returns the gradient of a row-wise softmax given the
-// probabilities probs and the gradient of the output: grad = probs * (g - <g·p>).
-func softmaxBackward(probs, gradProbs *tensor.Tensor) *tensor.Tensor {
-	rows, cols := probs.Shape[0], probs.Shape[1]
-	out := tensor.New(rows, cols)
-	for i := 0; i < rows; i++ {
-		var dot float64
-		for j := 0; j < cols; j++ {
-			dot += float64(gradProbs.Data[i*cols+j]) * float64(probs.Data[i*cols+j])
-		}
-		for j := 0; j < cols; j++ {
-			out.Data[i*cols+j] = probs.Data[i*cols+j] * (gradProbs.Data[i*cols+j] - float32(dot))
-		}
+// negateSineTable returns a negated copy of the sine rotary table, used to
+// transpose the rotary rotation during backpropagation.
+func negateSineTable(sine *tensors.Tensor) *tensors.Tensor {
+	negated := tensors.New(sine.Shape...)
+	for index, value := range sine.Data {
+		negated.Data[index] = -value
 	}
-	return out
+	return negated
 }
 
-// scatterChannels is the reverse of sliceChannels: it places gradOut into the
-// first `channels` channels of a zero tensor shaped like the original.
-func scatterChannels(x *tensor.Tensor, rowStart, rowEnd, channels int, gradOut *tensor.Tensor) *tensor.Tensor {
-	b, t, c := x.Shape[0], x.Shape[1], x.Shape[2]
-	out := tensor.New(b, t, c)
-	for bb := 0; bb < b; bb++ {
-		for r := rowStart; r < rowEnd; r++ {
-			src := gradOut.Data[(bb*(rowEnd-rowStart)+(r-rowStart))*channels : (bb*(rowEnd-rowStart)+(r-rowStart)+1)*channels]
-			copy(out.Data[(bb*t+r)*c:(bb*t+r)*c+channels], src)
-		}
-	}
-	return out
+// attentionContext holds the activations saved by the training attention
+// forward.
+type attentionContext struct {
+	queryRotary     *tensors.Tensor // [B,T,Hq,D] post-rotary, pre-norm
+	keyRotary       *tensors.Tensor // [B,T,Hkv,D] post-rotary, pre-norm
+	queryHeadMajor  *tensors.Tensor // [B,Hq,T,D] post-norm+scale
+	keyHeadMajor    *tensors.Tensor // [B,Hkv,T,D] post-norm+scale
+	valueHeadMajor  *tensors.Tensor // [B,Hkv,T,D] final value (post gate)
+	logSumExp       *tensors.Tensor // [B,Hq,T] flash-attention statistic
+	outputHeadMajor *tensors.Tensor // [B,Hq,T,D] attention output (pre outputProjection)
+	window          int
+
+	valueGateSigmoid       *tensors.Tensor // [B,T,Hkv] sigmoid gate output (pre *3), nil if no value embedding
+	valueEmbedding         *tensors.Tensor // [B,T,Hkv,D] value embedding, nil if none
+	valueEmbeddingGradient *tensors.Tensor // [B,T,Hkv,D] gradient wrt the value embedding (set by backward)
 }
 
-// negateSin returns a negated copy of the sin rotary table, used to transpose
-// the rotary rotation during backpropagation.
-func negateSin(sin *tensor.Tensor) *tensor.Tensor {
-	out := tensor.New(sin.Shape...)
-	for i, v := range sin.Data {
-		out.Data[i] = -v
-	}
-	return out
-}
+// forwardTraining runs the attention forward while saving activations. The
+// attention itself is computed by the flash-attention kernel, which returns the
+// per-query log-sum-exp instead of the full probability matrix.
+func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int) (*tensors.Tensor, *attentionContext) {
+	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
+	query := attention.queryProjection.Forward(input).Reshape(batchSize, sequenceLength, attention.queryHeadCount, attention.headDimension)
+	key := attention.keyProjection.Forward(input).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+	value := attention.valueProjection.Forward(input).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
 
-// attnCtx holds the activations saved by the training attention forward.
-type attnCtx struct {
-	qRotary *tensor.Tensor // [B,T,Hq,D] post-rotary, pre-norm
-	kRotary *tensor.Tensor // [B,T,Hkv,D] post-rotary, pre-norm
-	qBH     *tensor.Tensor // [B,Hq,T,D] post-norm+scale
-	kBH     *tensor.Tensor // [B,Hkv,T,D] post-norm+scale
-	vBH     *tensor.Tensor // [B,Hkv,T,D] final v (post ve-gate)
-	probs   *tensor.Tensor // [B,Hq,T,T]
-	outBH   *tensor.Tensor // [B,Hq,T,D] attention output (pre cproj)
-
-	veSig   *tensor.Tensor // [B,T,Hkv] sigmoid gate output (pre *3), nil if no VE
-	ve      *tensor.Tensor // [B,T,Hkv,D] value embedding, nil if no VE
-	gradVE  *tensor.Tensor // [B,T,Hkv,D] gradient wrt the value embedding (set by backward)
-}
-
-// forwardTrain runs the attention forward while saving activations.
-func (a *CausalSelfAttention) forwardTrain(x, ve, cos, sin *tensor.Tensor, t0 int, window [2]int) (*tensor.Tensor, *attnCtx) {
-	b, t := x.Shape[0], x.Shape[1]
-	q := a.cq.Forward(x).Reshape(b, t, a.numHead, a.headDim)
-	k := a.ck.Forward(x).Reshape(b, t, a.numKVHead, a.headDim)
-	v := a.cv.Forward(x).Reshape(b, t, a.numKVHead, a.headDim)
-
-	ctx := &attnCtx{}
-	if ve != nil {
-		ve4 := ve.Reshape(b, t, a.numKVHead, a.headDim)
-		z := a.veGate.Forward(sliceChannels(x, 0, t, veGateChannels)) // [B,T,Hkv]
-		sig := tensor.Sigmoid(z)
-		ctx.veSig = sig
-		gate := tensor.Scale(sig, veGateScale)
-		v = addGateTimesVE(v, gate, ve4)
-		ctx.ve = ve4
+	context := &attentionContext{window: window[0]}
+	if valueEmbedding != nil {
+		valueEmbeddingHeads := valueEmbedding.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+		preGate := attention.valueEmbeddingGate.Forward(sliceChannels(input, 0, sequenceLength, veGateChannels)) // [B,T,Hkv]
+		sigmoid := tensors.Sigmoid(preGate)
+		context.valueGateSigmoid = sigmoid
+		gate := tensors.Scale(sigmoid, veGateScale)
+		value = addGateTimesValueEmbedding(value, gate, valueEmbeddingHeads)
+		context.valueEmbedding = valueEmbeddingHeads
 	}
 
-	q = ApplyRotary(q, cos, sin, t0)
-	k = ApplyRotary(k, cos, sin, t0)
-	ctx.qRotary = q
-	ctx.kRotary = k
+	query = ApplyRotary(query, cosine, sine, positionOffset)
+	key = ApplyRotary(key, cosine, sine, positionOffset)
+	context.queryRotary = query
+	context.keyRotary = key
 
-	q = tensor.Scale(normLastDim(q), qkScale)
-	k = tensor.Scale(normLastDim(k), qkScale)
+	query = tensors.Scale(normalizeLastDim(query), qkScale)
+	key = tensors.Scale(normalizeLastDim(key), qkScale)
 
-	qBH := toBH(q)
-	kBH := toBH(k)
-	vBH := toBH(v)
-	ctx.qBH = qBH
-	ctx.kBH = kBH
-	ctx.vBH = vBH
+	queryHeadMajor := toBatchHeadLayout(query)
+	keyHeadMajor := toBatchHeadLayout(key)
+	valueHeadMajor := toBatchHeadLayout(value)
+	context.queryHeadMajor = queryHeadMajor
+	context.keyHeadMajor = keyHeadMajor
+	context.valueHeadMajor = valueHeadMajor
 
-	headRatio := a.numHead / a.numKVHead
-	d := a.headDim
-	outBH := tensor.New(b, a.numHead, t, d)
-	probs := tensor.New(b, a.numHead, t, t)
+	headRatio := attention.queryHeadCount / attention.keyValueHeadCount
+	headDimension := attention.headDimension
+	outputHeadMajor := tensors.New(batchSize, attention.queryHeadCount, sequenceLength, headDimension)
+	logSumExp := tensors.New(batchSize, attention.queryHeadCount, sequenceLength)
 
-	for bb := 0; bb < b; bb++ {
-		for hq := 0; hq < a.numHead; hq++ {
-			kvh := hq / headRatio
-			qh := qBH.Data[((bb*a.numHead+hq)*t)*d : ((bb*a.numHead+hq)*t+t)*d]
-			kh := kBH.Data[((bb*a.numKVHead+kvh)*t)*d : ((bb*a.numKVHead+kvh)*t+t)*d]
-			vh := vBH.Data[((bb*a.numKVHead+kvh)*t)*d : ((bb*a.numKVHead+kvh)*t+t)*d]
-			oh, ph := attentionHeadWithProbs(qh, kh, vh, t, d, t0, window[0])
-			copy(outBH.Data[((bb*a.numHead+hq)*t)*d:], oh)
-			copy(probs.Data[((bb*a.numHead+hq)*t)*t:], ph)
+	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		for queryHead := 0; queryHead < attention.queryHeadCount; queryHead++ {
+			keyValueHead := queryHead / headRatio
+			queryHeadData := headSlice(queryHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
+			keyHeadData := headSlice(keyHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
+			valueHeadData := headSlice(valueHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
+			outputHeadData := headSlice(outputHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
+			logSumExpHead := headSlice(logSumExp.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, 1)
+			tensors.AttentionForward(queryHeadData, keyHeadData, valueHeadData, outputHeadData, logSumExpHead, sequenceLength, sequenceLength, headDimension, positionOffset, window[0])
 		}
 	}
-	ctx.outBH = outBH
-	ctx.probs = probs
+	context.logSumExp = logSumExp
+	context.outputHeadMajor = outputHeadMajor
 
-	out := toBT(outBH).Reshape(b, t, a.numHead*a.headDim)
-	return a.cproj.Forward(out), ctx
+	output := toBatchSequenceLayout(outputHeadMajor).Reshape(batchSize, sequenceLength, attention.queryHeadCount*attention.headDimension)
+	return attention.outputProjection.Forward(output), context
 }
 
-// attentionHeadWithProbs computes the attention output and returns the
-// probability matrix for later backprop.
-func attentionHeadWithProbs(q, k, v []float32, tq, d, t0, window int) ([]float32, []float32) {
-	q2 := tensor.NewWithData([]int{tq, d}, q)
-	k2 := tensor.NewWithData([]int{tq, d}, k)
-	scores := tensor.MatMulTransB(q2, k2)
-	sd := scores.Data
-	for i := 0; i < tq; i++ {
-		qpos := t0 + i
-		for j := 0; j < tq; j++ {
-			if j > qpos || (window >= 0 && qpos-j > window) {
-				sd[i*tq+j] = maskedScore
-			}
-		}
-	}
-	probs := tensor.SoftmaxLastDim(scores)
-	v2 := tensor.NewWithData([]int{tq, d}, v)
-	return tensor.MatMul(probs, v2).Data, probs.Data
-}
+// backwardTraining runs the attention backward given the gradient of its output
+// and the saved context. It returns the gradient with respect to the attention
+// input. Key and value gradients accumulate across query heads that share a
+// key/value head (grouped-query attention).
+func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, outputGradient *tensors.Tensor, context *attentionContext, cosine, sine *tensors.Tensor, positionOffset int) *tensors.Tensor {
+	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
+	headDimension := attention.headDimension
+	headRatio := attention.queryHeadCount / attention.keyValueHeadCount
 
-// backwardTrain runs the attention backward given the gradient of its output
-// and the saved context. It returns the gradient wrt the attention input x.
-func (a *CausalSelfAttention) backwardTrain(x *tensor.Tensor, gradOut *tensor.Tensor, ctx *attnCtx, cos, sin *tensor.Tensor, t0 int) *tensor.Tensor {
-	b, t := x.Shape[0], x.Shape[1]
-	d := a.headDim
-	headRatio := a.numHead / a.numKVHead
+	// outputProjection backward.
+	outputFlat := toBatchSequenceLayout(context.outputHeadMajor).Reshape(batchSize, sequenceLength, attention.queryHeadCount*attention.headDimension)
+	gradientOutputHeadMajor := attention.outputProjection.Backward(outputFlat, outputGradient).Reshape(batchSize, sequenceLength, attention.queryHeadCount, attention.headDimension)
+	gradientOutputHeadMajor = toBatchHeadLayout(gradientOutputHeadMajor)
 
-	// cproj backward.
-	outFlat := toBT(ctx.outBH).Reshape(b, t, a.numHead*a.headDim)
-	gradOutBH := a.cproj.Backward(outFlat, gradOut).Reshape(b, t, a.numHead, a.headDim)
-	gradOutBH = toBH(gradOutBH) // [B,Hq,T,D]
+	gradientQuery := tensors.New(batchSize, attention.queryHeadCount, sequenceLength, headDimension)
+	gradientKey := tensors.New(batchSize, attention.keyValueHeadCount, sequenceLength, headDimension)
+	gradientValue := tensors.New(batchSize, attention.keyValueHeadCount, sequenceLength, headDimension)
 
-	gradQ := tensor.New(b, a.numHead, t, d)
-	gradK := tensor.New(b, a.numKVHead, t, d)
-	gradV := tensor.New(b, a.numKVHead, t, d)
+	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		for queryHead := 0; queryHead < attention.queryHeadCount; queryHead++ {
+			keyValueHead := queryHead / headRatio
+			queryHeadData := headSlice(context.queryHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
+			keyHeadData := headSlice(context.keyHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
+			valueHeadData := headSlice(context.valueHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
+			outputHeadData := headSlice(context.outputHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
+			outputGradientHeadData := headSlice(gradientOutputHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
+			logSumExpHead := headSlice(context.logSumExp.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, 1)
+			queryGradientHead := headSlice(gradientQuery.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
+			keyGradientHead := headSlice(gradientKey.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
+			valueGradientHead := headSlice(gradientValue.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
 
-	for bb := 0; bb < b; bb++ {
-		for hq := 0; hq < a.numHead; hq++ {
-			kvh := hq / headRatio
-			oh := gradOutBH.Data[((bb*a.numHead+hq)*t)*d : ((bb*a.numHead+hq)*t+t)*d]
-			vh := ctx.vBH.Data[((bb*a.numKVHead+kvh)*t)*d : ((bb*a.numKVHead+kvh)*t+t)*d]
-			ph := ctx.probs.Data[((bb*a.numHead+hq)*t)*t : ((bb*a.numHead+hq)*t+t)*t]
-			qh := ctx.qBH.Data[((bb*a.numHead+hq)*t)*d : ((bb*a.numHead+hq)*t+t)*d]
-			kh := ctx.kBH.Data[((bb*a.numKVHead+kvh)*t)*d : ((bb*a.numKVHead+kvh)*t+t)*d]
-
-			// grad_probs = grad_out @ v^T ; grad_v = probs^T @ grad_out.
-			o2 := tensor.NewWithData([]int{t, d}, oh)
-			v2 := tensor.NewWithData([]int{t, d}, vh)
-			gradProbs := tensor.MatMulTransB(o2, v2)         // [T,T]
-			gradVh := tensor.MatMul(tensor.Transpose(tensor.NewWithData([]int{t, t}, ph)), o2) // [T,D]
-
-			gradScores := softmaxBackward(tensor.NewWithData([]int{t, t}, ph), gradProbs) // [T,T]
-			q2 := tensor.NewWithData([]int{t, d}, qh)
-			k2 := tensor.NewWithData([]int{t, d}, kh)
-			gradQh := tensor.MatMul(gradScores, k2)             // [T,D]
-			gradKh := tensor.MatMul(tensor.Transpose(gradScores), q2) // [T,D]
-
-			copy(gradQ.Data[((bb*a.numHead+hq)*t)*d:], gradQh.Data)
-			copy(gradK.Data[((bb*a.numKVHead+kvh)*t)*d:], gradKh.Data)
-			copy(gradV.Data[((bb*a.numKVHead+kvh)*t)*d:], gradVh.Data)
+			tensors.AttentionBackward(queryHeadData, keyHeadData, valueHeadData, outputHeadData, outputGradientHeadData, logSumExpHead, queryGradientHead, keyGradientHead, valueGradientHead, sequenceLength, sequenceLength, headDimension, positionOffset, context.window)
 		}
 	}
 
-	// Unscale QK (1.2) and back through QK norm.
-	gradQ = tensor.Scale(gradQ, qkScale)
-	gradK = tensor.Scale(gradK, qkScale)
-	gradQBT := toBT(gradQ) // [B,T,Hq,D]
-	gradKBT := toBT(gradK)
+	// Unscale QK (qkScale) and back through QK norm.
+	gradientQuery = tensors.Scale(gradientQuery, qkScale)
+	gradientKey = tensors.Scale(gradientKey, qkScale)
+	gradientQuerySequence := toBatchSequenceLayout(gradientQuery)
+	gradientKeySequence := toBatchSequenceLayout(gradientKey)
 
-	// RMSNorm backward over the head dim.
-	gradQPre := normLastDimBackward(ctx.qRotary, gradQBT)
-	gradKPre := normLastDimBackward(ctx.kRotary, gradKBT)
+	gradientQueryPreNorm := normalizeLastDimBackward(context.queryRotary, gradientQuerySequence)
+	gradientKeyPreNorm := normalizeLastDimBackward(context.keyRotary, gradientKeySequence)
 
-	// Rotary backward: transpose the rotation (negate sin).
-	nSin := negateSin(sin)
-	gradQProj := ApplyRotary(gradQPre, cos, nSin, t0)
-	gradKProj := ApplyRotary(gradKPre, cos, nSin, t0)
+	// Rotary backward: transpose the rotation (negate the sine table).
+	negatedSine := negateSineTable(sine)
+	gradientQueryProjected := ApplyRotary(gradientQueryPreNorm, cosine, negatedSine, positionOffset)
+	gradientKeyProjected := ApplyRotary(gradientKeyPreNorm, cosine, negatedSine, positionOffset)
 
 	// Accumulate into the input via the projection layers.
-	gradX := a.cq.Backward(x, gradQProj.Reshape(b, t, a.numHead*a.headDim))
-	gradX = tensor.Add(gradX, a.ck.Backward(x, gradKProj.Reshape(b, t, a.numKVHead*a.headDim)))
+	gradientInput := attention.queryProjection.Backward(input, gradientQueryProjected.Reshape(batchSize, sequenceLength, attention.queryHeadCount*attention.headDimension))
+	gradientInput = tensors.Add(gradientInput, attention.keyProjection.Backward(input, gradientKeyProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount*attention.headDimension)))
 
 	// Value embedding gate backward.
-	gradVBT := toBT(gradV) // [B,T,Hkv,D]
-	if ctx.ve != nil {
-		// grad_ve = grad_v * gate; grad_gate = sum_D(grad_v * ve).
-		gate := tensor.Scale(ctx.veSig, veGateScale)
-		ve4 := ctx.ve
-		gd := gradVBT.Data
-		gradVE := tensor.New(b, t, a.numKVHead, d)
-		gradGate := tensor.New(b, t, a.numKVHead)
-		for idx := 0; idx < b*t*a.numKVHead; idx++ {
-			g := gate.Data[idx]
-			base := idx * d
-			var sum float64
-			for j := 0; j < d; j++ {
-				gradVE.Data[base+j] = gd[base+j] * g
-				sum += float64(gd[base+j]) * float64(ve4.Data[base+j])
+	gradientValueSequence := toBatchSequenceLayout(gradientValue)
+	if context.valueEmbedding != nil {
+		// gradient_valueEmbedding = gradient_value * gate ; gradient_gate =
+		// sum_dim(gradient_value * valueEmbedding).
+		gate := tensors.Scale(context.valueGateSigmoid, veGateScale)
+		valueEmbedding := context.valueEmbedding
+		gradientValueData := gradientValueSequence.Data
+		gradientValueEmbedding := tensors.New(batchSize, sequenceLength, attention.keyValueHeadCount, headDimension)
+		gradientGate := tensors.New(batchSize, sequenceLength, attention.keyValueHeadCount)
+		rowCount := batchSize * sequenceLength * attention.keyValueHeadCount
+		for row := 0; row < rowCount; row++ {
+			scale := gate.Data[row]
+			base := row * headDimension
+			var dotProduct float64
+			for dimension := 0; dimension < headDimension; dimension++ {
+				gradientValueEmbedding.Data[base+dimension] = gradientValueData[base+dimension] * scale
+				dotProduct += float64(gradientValueData[base+dimension]) * float64(valueEmbedding.Data[base+dimension])
 			}
-			gradGate.Data[idx] = float32(sum)
+			gradientGate.Data[row] = float32(dotProduct)
 		}
-		ctx.gradVE = gradVE
-		// sigmoid backward: gate = 3*sigmoid(z).
-		gradSig := tensor.Scale(gradGate, veGateScale)
-		gradZ := tensor.New(b, t, a.numKVHead)
-		for i := range ctx.veSig.Data {
-			s := ctx.veSig.Data[i]
-			gradZ.Data[i] = gradSig.Data[i] * s * (1 - s)
+		context.valueEmbeddingGradient = gradientValueEmbedding
+
+		// Sigmoid backward: gate = veGateScale * sigmoid(preGate).
+		gradientSigmoid := tensors.Scale(gradientGate, veGateScale)
+		gradientPreGate := tensors.New(batchSize, sequenceLength, attention.keyValueHeadCount)
+		for index := range context.valueGateSigmoid.Data {
+			sigmoid := context.valueGateSigmoid.Data[index]
+			gradientPreGate.Data[index] = gradientSigmoid.Data[index] * sigmoid * (1 - sigmoid)
 		}
-		gradGateSlice := a.veGate.Backward(sliceChannels(x, 0, t, veGateChannels), gradZ) // [B,T,12]
-		scattered := tensor.New(b, t, a.embedDim)
-		scatterAddChannels(scattered, 0, t, veGateChannels, gradGateSlice)
-		gradX = tensor.Add(gradX, scattered)
+		gradientGateSlice := attention.valueEmbeddingGate.Backward(sliceChannels(input, 0, sequenceLength, veGateChannels), gradientPreGate) // [B,T,12]
+		scattered := tensors.New(batchSize, sequenceLength, attention.embeddingDimension)
+		scatterAddChannels(scattered, 0, sequenceLength, veGateChannels, gradientGateSlice)
+		gradientInput = tensors.Add(gradientInput, scattered)
 	}
 
-	// c_v projection gradient (gradV flows through cv).
-	gradX = tensor.Add(gradX, a.cv.Backward(x, gradVBT.Reshape(b, t, a.numKVHead*a.headDim)))
+	// value projection gradient (gradientValue flows through valueProjection).
+	gradientInput = tensors.Add(gradientInput, attention.valueProjection.Backward(input, gradientValueSequence.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount*attention.headDimension)))
 
-	return gradX
+	return gradientInput
 }
 
-// normLastDimBackward applies RMSNorm backward to an arbitrary-rank tensor.
-func normLastDimBackward(x, gradOut *tensor.Tensor) *tensor.Tensor {
-	last := x.Shape[len(x.Shape)-1]
-	rows := x.Numel() / last
-	return tensor.RMSNormBackward(x.Reshape(rows, last), gradOut.Reshape(rows, last), normEps).Reshape(x.Shape...)
+// normalizeLastDimBackward applies RMSNorm backward to an arbitrary-rank
+// tensor.
+func normalizeLastDimBackward(input, gradientOutput *tensors.Tensor) *tensors.Tensor {
+	lastDimension := input.Shape[len(input.Shape)-1]
+	rowCount := input.Numel() / lastDimension
+	return tensors.RMSNormBackward(input.Reshape(rowCount, lastDimension), gradientOutput.Reshape(rowCount, lastDimension), normEps).Reshape(input.Shape...)
 }
 
-// mlpCtx holds activations for the MLP backward.
-type mlpCtx struct {
-	fcIn  *tensor.Tensor // input to c_fc (== norm input)
-	fcOut *tensor.Tensor // c_fc output (pre relu2)
-	h     *tensor.Tensor // relu2 output (input to c_proj)
+// mlpContext holds activations for the MLP backward.
+type mlpContext struct {
+	input     *tensors.Tensor // input to inputProjection (== norm input)
+	projected *tensors.Tensor // inputProjection output (pre ReLU-squared)
+	hidden    *tensors.Tensor // ReLU-squared output (input to outputProjection)
 }
 
-func (m *MLP) forwardTrain(x *tensor.Tensor) (*tensor.Tensor, *mlpCtx) {
-	fc := m.CFc.Forward(x)
-	h := tensor.Relu2(fc)
-	out := m.CProj.Forward(h)
-	return out, &mlpCtx{fcIn: x, fcOut: fc, h: h}
+func (mlp *MLP) forwardTraining(input *tensors.Tensor) (*tensors.Tensor, *mlpContext) {
+	projected := mlp.inputProjection.Forward(input)
+	hidden := tensors.ReluSquared(projected)
+	output := mlp.outputProjection.Forward(hidden)
+	return output, &mlpContext{input: input, projected: projected, hidden: hidden}
 }
 
-func (m *MLP) backwardTrain(gradOut *tensor.Tensor, ctx *mlpCtx) *tensor.Tensor {
-	gradH := m.CProj.Backward(ctx.h, gradOut)
-	gradFC := tensor.Relu2Backward(ctx.fcOut, gradH)
-	return m.CFc.Backward(ctx.fcIn, gradFC)
+func (mlp *MLP) backwardTraining(outputGradient *tensors.Tensor, context *mlpContext) *tensors.Tensor {
+	gradientHidden := mlp.outputProjection.Backward(context.hidden, outputGradient)
+	gradientProjected := tensors.ReluSquaredBackward(context.projected, gradientHidden)
+	return mlp.inputProjection.Backward(context.input, gradientProjected)
 }
 
-// blockCtx holds activations for the block backward.
-type blockCtx struct {
-	xPre       *tensor.Tensor // block input (after combineResidual)
-	attnNormIn *tensor.Tensor // norm(xPre), the attention's actual input
-	attnOut    *tensor.Tensor // attention output (pre residual)
-	attnCtx    *attnCtx
-	mlpNormIn  *tensor.Tensor // x after attention residual (input to mlp norm)
-	mlpOut     *tensor.Tensor
-	mlpCtx     *mlpCtx
+// blockContext holds activations for the block backward.
+type blockContext struct {
+	input              *tensors.Tensor // block input (after combineResidual)
+	attentionNormInput *tensors.Tensor // norm(input), the attention's actual input
+	attentionOutput    *tensors.Tensor // attention output (pre residual)
+	attentionContext   *attentionContext
+	mlpNormInput       *tensors.Tensor // input after attention residual (input to mlp norm)
+	mlpOutput          *tensors.Tensor
+	mlpContext         *mlpContext
 }
 
-func (b *Block) forwardTrain(x, ve, cos, sin *tensor.Tensor, t0 int, window [2]int) (*tensor.Tensor, *blockCtx) {
-	ctx := &blockCtx{xPre: x}
-	attnIn := normLastDim(x)
-	ctx.attnNormIn = attnIn
-	attnOut, actx := b.Attn.forwardTrain(attnIn, ve, cos, sin, t0, window)
-	ctx.attnOut = attnOut
-	ctx.attnCtx = actx
-	mid := tensor.Add(x, attnOut)
-	ctx.mlpNormIn = mid
-	mlpOut, mctx := b.MLP.forwardTrain(normLastDim(mid))
-	ctx.mlpOut = mlpOut
-	ctx.mlpCtx = mctx
-	return tensor.Add(mid, mlpOut), ctx
+func (block *Block) forwardTraining(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int) (*tensors.Tensor, *blockContext) {
+	context := &blockContext{input: input}
+	attentionInput := normalizeLastDim(input)
+	context.attentionNormInput = attentionInput
+	attentionOutput, attentionCtx := block.attention.forwardTraining(attentionInput, valueEmbedding, cosine, sine, positionOffset, window)
+	context.attentionOutput = attentionOutput
+	context.attentionContext = attentionCtx
+	mid := tensors.Add(input, attentionOutput)
+	context.mlpNormInput = mid
+	mlpOutput, mlpContext := block.mlp.forwardTraining(normalizeLastDim(mid))
+	context.mlpOutput = mlpOutput
+	context.mlpContext = mlpContext
+	return tensors.Add(mid, mlpOutput), context
 }
 
-func (b *Block) backwardTrain(gradOut *tensor.Tensor, ctx *blockCtx, cos, sin *tensor.Tensor, t0 int) *tensor.Tensor {
-	// Forward: mid = x_pre + attn_out; out = mid + mlp_out. The residual
-	// connections mean the gradient flows both through each sublayer and
-	// directly (identity) across it.
-	gradMid := gradOut
-	gradMLPOut := gradOut
+func (block *Block) backwardTraining(outputGradient *tensors.Tensor, context *blockContext, cosine, sine *tensors.Tensor, positionOffset int) *tensors.Tensor {
+	// Forward: mid = input + attentionOutput; output = mid + mlpOutput. The
+	// residual connections mean the gradient flows both through each sublayer
+	// and directly (identity) across it.
+	gradientMid := outputGradient
 
-	gradMLPNormIn := b.MLP.backwardTrain(gradMLPOut, ctx.mlpCtx)
-	gradMid = tensor.Add(gradMid, normLastDimBackward(ctx.mlpNormIn, gradMLPNormIn))
+	gradientMLPNormInput := block.mlp.backwardTraining(outputGradient, context.mlpContext)
+	gradientMid = tensors.Add(gradientMid, normalizeLastDimBackward(context.mlpNormInput, gradientMLPNormInput))
 
-	gradAttnNormIn := b.Attn.backwardTrain(ctx.attnNormIn, gradMid, ctx.attnCtx, cos, sin, t0)
-	gradXPre := normLastDimBackward(ctx.xPre, gradAttnNormIn)
+	gradientAttentionNormInput := block.attention.backwardTraining(context.attentionNormInput, gradientMid, context.attentionContext, cosine, sine, positionOffset)
+	gradientInput := normalizeLastDimBackward(context.input, gradientAttentionNormInput)
 	// Identity residual path.
-	gradXPre = tensor.Add(gradXPre, gradMid)
-	return gradXPre
+	gradientInput = tensors.Add(gradientInput, gradientMid)
+	return gradientInput
 }

@@ -8,147 +8,147 @@ import (
 )
 
 // Handler returns the HTTP handler for the OpenAI-compatible API.
-func (s *Server) Handler() http.Handler {
+func (server *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
-	mux.HandleFunc("/v1/models", s.handleModels)
-	mux.HandleFunc("/v1/models/", s.handleModel)
+	mux.HandleFunc("/v1/chat/completions", server.handleChatCompletions)
+	mux.HandleFunc("/v1/models", server.handleModels)
+	mux.HandleFunc("/v1/models/", server.handleModel)
 	return mux
 }
 
 // handleModels lists the available model.
-func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, ModelsResponse{
+func (server *Server) handleModels(writer http.ResponseWriter, request *http.Request) {
+	writeJSON(writer, http.StatusOK, ModelsResponse{
 		Object: "list",
 		Data: []ModelEntry{
-			{ID: s.ModelName, Object: "model", Created: 0, OwnedBy: "gonano"},
+			{ID: server.ModelName, Object: "model", Created: 0, OwnedBy: "gonano"},
 		},
 	})
 }
 
 // handleModel serves GET /v1/models/{name}.
-func (s *Server) handleModel(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, ModelEntry{ID: s.ModelName, Object: "model", OwnedBy: "gonano"})
+func (server *Server) handleModel(writer http.ResponseWriter, request *http.Request) {
+	writeJSON(writer, http.StatusOK, ModelEntry{ID: server.ModelName, Object: "model", OwnedBy: "gonano"})
 }
 
 // handleChatCompletions serves POST /v1/chat/completions, streaming or not.
-func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+func (server *Server) handleChatCompletions(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var req ChatCompletionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
+	var chatRequest ChatCompletionRequest
+	if err := json.NewDecoder(request.Body).Decode(&chatRequest); err != nil {
+		http.Error(writer, "invalid request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if len(req.Messages) == 0 {
-		http.Error(w, "messages must not be empty", http.StatusBadRequest)
+	if len(chatRequest.Messages) == 0 {
+		http.Error(writer, "messages must not be empty", http.StatusBadRequest)
 		return
 	}
 
-	prompt := s.renderMessages(req.Messages, req.Tools)
-	opts := options(req, s.Model.Config.SequenceLen)
+	prompt := server.renderMessages(chatRequest.Messages, chatRequest.Tools)
+	genOptions := resolveOptions(chatRequest, server.Model.Config.SequenceLen)
 
-	if req.Stream {
-		s.streamCompletion(w, prompt, req, opts)
+	if chatRequest.Stream {
+		server.streamCompletion(writer, prompt, chatRequest, genOptions)
 		return
 	}
-	s.complete(w, prompt, req, opts)
+	server.complete(writer, prompt, chatRequest, genOptions)
 }
 
 // complete writes a single non-streaming chat completion response.
-func (s *Server) complete(w http.ResponseWriter, prompt []int, req ChatCompletionRequest, opts generationOptions) {
-	rows := s.generate(prompt, opts.temperature, opts.topK, opts.maxTokens, opts.n, opts.seed)
+func (server *Server) complete(writer http.ResponseWriter, prompt []int, chatRequest ChatCompletionRequest, genOptions generationOptions) {
+	rows := server.generate(prompt, genOptions.temperature, genOptions.topK, genOptions.maxTokens, genOptions.numSamples, genOptions.seed)
 
 	choices := make([]Choice, len(rows))
 	var totalPrompt, totalCompletion int
-	for i, r := range rows {
-		choices[i] = Choice{
-			Index:        i,
-			Message:      ResponseMessage{Role: "assistant", Content: r.content, ToolCalls: r.toolCalls},
-			FinishReason: r.finish,
+	for index, row := range rows {
+		choices[index] = Choice{
+			Index:        index,
+			Message:      ResponseMessage{Role: "assistant", Content: row.content, ToolCalls: row.toolCalls},
+			FinishReason: row.finish,
 		}
-		totalPrompt += r.promptLen
-		totalCompletion += r.completion
+		totalPrompt += row.promptLen
+		totalCompletion += row.completion
 	}
-	writeJSON(w, http.StatusOK, ChatCompletionResponse{
+	writeJSON(writer, http.StatusOK, ChatCompletionResponse{
 		ID:      chatID(),
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
-		Model:   s.ModelName,
+		Model:   server.ModelName,
 		Choices: choices,
 		Usage:   Usage{PromptTokens: totalPrompt, CompletionTokens: totalCompletion, TotalTokens: totalPrompt + totalCompletion},
 	})
 }
 
 // streamCompletion writes a server-sent-events stream of completion chunks.
-func (s *Server) streamCompletion(w http.ResponseWriter, prompt []int, req ChatCompletionRequest, opts generationOptions) {
-	flusher, ok := w.(http.Flusher)
+func (server *Server) streamCompletion(writer http.ResponseWriter, prompt []int, chatRequest ChatCompletionRequest, genOptions generationOptions) {
+	flusher, ok := writer.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		http.Error(writer, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	writer.Header().Set("Content-Type", "text/event-stream")
+	writer.Header().Set("Cache-Control", "no-cache")
+	writer.Header().Set("Connection", "keep-alive")
 
-	tok := s.Tokenizer
-	toolStart := tok.EncodeSpecial("<|tool_start|>")
-	toolEnd := tok.EncodeSpecial("<|tool_end|>")
-	assistantEnd := tok.EncodeSpecial("<|assistant_end|>")
-	bos := tok.BOSTokenID()
+	tokenizerImpl := server.Tokenizer
+	toolStart := tokenizerImpl.EncodeSpecial("<|tool_start|>")
+	toolEnd := tokenizerImpl.EncodeSpecial("<|tool_end|>")
+	assistantEnd := tokenizerImpl.EncodeSpecial("<|assistant_end|>")
+	bosToken := tokenizerImpl.BOSTokenID()
 
 	id := chatID()
 	created := time.Now().Unix()
 
 	// Emit the initial role chunk.
-	writeSSE(w, flusher, ChatCompletionChunk{
+	writeSSE(writer, flusher, ChatCompletionChunk{
 		ID:      id,
 		Object:  "chat.completion.chunk",
 		Created: created,
-		Model:   s.ModelName,
+		Model:   server.ModelName,
 		Choices: []StreamChoice{{Index: 0, Delta: StreamDelta{Role: "assistant"}}},
 	})
 
-	inCall := make([]bool, opts.n)
-	finished := make([]bool, opts.n)
+	inToolCall := make([]bool, genOptions.numSamples)
+	finished := make([]bool, genOptions.numSamples)
 	completion := 0
 
-	gen := s.Engine.Generate(prompt, opts.n, opts.maxTokens, opts.temperature, opts.topK, opts.seed)
-	gen(func(column, mask []int) bool {
-		for i := 0; i < opts.n; i++ {
-			if finished[i] {
+	generate := server.Engine.Generate(prompt, genOptions.numSamples, genOptions.maxTokens, genOptions.temperature, genOptions.topK, genOptions.seed)
+	generate(func(column, mask []int) bool {
+		for index := 0; index < genOptions.numSamples; index++ {
+			if finished[index] {
 				continue
 			}
-			if mask[i] == 0 {
+			if mask[index] == 0 {
 				continue // forced tool output; hidden from the stream
 			}
-			tk := column[i]
-			switch tk {
+			token := column[index]
+			switch token {
 			case toolStart:
-				inCall[i] = true
+				inToolCall[index] = true
 			case toolEnd:
-				inCall[i] = false
-			case assistantEnd, bos:
-				finished[i] = true
+				inToolCall[index] = false
+			case assistantEnd, bosToken:
+				finished[index] = true
 			default:
-				if inCall[i] {
+				if inToolCall[index] {
 					continue // tool-call expression; hidden from the stream
 				}
-				text := tok.Decode([]int{tk})
+				text := tokenizerImpl.Decode([]int{token})
 				completion++
-				writeSSE(w, flusher, ChatCompletionChunk{
+				writeSSE(writer, flusher, ChatCompletionChunk{
 					ID:      id,
 					Object:  "chat.completion.chunk",
 					Created: created,
-					Model:   s.ModelName,
-					Choices: []StreamChoice{{Index: i, Delta: StreamDelta{Content: text}}},
+					Model:   server.ModelName,
+					Choices: []StreamChoice{{Index: index, Delta: StreamDelta{Content: text}}},
 				})
 			}
 		}
-		for _, f := range finished {
-			if !f {
+		for _, done := range finished {
+			if !done {
 				return true
 			}
 		}
@@ -157,30 +157,30 @@ func (s *Server) streamCompletion(w http.ResponseWriter, prompt []int, req ChatC
 
 	// Final chunk with the finish reason.
 	finish := "stop"
-	if completion >= opts.maxTokens {
+	if completion >= genOptions.maxTokens {
 		finish = "length"
 	}
-	writeSSE(w, flusher, ChatCompletionChunk{
+	writeSSE(writer, flusher, ChatCompletionChunk{
 		ID:      id,
 		Object:  "chat.completion.chunk",
 		Created: created,
-		Model:   s.ModelName,
+		Model:   server.ModelName,
 		Choices: []StreamChoice{{Index: 0, Delta: StreamDelta{}, FinishReason: &finish}},
 	})
-	fmt.Fprintf(w, "data: [DONE]\n\n")
+	fmt.Fprintf(writer, "data: [DONE]\n\n")
 	flusher.Flush()
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+func writeJSON(writer http.ResponseWriter, status int, value any) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(value)
 }
 
-func writeSSE(w http.ResponseWriter, f http.Flusher, chunk ChatCompletionChunk) {
-	b, _ := json.Marshal(chunk)
-	fmt.Fprintf(w, "data: %s\n\n", b)
-	f.Flush()
+func writeSSE(writer http.ResponseWriter, flusher http.Flusher, chunk ChatCompletionChunk) {
+	data, _ := json.Marshal(chunk)
+	fmt.Fprintf(writer, "data: %s\n\n", data)
+	flusher.Flush()
 }
 
 // chatID returns a short unique completion id.

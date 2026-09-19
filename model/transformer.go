@@ -3,8 +3,8 @@ package model
 import (
 	"math"
 
-	"github.com/cookiengineer/gonano/nn"
-	"github.com/cookiengineer/gonano/tensor"
+	"github.com/cookiengineer/gonano/model/layers"
+	"github.com/cookiengineer/gonano/tensors"
 )
 
 // softcap is the logit softcap used before loss/sampling.
@@ -15,8 +15,8 @@ const softcap = 15.0
 const rotaryOvercompute = 10
 
 // uniformBound returns nanochat's uniform half-width sqrt(3) * n_embd^-0.5.
-func uniformBound(embedDim int) float32 {
-	return float32(math.Sqrt(3.0) / math.Sqrt(float64(embedDim)))
+func uniformBound(embeddingDimension int) float32 {
+	return float32(math.Sqrt(3.0) / math.Sqrt(float64(embeddingDimension)))
 }
 
 // Transformer is the nanochat GPT model.
@@ -25,215 +25,218 @@ type Transformer struct {
 	paddedVocab int
 	windowSizes [][2]int
 
-	wte *nn.Embedding
-	h   []*Block
-	lm  *nn.Linear
+	tokenEmbedding *layers.Embedding
+	blocks         []*Block
+	lmHead         *layers.Linear
 
-	residLambdas  *tensor.Tensor // [n_layer]
-	x0Lambdas     *tensor.Tensor // [n_layer]
-	smearGate     *nn.Linear    // [24, 1]
-	smearLambda   *tensor.Tensor // [1]
-	backoutLambda *tensor.Tensor // [1]
+	residLambdas  *tensors.Tensor // [n_layer]
+	x0Lambdas     *tensors.Tensor // [n_layer]
+	smearGate     *layers.Linear  // [24, 1]
+	smearLambda   *tensors.Tensor // [1]
+	backoutLambda *tensors.Tensor // [1]
 
-	valueEmbeds map[int]*nn.Embedding // layer -> embedding (ResFormer)
+	valueEmbeds map[int]*layers.Embedding // layer -> embedding (ResFormer)
 
-	cos, sin *tensor.Tensor // [rotarySeqLen, headDim/2]
+	rotaryCosine, rotarySine *tensors.Tensor // [rotarySeqLen, headDim/2]
 }
 
 // NewTransformer builds a Transformer with all parameters zero-initialized.
 // Call InitWeights to initialize them.
-func NewTransformer(cfg Config) *Transformer {
-	cfg.Validate()
-	padded := cfg.PaddedVocab()
-	headDim := cfg.HeadDim()
-	cos, sin := precomputeRotary(cfg.SequenceLen*rotaryOvercompute, headDim)
+func NewTransformer(config Config) *Transformer {
+	config.Validate()
+	paddedVocabulary := config.PaddedVocab()
+	headDimension := config.HeadDim()
+	rotaryCosine, rotarySine := precomputeRotary(config.SequenceLen*rotaryOvercompute, headDimension)
 
-	m := &Transformer{
-		Config:        cfg,
-		paddedVocab:   padded,
-		windowSizes:   cfg.WindowSizes(),
-		wte:           nn.NewEmbedding(padded, cfg.EmbedDim),
-		h:             make([]*Block, cfg.NumLayer),
-		lm:            nn.NewLinear(cfg.EmbedDim, padded),
-		residLambdas:  tensor.New(cfg.NumLayer),
-		x0Lambdas:     tensor.New(cfg.NumLayer),
-		smearGate:     nn.NewLinear(smearGateChannels, 1),
-		smearLambda:   tensor.New(1),
-		backoutLambda: tensor.New(1),
-		valueEmbeds:   make(map[int]*nn.Embedding),
-		cos:           cos,
-		sin:           sin,
+	model := &Transformer{
+		Config:         config,
+		paddedVocab:    paddedVocabulary,
+		windowSizes:    config.WindowSizes(),
+		tokenEmbedding: layers.NewEmbedding(paddedVocabulary, config.EmbedDim),
+		blocks:         make([]*Block, config.NumLayer),
+		lmHead:         layers.NewLinear(config.EmbedDim, paddedVocabulary),
+		residLambdas:   tensors.New(config.NumLayer),
+		x0Lambdas:      tensors.New(config.NumLayer),
+		smearGate:      layers.NewLinear(smearGateChannels, 1),
+		smearLambda:    tensors.New(1),
+		backoutLambda:  tensors.New(1),
+		valueEmbeds:    make(map[int]*layers.Embedding),
+		rotaryCosine:   rotaryCosine,
+		rotarySine:     rotarySine,
 	}
-	for i := 0; i < cfg.NumLayer; i++ {
-		m.h[i] = NewBlock(cfg, hasVE(i, cfg.NumLayer))
-		if hasVE(i, cfg.NumLayer) {
-			m.valueEmbeds[i] = nn.NewEmbedding(padded, cfg.NumKVHead*headDim)
+	for layerIndex := 0; layerIndex < config.NumLayer; layerIndex++ {
+		model.blocks[layerIndex] = NewBlock(config, hasValueEmbedding(layerIndex, config.NumLayer))
+		if hasValueEmbedding(layerIndex, config.NumLayer) {
+			model.valueEmbeds[layerIndex] = layers.NewEmbedding(paddedVocabulary, config.NumKVHead*headDimension)
 		}
 	}
-	return m
+	return model
 }
 
 // NumLayers returns the number of transformer blocks.
-func (m *Transformer) NumLayers() int { return m.Config.NumLayer }
+func (model *Transformer) NumLayers() int { return model.Config.NumLayer }
 
 // PaddedVocab returns the padded vocabulary size.
-func (m *Transformer) PaddedVocab() int { return m.paddedVocab }
+func (model *Transformer) PaddedVocab() int { return model.paddedVocab }
 
 // KVHeadDim returns the KV embedding dimension (numKVHead * headDim).
-func (m *Transformer) KVHeadDim() int { return m.Config.NumKVHead * m.Config.HeadDim() }
+func (model *Transformer) KVHeadDim() int {
+	return model.Config.NumKVHead * model.Config.HeadDim()
+}
 
 // InitWeights initializes every parameter exactly as nanochat's init_weights.
-func (m *Transformer) InitWeights(rng *tensor.RNG) {
-	cfg := m.Config
-	s := uniformBound(cfg.EmbedDim)
+func (model *Transformer) InitWeights(rng *tensors.RNG) {
+	config := model.Config
+	bound := uniformBound(config.EmbedDim)
 
-	nn.InitNormal(m.wte.Weight, rng, 0.8)
-	nn.InitNormal(m.lm.Weight, rng, 0.001)
+	layers.InitNormal(model.tokenEmbedding.Weight, rng, 0.8)
+	layers.InitNormal(model.lmHead.Weight, rng, 0.001)
 
-	for _, block := range m.h {
-		nn.InitUniform(block.Attn.cq.Weight, rng, -s, s)
-		nn.InitUniform(block.Attn.ck.Weight, rng, -s, s)
-		nn.InitUniform(block.Attn.cv.Weight, rng, -s, s)
-		nn.InitZeros(block.Attn.cproj.Weight)
-		nn.InitUniform(block.MLP.CFc.Weight, rng, -0.4*s, 0.4*s)
-		nn.InitZeros(block.MLP.CProj.Weight)
+	for _, block := range model.blocks {
+		layers.InitUniform(block.attention.queryProjection.Weight, rng, -bound, bound)
+		layers.InitUniform(block.attention.keyProjection.Weight, rng, -bound, bound)
+		layers.InitUniform(block.attention.valueProjection.Weight, rng, -bound, bound)
+		layers.InitZeros(block.attention.outputProjection.Weight)
+		layers.InitUniform(block.mlp.inputProjection.Weight, rng, -0.4*bound, 0.4*bound)
+		layers.InitZeros(block.mlp.outputProjection.Weight)
 	}
 
-	nLayer := cfg.NumLayer
-	for i := 0; i < nLayer; i++ {
-		m.residLambdas.Data[i] = 1.15 - 0.10*float32(i)/float32(max(nLayer-1, 1))
-		m.x0Lambdas.Data[i] = 0.20 - 0.15*float32(i)/float32(max(nLayer-1, 1))
+	numLayers := config.NumLayer
+	for layerIndex := 0; layerIndex < numLayers; layerIndex++ {
+		model.residLambdas.Data[layerIndex] = 1.15 - 0.10*float32(layerIndex)/float32(max(numLayers-1, 1))
+		model.x0Lambdas.Data[layerIndex] = 0.20 - 0.15*float32(layerIndex)/float32(max(numLayers-1, 1))
 	}
 
-	m.smearLambda.Data[0] = 0
-	m.backoutLambda.Data[0] = 0.2
-	nn.InitUniform(m.smearGate.Weight, rng, 0.0, 0.02)
+	model.smearLambda.Data[0] = 0
+	model.backoutLambda.Data[0] = 0.2
+	layers.InitUniform(model.smearGate.Weight, rng, 0.0, 0.02)
 
-	for _, ve := range m.valueEmbeds {
-		nn.InitUniform(ve.Weight, rng, -s, s)
+	for _, valueEmbedding := range model.valueEmbeds {
+		layers.InitUniform(valueEmbedding.Weight, rng, -bound, bound)
 	}
 
-	for _, block := range m.h {
-		if block.Attn.veGate != nil {
-			nn.InitUniform(block.Attn.veGate.Weight, rng, 0.0, 0.02)
+	for _, block := range model.blocks {
+		if block.attention.valueEmbeddingGate != nil {
+			layers.InitUniform(block.attention.valueEmbeddingGate.Weight, rng, 0.0, 0.02)
 		}
 	}
 }
 
 // Forward runs the model and returns the softcapped logits of shape
-// [B,T,vocab]. idx has shape [B,T]. cache, when non-nil, enables
+// [B,T,vocab]. indexes has shape [B,T]. cache, when non-nil, enables
 // autoregressive inference (KV-cache). Loss computation is intentionally kept
-// out of the model; callers use tensor.CrossEntropy on the returned logits.
-func (m *Transformer) Forward(idx *tensor.Int32s, cache *KVBuffer) *tensor.Tensor {
-	b, t := idx.Shape[0], idx.Shape[1]
-	if t > m.Config.SequenceLen {
+// out of the model; callers use tensors.CrossEntropy on the returned logits.
+func (model *Transformer) Forward(indexes *tensors.Int32s, cache *KVBuffer) *tensors.Tensor {
+	batchSize, sequenceLength := indexes.Shape[0], indexes.Shape[1]
+	if sequenceLength > model.Config.SequenceLen {
 		panic("model: sequence longer than rotary cache")
 	}
 
-	x := m.wte.Forward(idx) // [B,T,C]
-	x = normLastDim(x)
+	activations := model.tokenEmbedding.Forward(indexes) // [B,T,C]
+	activations = normalizeLastDim(activations)
 
-	t0 := 0
+	positionOffset := 0
 	if cache != nil {
-		t0 = cache.Position()
+		positionOffset = cache.Position()
 	}
 
 	// Smear: mix the previous token's embedding into the current token.
 	switch {
 	case cache == nil:
-		if t <= 1 {
+		if sequenceLength <= 1 {
 			panic("model: training forward requires T > 1")
 		}
-		gate := m.smearGate.Forward(sliceChannels(x, 1, t, smearGateChannels)) // [B,T-1,1]
-		gate = tensor.Scale(tensor.Sigmoid(gate), m.smearLambda.Data[0])
-		smearAdd(x, gate)
+		gate := model.smearGate.Forward(sliceChannels(activations, 1, sequenceLength, smearGateChannels)) // [B,T-1,1]
+		gate = tensors.Scale(tensors.Sigmoid(gate), model.smearLambda.Data[0])
+		smearAdd(activations, gate)
 	default:
-		xPre := cache.PrevEmbedding()
-		cache.SetPrevEmbedding(lastTokenEmbedding(x))
-		if t > 1 {
-			gate := m.smearGate.Forward(sliceChannels(x, 1, t, smearGateChannels))
-			gate = tensor.Scale(tensor.Sigmoid(gate), m.smearLambda.Data[0])
-			smearAdd(x, gate)
-		} else if xPre != nil {
-			gate := m.smearGate.Forward(sliceChannels(x, 0, 1, smearGateChannels)) // [B,1,1]
-			gate = tensor.Scale(tensor.Sigmoid(gate), m.smearLambda.Data[0])
-			smearDecode(x, gate, xPre)
+		previousEmbedding := cache.PrevEmbedding()
+		cache.SetPrevEmbedding(lastTokenEmbedding(activations))
+		if sequenceLength > 1 {
+			gate := model.smearGate.Forward(sliceChannels(activations, 1, sequenceLength, smearGateChannels))
+			gate = tensors.Scale(tensors.Sigmoid(gate), model.smearLambda.Data[0])
+			smearAdd(activations, gate)
+		} else if previousEmbedding != nil {
+			gate := model.smearGate.Forward(sliceChannels(activations, 0, 1, smearGateChannels)) // [B,1,1]
+			gate = tensors.Scale(tensors.Sigmoid(gate), model.smearLambda.Data[0])
+			smearDecode(activations, gate, previousEmbedding)
 		}
 	}
 
-	x0 := x
-	backoutLayer := m.Config.NumLayer / 2
-	var xBackout *tensor.Tensor
-	for i, block := range m.h {
-		x = combineResidual(x, x0, m.residLambdas.Data[i], m.x0Lambdas.Data[i])
-		var ve *tensor.Tensor
-		if emb, ok := m.valueEmbeds[i]; ok {
-			ve = emb.Forward(idx)
+	initialResidual := activations
+	backoutLayerIndex := model.Config.NumLayer / 2
+	var backoutActivation *tensors.Tensor
+	for layerIndex, block := range model.blocks {
+		activations = combineResidual(activations, initialResidual, model.residLambdas.Data[layerIndex], model.x0Lambdas.Data[layerIndex])
+		var valueEmbedding *tensors.Tensor
+		if embedding, ok := model.valueEmbeds[layerIndex]; ok {
+			valueEmbedding = embedding.Forward(indexes)
 		}
-		x = block.Forward(x, ve, m.cos, m.sin, t0, m.windowSizes[i], cache, i)
-		if i == backoutLayer {
-			xBackout = x.Clone()
+		activations = block.Forward(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, positionOffset, model.windowSizes[layerIndex], cache, layerIndex)
+		if layerIndex == backoutLayerIndex {
+			backoutActivation = activations.Clone()
 		}
 	}
 
 	if cache != nil {
-		cache.Advance(t)
+		cache.Advance(sequenceLength)
 	}
 
-	if xBackout != nil {
-		x = tensor.AddScaled(x, xBackout, -m.backoutLambda.Data[0])
+	if backoutActivation != nil {
+		activations = tensors.AddScaled(activations, backoutActivation, -model.backoutLambda.Data[0])
 	}
-	x = normLastDim(x)
+	activations = normalizeLastDim(activations)
 
-	logits := m.lm.Forward(x) // [B,T,paddedVocab]
-	logits = trimVocab(logits, m.paddedVocab, m.Config.VocabSize)
-	logits = tensor.Softcap(logits, softcap)
-	return logits.Reshape(b, t, m.Config.VocabSize)
+	logits := model.lmHead.Forward(activations) // [B,T,paddedVocab]
+	logits = trimVocab(logits, model.paddedVocab, model.Config.VocabSize)
+	logits = tensors.Softcap(logits, softcap)
+	return logits.Reshape(batchSize, sequenceLength, model.Config.VocabSize)
 }
 
 // lastTokenEmbedding copies the last token's embedding of each batch row into
-// a fresh [B,1,C] tensor.
-func lastTokenEmbedding(x *tensor.Tensor) *tensor.Tensor {
-	b, t, c := x.Shape[0], x.Shape[1], x.Shape[2]
-	out := tensor.New(b, 1, c)
-	for bb := 0; bb < b; bb++ {
-		src := x.Data[(bb*t+(t-1))*c : (bb*t+(t-1))*c+c]
-		copy(out.Data[bb*c:(bb+1)*c], src)
+// a fresh [B,1,C] tensors.
+func lastTokenEmbedding(activations *tensors.Tensor) *tensors.Tensor {
+	batchSize, sequenceLength, embeddingDimension := activations.Shape[0], activations.Shape[1], activations.Shape[2]
+	output := tensors.New(batchSize, 1, embeddingDimension)
+	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		source := activations.Data[(batchIndex*sequenceLength+(sequenceLength-1))*embeddingDimension : (batchIndex*sequenceLength+(sequenceLength-1))*embeddingDimension+embeddingDimension]
+		copy(output.Data[batchIndex*embeddingDimension:(batchIndex+1)*embeddingDimension], source)
 	}
-	return out
+	return output
 }
 
-// smearDecode adds gate * xPre to x for the single-token decode case. gate has
-// shape [B,1,1]; x and xPre have shape [B,1,C].
-func smearDecode(x, gate, xPre *tensor.Tensor) {
-	b, c := x.Shape[0], x.Shape[2]
-	xd, gd, pd := x.Data, gate.Data, xPre.Data
-	for bb := 0; bb < b; bb++ {
-		g := gd[bb]
-		base := bb * c
-		for j := 0; j < c; j++ {
-			xd[base+j] += g * pd[base+j]
+// smearDecode adds gate * previousEmbedding to activations for the single-token
+// decode case. gate has shape [B,1,1]; activations and previousEmbedding have
+// shape [B,1,C].
+func smearDecode(activations, gate, previousEmbedding *tensors.Tensor) {
+	batchSize, embeddingDimension := activations.Shape[0], activations.Shape[2]
+	activationData, gateData, previousData := activations.Data, gate.Data, previousEmbedding.Data
+	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		gateValue := gateData[batchIndex]
+		base := batchIndex * embeddingDimension
+		for channelIndex := 0; channelIndex < embeddingDimension; channelIndex++ {
+			activationData[base+channelIndex] += gateValue * previousData[base+channelIndex]
 		}
 	}
 }
 
 // trimVocab crops the trailing padded-vocab channels down to vocabSize, given
-// a [B*T, paddedVocab] tensor.
-func trimVocab(logits *tensor.Tensor, padded, vocab int) *tensor.Tensor {
-	rows := logits.Numel() / padded
-	out := tensor.New(rows, vocab)
-	for i := 0; i < rows; i++ {
-		copy(out.Data[i*vocab:(i+1)*vocab], logits.Data[i*padded:i*padded+vocab])
+// a [B*T, paddedVocab] tensors.
+func trimVocab(logits *tensors.Tensor, paddedVocabSize, vocabSize int) *tensors.Tensor {
+	rowCount := logits.Numel() / paddedVocabSize
+	output := tensors.New(rowCount, vocabSize)
+	for rowIndex := 0; rowIndex < rowCount; rowIndex++ {
+		copy(output.Data[rowIndex*vocabSize:(rowIndex+1)*vocabSize], logits.Data[rowIndex*paddedVocabSize:rowIndex*paddedVocabSize+vocabSize])
 	}
-	return out
+	return output
 }
 
-// combineResidual computes resid*x + x0lamb*x0 element-wise.
-func combineResidual(x, x0 *tensor.Tensor, resid, x0lamb float32) *tensor.Tensor {
-	out := tensor.New(x.Shape...)
-	xd, od, zd := x.Data, out.Data, x0.Data
-	for i := range xd {
-		od[i] = resid*xd[i] + x0lamb*zd[i]
+// combineResidual computes residualWeight*activations + initialWeight*initialResidual element-wise.
+func combineResidual(activations, initialResidual *tensors.Tensor, residualWeight, initialWeight float32) *tensors.Tensor {
+	output := tensors.New(activations.Shape...)
+	activationData, outputData, initialData := activations.Data, output.Data, initialResidual.Data
+	for elementIndex := range activationData {
+		outputData[elementIndex] = residualWeight*activationData[elementIndex] + initialWeight*initialData[elementIndex]
 	}
-	return out
+	return output
 }

@@ -4,44 +4,44 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/cookiengineer/gonano/tensor"
+	"github.com/cookiengineer/gonano/tensors"
 )
 
 // NamedParameters returns every trainable parameter of the model keyed by a
 // state-dict-style name matching nanochat's checkpoint keys. The order is
 // deterministic (sorted by name). This is the single source of truth used by
 // weight initialization verification, checkpointing, and optimizer setup.
-func (m *Transformer) NamedParameters() map[string]*tensor.Tensor {
-	params := make(map[string]*tensor.Tensor)
-	params["transformer.wte.weight"] = m.wte.Weight
-	params["lm_head.weight"] = m.lm.Weight
-	for i, block := range m.h {
-		params[fmt.Sprintf("transformer.h.%d.attn.c_q.weight", i)] = block.Attn.cq.Weight
-		params[fmt.Sprintf("transformer.h.%d.attn.c_k.weight", i)] = block.Attn.ck.Weight
-		params[fmt.Sprintf("transformer.h.%d.attn.c_v.weight", i)] = block.Attn.cv.Weight
-		params[fmt.Sprintf("transformer.h.%d.attn.c_proj.weight", i)] = block.Attn.cproj.Weight
-		if block.Attn.veGate != nil {
-			params[fmt.Sprintf("transformer.h.%d.attn.ve_gate.weight", i)] = block.Attn.veGate.Weight
+func (model *Transformer) NamedParameters() map[string]*tensors.Tensor {
+	parameters := make(map[string]*tensors.Tensor)
+	parameters["transformer.wte.weight"] = model.tokenEmbedding.Weight
+	parameters["lm_head.weight"] = model.lmHead.Weight
+	for layerIndex, block := range model.blocks {
+		parameters[fmt.Sprintf("transformer.h.%d.attn.c_q.weight", layerIndex)] = block.attention.queryProjection.Weight
+		parameters[fmt.Sprintf("transformer.h.%d.attn.c_k.weight", layerIndex)] = block.attention.keyProjection.Weight
+		parameters[fmt.Sprintf("transformer.h.%d.attn.c_v.weight", layerIndex)] = block.attention.valueProjection.Weight
+		parameters[fmt.Sprintf("transformer.h.%d.attn.c_proj.weight", layerIndex)] = block.attention.outputProjection.Weight
+		if block.attention.valueEmbeddingGate != nil {
+			parameters[fmt.Sprintf("transformer.h.%d.attn.ve_gate.weight", layerIndex)] = block.attention.valueEmbeddingGate.Weight
 		}
-		params[fmt.Sprintf("transformer.h.%d.mlp.c_fc.weight", i)] = block.MLP.CFc.Weight
-		params[fmt.Sprintf("transformer.h.%d.mlp.c_proj.weight", i)] = block.MLP.CProj.Weight
+		parameters[fmt.Sprintf("transformer.h.%d.mlp.c_fc.weight", layerIndex)] = block.mlp.inputProjection.Weight
+		parameters[fmt.Sprintf("transformer.h.%d.mlp.c_proj.weight", layerIndex)] = block.mlp.outputProjection.Weight
 	}
-	for i, ve := range m.valueEmbeds {
-		params[fmt.Sprintf("value_embeds.%d.weight", i)] = ve.Weight
+	for layerIndex, valueEmbedding := range model.valueEmbeds {
+		parameters[fmt.Sprintf("value_embeds.%d.weight", layerIndex)] = valueEmbedding.Weight
 	}
-	params["resid_lambdas"] = m.residLambdas
-	params["x0_lambdas"] = m.x0Lambdas
-	params["smear_gate.weight"] = m.smearGate.Weight
-	params["smear_lambda"] = m.smearLambda
-	params["backout_lambda"] = m.backoutLambda
-	return params
+	parameters["resid_lambdas"] = model.residLambdas
+	parameters["x0_lambdas"] = model.x0Lambdas
+	parameters["smear_gate.weight"] = model.smearGate.Weight
+	parameters["smear_lambda"] = model.smearLambda
+	parameters["backout_lambda"] = model.backoutLambda
+	return parameters
 }
 
 // ParameterNames returns the sorted parameter names.
-func (m *Transformer) ParameterNames() []string {
-	params := m.NamedParameters()
-	names := make([]string, 0, len(params))
-	for name := range params {
+func (model *Transformer) ParameterNames() []string {
+	parameters := model.NamedParameters()
+	names := make([]string, 0, len(parameters))
+	for name := range parameters {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -49,29 +49,29 @@ func (m *Transformer) ParameterNames() []string {
 }
 
 // TotalParams returns the total number of parameters.
-func (m *Transformer) TotalParams() int {
+func (model *Transformer) TotalParams() int {
 	total := 0
-	for _, p := range m.NamedParameters() {
-		total += p.Numel()
+	for _, parameter := range model.NamedParameters() {
+		total += parameter.Numel()
 	}
 	return total
 }
 
 // ZeroGrad zeroes the gradients of all parameters.
-func (m *Transformer) ZeroGrad() {
-	for _, p := range m.NamedParameters() {
-		p.ZeroGrad()
+func (model *Transformer) ZeroGrad() {
+	for _, parameter := range model.NamedParameters() {
+		parameter.ZeroGrad()
 	}
 }
 
 // Parameters returns every trainable parameter as a flat slice (deterministic
 // order by name).
-func (m *Transformer) Parameters() []*tensor.Tensor {
-	names := m.ParameterNames()
-	out := make([]*tensor.Tensor, 0, len(names))
-	params := m.NamedParameters()
+func (model *Transformer) Parameters() []*tensors.Tensor {
+	names := model.ParameterNames()
+	output := make([]*tensors.Tensor, 0, len(names))
+	parameters := model.NamedParameters()
 	for _, name := range names {
-		out = append(out, params[name])
+		output = append(output, parameters[name])
 	}
-	return out
+	return output
 }

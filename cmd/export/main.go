@@ -10,17 +10,17 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/cookiengineer/gonano/checkpoint"
-	"github.com/cookiengineer/gonano/logging"
+	"github.com/cookiengineer/gonano/internal/logging"
+	"github.com/cookiengineer/gonano/model/checkpoint"
 )
 
 func main() {
 	modelPath := flag.String("model", "", "path to a .gn checkpoint (required)")
-	out := flag.String("out", "", "output .gguf path (required)")
+	outputPath := flag.String("out", "", "output .gguf path (required)")
 	flag.Parse()
 
 	logger := logging.Default(slog.LevelInfo)
-	if *modelPath == "" || *out == "" {
+	if *modelPath == "" || *outputPath == "" {
 		fmt.Fprintln(os.Stderr, "usage: export --model <path.gn> --out <path.gguf>")
 		os.Exit(1)
 	}
@@ -30,9 +30,9 @@ func main() {
 		logger.Error("load checkpoint", "err", err)
 		os.Exit(1)
 	}
-	if err := checkpoint.ExportGGUF(*out, meta, params); err != nil {
+	if err := checkpoint.ExportGGUF(*outputPath, meta, params); err != nil {
 		logger.Error("export", "err", err)
 		os.Exit(1)
 	}
-	logger.Info("exported GGUF", "path", *out, "tensors", len(params))
+	logger.Info("exported GGUF", "path", *outputPath, "tensors", len(params))
 }

@@ -27,7 +27,7 @@ gonano already saves checkpoints during training
 (`$GONANO_BASE_DIR/base_checkpoints/<tag>/model_<step>.gn`). This is the
 format you should use to move weights between gonano processes.
 
-Layout (`checkpoint/checkpoint.go`):
+Layout (`model/checkpoint/checkpoint.go`):
 
 ```
 magic "GONANO\x00\x01"          (8 bytes)
@@ -66,7 +66,7 @@ meta, params, err := checkpoint.Load("model_000200.gn")
 err = checkpoint.ExportGGUF("d4.gguf", meta, params)
 ```
 
-Implementation: `checkpoint/gguf.go` (`ExportGGUF`).
+Implementation: `model/checkpoint/gguf.go` (`ExportGGUF`).
 
 ### What is written
 
@@ -114,7 +114,7 @@ backout_lambda                             [1]
 
 ### Validating an export
 
-The GGUF writer is unit-tested (`checkpoint/gguf_test.go`): it writes the file
+The GGUF writer is unit-tested (`model/checkpoint/gguf_test.go`): it writes the file
 and reads it back with a minimal GGUF parser to verify the magic, version,
 metadata, tensor count, shapes, and raw float32 data. To inspect a file with a
 third-party tool:

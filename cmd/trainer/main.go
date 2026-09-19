@@ -11,29 +11,29 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cookiengineer/gonano/checkpoint"
 	"github.com/cookiengineer/gonano/data"
-	"github.com/cookiengineer/gonano/logging"
+	"github.com/cookiengineer/gonano/internal/logging"
 	"github.com/cookiengineer/gonano/model"
-	"github.com/cookiengineer/gonano/tensor"
+	"github.com/cookiengineer/gonano/model/checkpoint"
+	"github.com/cookiengineer/gonano/tensors"
 	"github.com/cookiengineer/gonano/tokenizer"
-	"github.com/cookiengineer/gonano/train"
+	"github.com/cookiengineer/gonano/trainer"
 )
 
 func main() {
 	var (
-		dataDir   string
-		format    string
+		dataDir       string
+		format        string
 		tokenizerPath string
-		trainTok  bool
-		vocabSize int
-		maxChars  int
-		depth     int
-		maxSeqLen int
-		numIter   int
-		batchSize int
-		modelTag  string
-		baseDir   string
+		trainTok      bool
+		vocabSize     int
+		maxChars      int
+		depth         int
+		maxSeqLen     int
+		numIterations int
+		batchSize     int
+		modelTag      string
+		baseDir       string
 	)
 	flag.StringVar(&dataDir, "data-dir", "", "directory of training data (.parquet or .md) (required)")
 	flag.StringVar(&format, "format", "parquet", "data format: parquet|markdown")
@@ -43,7 +43,7 @@ func main() {
 	flag.IntVar(&maxChars, "max-chars", 2000000000, "max characters for tokenizer training")
 	flag.IntVar(&depth, "depth", 12, "transformer depth (the complexity dial)")
 	flag.IntVar(&maxSeqLen, "max-seq-len", 512, "context length")
-	flag.IntVar(&numIter, "num-iterations", 50, "optimization steps")
+	flag.IntVar(&numIterations, "num-iterations", 50, "optimization steps")
 	flag.IntVar(&batchSize, "device-batch-size", 1, "sequences per step")
 	flag.StringVar(&modelTag, "model-tag", "", "checkpoint directory name (default d<depth>)")
 	flag.StringVar(&baseDir, "base-dir", "", "checkpoint/tokenizer directory (default ~/.cache/gonano)")
@@ -63,13 +63,13 @@ func main() {
 	}
 
 	// 1) Tokenizer setup.
-	tok := setupTokenizer(logger, baseDir, dataDir, format, tokenizerPath, trainTok, vocabSize, maxChars)
+	tokenizer := setupTokenizer(logger, baseDir, dataDir, format, tokenizerPath, trainTok, vocabSize, maxChars)
 
 	// 2) Model.
-	cfg := model.ConfigForDepth(depth, tok.VocabSize(), 64, 128, maxSeqLen, "SSSL")
-	m := model.NewTransformer(cfg)
-	m.InitWeights(tensor.NewRNG(42))
-	groups := m.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5)
+	configuration := model.ConfigForDepth(depth, tokenizer.VocabSize(), 64, 128, maxSeqLen, "SSSL")
+	model := model.NewTransformer(configuration)
+	model.InitWeights(tensors.NewRNG(42))
+	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5)
 
 	// 3) Data source.
 	source, err := newDocProvider(dataDir, format)
@@ -78,31 +78,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	loader := data.NewPretrainLoader(tok, batchSize, maxSeqLen, source, 1000)
+	loader := data.NewPretrainLoader(tokenizer, batchSize, maxSeqLen, source, 1000)
 	gradAccum := 1
-	tr := train.NewTrainer(m, groups, gradAccum)
+	trainer := trainer.NewTrainer(model, groups, gradAccum)
 
 	outputDir := filepath.Join(baseDir, "base_checkpoints", tagOrDepth(modelTag, depth))
 	os.MkdirAll(outputDir, 0o755)
 
-	logger.Info("training", "depth", depth, "dim", cfg.EmbedDim, "vocab", tok.VocabSize(),
-		"format", format, "params", m.TotalParams(), "steps", numIter)
-	for step := 0; step < numIter; step++ {
-		x, y, _ := loader.Next()
-		loss := tr.TrainStep(x, y)
-		tr.StepOptimizer(step, numIter)
-		if step%10 == 0 || step == numIter-1 {
+	logger.Info("training", "depth", depth, "dim", configuration.EmbedDim, "vocab", tokenizer.VocabSize(),
+		"format", format, "params", model.TotalParams(), "steps", numIterations)
+	for step := 0; step < numIterations; step++ {
+		inputs, targets, _ := loader.Next()
+		loss := trainer.TrainStep(inputs, targets)
+		trainer.StepOptimizer(step, numIterations)
+		if step%10 == 0 || step == numIterations-1 {
 			logger.Info("step", "step", step, "loss", fmt.Sprintf("%.4f", loss))
 		}
 	}
 
 	// 4) Save.
-	meta := checkpoint.Meta{Step: numIter, ModelConfig: cfg}
-	if err := checkpoint.Save(checkpoint.ModelPath(outputDir, numIter), meta, m.NamedParameters()); err != nil {
+	meta := checkpoint.Meta{Step: numIterations, ModelConfig: configuration}
+	if err := checkpoint.Save(checkpoint.ModelPath(outputDir, numIterations), meta, model.NamedParameters()); err != nil {
 		logger.Error("save", "err", err)
 		os.Exit(1)
 	}
-	logger.Info("saved checkpoint", "path", checkpoint.ModelPath(outputDir, numIter))
+	logger.Info("saved checkpoint", "path", checkpoint.ModelPath(outputDir, numIterations))
 }
 
 // setupTokenizer resolves the tokenizer in this order:
@@ -116,12 +116,12 @@ func setupTokenizer(logger *slog.Logger, baseDir, dataDir, format, tokenizerPath
 	defaultPath := filepath.Join(tokDir, "tokenizer.json")
 
 	if tokenizerPath != "" {
-		tok, err := tokenizer.LoadTokenizer(tokenizerPath)
+		tokenizer, err := tokenizer.LoadTokenizer(tokenizerPath)
 		if err != nil {
 			logger.Error("load --tokenizer", "err", err)
 			os.Exit(1)
 		}
-		return tok
+		return tokenizer
 	}
 
 	if trainTok {
@@ -132,26 +132,26 @@ func setupTokenizer(logger *slog.Logger, baseDir, dataDir, format, tokenizerPath
 			os.Exit(1)
 		}
 		ranks := data.TrainTokenizer(provider, vocabSize, maxChars)
-		tok := tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
-		if err := tok.Save(defaultPath); err != nil {
+		tokenizer := tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
+		if err := tokenizer.Save(defaultPath); err != nil {
 			logger.Error("save tokenizer", "err", err)
 			os.Exit(1)
 		}
-		logger.Info("saved tokenizer", "path", defaultPath, "vocab", tok.VocabSize())
-		return tok
+		logger.Info("saved tokenizer", "path", defaultPath, "vocab", tokenizer.VocabSize())
+		return tokenizer
 	}
 
-	if tok, err := tokenizer.LoadTokenizer(defaultPath); err == nil {
-		return tok
+	if tokenizer, err := tokenizer.LoadTokenizer(defaultPath); err == nil {
+		return tokenizer
 	}
 
 	// Fallback: a byte-level tokenizer.
 	logger.Warn("no tokenizer found; using a byte-level default", "path", defaultPath)
-	tok := byteTokenizer()
-	if err := tok.Save(defaultPath); err != nil {
+	tokenizer := byteTokenizer()
+	if err := tokenizer.Save(defaultPath); err != nil {
 		logger.Warn("could not save default tokenizer", "err", err)
 	}
-	return tok
+	return tokenizer
 }
 
 // newDocProvider builds a document provider for the given directory + format.
@@ -182,8 +182,8 @@ func tagOrDepth(tag string, depth int) string {
 
 func byteTokenizer() *tokenizer.Tokenizer {
 	ranks := make(map[string]int, 256)
-	for i := 0; i < 256; i++ {
-		ranks[string([]byte{byte(i)})] = i
+	for index := 0; index < 256; index++ {
+		ranks[string([]byte{byte(index)})] = index
 	}
 	return tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
 }
