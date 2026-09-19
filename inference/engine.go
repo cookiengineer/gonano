@@ -45,6 +45,9 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 		if ratio := config.Compression(); ratio > 1 {
 			kvWidth := config.NumKVHead * headDim
 			prefillCache.EnableCompression(ratio, config.EmbedDim, kvWidth, len(tokens)/ratio+1)
+			if config.SparseTopK > 0 {
+				prefillCache.EnableIndexerKeys(indexerKeyWidth(config))
+			}
 		}
 		inputIDs := tensors.NewInt32sWithData([]int{1, len(tokens)}, toI32(tokens))
 		logits := engine.Model.Forward(inputIDs, prefillCache) // [1, T, vocab]
@@ -67,6 +70,9 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 		if ratio := config.Compression(); ratio > 1 {
 			kvWidth := config.NumKVHead * headDim
 			decodeCache.EnableCompression(ratio, config.EmbedDim, kvWidth, cacheLen/ratio+1)
+			if config.SparseTopK > 0 {
+				decodeCache.EnableIndexerKeys(indexerKeyWidth(config))
+			}
 		}
 		model.PrefillFrom(decodeCache, prefillCache)
 
@@ -196,6 +202,19 @@ func (engine *Engine) GenerateBatch(tokens []int, numSamples, maxTokens int, tem
 		return false
 	})
 	return results, masks
+}
+
+// indexerKeyWidth returns the cached indexer key width for a config.
+func indexerKeyWidth(config model.Config) int {
+	dim := config.IndexerDim
+	if dim <= 0 {
+		dim = 64
+	}
+	heads := config.IndexerHeads
+	if heads <= 0 {
+		heads = 1
+	}
+	return dim * heads
 }
 
 func toI32(ids []int) []int32 {

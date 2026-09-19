@@ -235,6 +235,150 @@ func SelectBlocks(scores *tensors.Tensor, positionOffset, ratio, topK int) [][]i
 	return selection
 }
 
+// argsortDescending returns indices ordered by descending value, ties broken
+// toward the smaller index.
+func argsortDescending(values []float32) []int {
+	order := make([]int, len(values))
+	for index := range order {
+		order[index] = index
+	}
+	sort.SliceStable(order, func(left, right int) bool {
+		if values[order[left]] != values[order[right]] {
+			return values[order[left]] > values[order[right]]
+		}
+		return order[left] < order[right]
+	})
+	return order
+}
+
+// HierarchicalSelect is the two-level indexer of DeepSeek-V4.1 (§2.3.2).
+// Compressed entries are grouped into super-blocks of `pool` entries; the query
+// is scored against pooled key representations, the best super-blocks are
+// chosen, and only the entries inside those super-blocks are scored in full.
+// The number of fully scored entries per token is bounded by candidateBudget,
+// which makes deeper indexers constant-cost instead of linear in context
+// length.
+func (indexer *SparseIndexer) HierarchicalSelect(hidden, compressed *tensors.Tensor, positionOffset, ratio, topK, pool, candidateBudget int) [][]int {
+	key := indexer.key.Forward(compressed) // [B*blocks, H, dim]
+	return indexer.SelectProjected(hidden, key.Data, compressed.Shape[1], positionOffset, ratio, topK, pool, candidateBudget)
+}
+
+// SelectProjected runs the hierarchical selection against precomputed key
+// projections [batch*blocks*H*dim]. Caching these projections lets decode skip
+// re-projecting every compressed key on each step.
+func (indexer *SparseIndexer) SelectProjected(hidden *tensors.Tensor, keyProjections []float32, blockCount, positionOffset, ratio, topK, pool, candidateBudget int) [][]int {
+	if pool < 1 {
+		pool = 1
+	}
+	batchSize := hidden.Shape[0]
+	sequenceLength := hidden.Shape[1]
+	dim := indexer.Dim
+	headCount := indexer.HeadCount
+
+	query := indexer.query.Forward(hidden) // [B*T, H, dim]
+	queryData := query.Data
+	keyData := keyProjections
+	weightData := indexer.headWeights.Data
+	headWidth := headCount * dim
+
+	groupsPerToken := (candidateBudget + pool - 1) / pool
+	if groupsPerToken < 1 {
+		groupsPerToken = 1
+	}
+
+	selection := make([][]int, batchSize*sequenceLength)
+	for batch := 0; batch < batchSize; batch++ {
+		batchKeyBase := batch * blockCount * headWidth
+		groups := (blockCount + pool - 1) / pool
+		pooled := make([]float32, groups*headWidth)
+		for group := 0; group < groups; group++ {
+			start := group * pool
+			end := min(start+pool, blockCount)
+			count := end - start
+			if count <= 0 {
+				continue
+			}
+			for element := 0; element < headWidth; element++ {
+				var sum float32
+				for entry := start; entry < end; entry++ {
+					sum += keyData[batchKeyBase+entry*headWidth+element]
+				}
+				pooled[group*headWidth+element] = sum / float32(count)
+			}
+		}
+
+		for token := 0; token < sequenceLength; token++ {
+			row := batch*sequenceLength + token
+			allowed := (positionOffset + token) / ratio
+			if allowed > blockCount {
+				allowed = blockCount
+			}
+			if allowed <= 0 || topK <= 0 {
+				selection[row] = []int{}
+				continue
+			}
+			queryBase := row * headWidth
+
+			allowedGroups := (allowed + pool - 1) / pool
+			coarse := make([]float32, allowedGroups)
+			for group := 0; group < allowedGroups; group++ {
+				var total float32
+				for head := 0; head < headCount; head++ {
+					var dot float32
+					for dimension := 0; dimension < dim; dimension++ {
+						dot += queryData[queryBase+head*dim+dimension] * pooled[group*headWidth+head*dim+dimension]
+					}
+					if dot > 0 {
+						total += weightData[head] * dot
+					}
+				}
+				coarse[group] = total
+			}
+
+			chosenGroups := argsortDescending(coarse)
+			if len(chosenGroups) > groupsPerToken {
+				chosenGroups = chosenGroups[:groupsPerToken]
+			}
+			candidates := make([]int, 0, groupsPerToken*pool)
+			for _, group := range chosenGroups {
+				start := group * pool
+				end := min(start+pool, allowed)
+				for entry := start; entry < end; entry++ {
+					candidates = append(candidates, entry)
+				}
+			}
+			if len(candidates) == 0 {
+				selection[row] = []int{}
+				continue
+			}
+
+			fine := make([]float32, len(candidates))
+			for index, entry := range candidates {
+				var total float32
+				for head := 0; head < headCount; head++ {
+					var dot float32
+					entryBase := batchKeyBase + entry*headWidth + head*dim
+					for dimension := 0; dimension < dim; dimension++ {
+						dot += queryData[queryBase+head*dim+dimension] * keyData[entryBase+dimension]
+					}
+					if dot > 0 {
+						total += weightData[head] * dot
+					}
+				}
+				fine[index] = total
+			}
+			order := argsortDescending(fine)
+			count := min(topK, len(order))
+			selected := make([]int, count)
+			for index := 0; index < count; index++ {
+				selected[index] = candidates[order[index]]
+			}
+			selection[row] = selected
+		}
+	}
+	return selection
+}
+
 // Parameters returns the indexer's trainable tensors.
 func (indexer *SparseIndexer) Parameters() []*tensors.Tensor {
 	return []*tensors.Tensor{indexer.query.Weight, indexer.key.Weight, indexer.headWeights}

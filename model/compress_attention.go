@@ -409,6 +409,10 @@ func (attention *CausalSelfAttention) compressTail(cache *KVBuffer, layer, batch
 			compressedKey, _ := attention.compressor.Forward(hidden, keyHead)
 			compressedValue, _ := attention.compressor.Forward(hidden, valueHead)
 			cache.AppendCompressed(layer, batch, head, compressedKey.Data, compressedValue.Data)
+			if attention.indexer != nil {
+				projected := attention.indexer.key.Forward(compressedKey)
+				cache.AppendIndexerKey(layer, batch, head, projected.Data)
+			}
 		}
 	}
 	cache.AdvanceCompressedCount(layer)
@@ -499,9 +503,21 @@ func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMa
 			if available > 0 {
 				keyData = cache.CompressedKey(layer, batch, keyValueHead, available)
 				valueData = cache.CompressedValue(layer, batch, keyValueHead, available)
-				compressed := tensors.NewWithData([]int{1, available, headDimension}, keyData)
-				scores := attention.indexer.Scores(hiddenSlice, compressed)
-				selection = SelectBlocks(scores, positionOffset, ratio, topK)
+				projectedKeys := cache.IndexerKey(layer, batch, keyValueHead, available)
+				if projectedKeys == nil {
+					compressed := tensors.NewWithData([]int{1, available, headDimension}, keyData)
+					projectedKeys = attention.indexer.key.Forward(compressed).Data
+				}
+				pool := attention.indexerPool
+				if pool < 1 {
+					pool = 1
+				}
+				budget := attention.indexerCandidates
+				if pool == 1 {
+					// Flat selection: score every available entry.
+					budget = available
+				}
+				selection = attention.indexer.SelectProjected(hiddenSlice, projectedKeys, available, positionOffset, ratio, topK, pool, budget)
 			}
 			keyBuffer := make([]float32, topK*headDimension)
 			valueBuffer := make([]float32, topK*headDimension)

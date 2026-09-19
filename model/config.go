@@ -38,6 +38,25 @@ type Config struct {
 	// IndexerLossWeight scales the indexer distillation loss used to train the
 	// sparse selection. Zero uses the default of 1.
 	IndexerLossWeight float32 `json:"indexer_loss_weight,omitempty"`
+	// IndexerPool enables the hierarchical (coarse-to-fine) indexer: compressed
+	// entries are pooled into super-blocks of this size before fine scoring.
+	// Zero or one disables it.
+	IndexerPool int `json:"indexer_pool,omitempty"`
+	// IndexerCandidates bounds the number of entries fully scored per token by
+	// the hierarchical indexer. Zero uses 8*SparseTopK (minimum 64).
+	IndexerCandidates int `json:"indexer_candidates,omitempty"`
+}
+
+// IndexerCandidateBudget returns the hierarchical indexer candidate budget.
+func (config Config) IndexerCandidateBudget() int {
+	if config.IndexerCandidates > 0 {
+		return config.IndexerCandidates
+	}
+	budget := 8 * config.SparseTopK
+	if budget < 64 {
+		budget = 64
+	}
+	return budget
 }
 
 // IndexerWeight returns the effective indexer distillation loss weight.

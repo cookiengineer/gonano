@@ -176,6 +176,40 @@ func TestSparseIndexerGradient(t *testing.T) {
 	}
 }
 
+func TestHierarchicalSelectMatchesFullWhenUnbounded(t *testing.T) {
+	indexer, hidden, compressed := testIndexer()
+	scores := indexer.Scores(hidden, compressed)
+	full := SelectBlocks(scores, 0, 2, 2)
+	for _, pool := range []int{1, 2, 3} {
+		hierarchical := indexer.HierarchicalSelect(hidden, compressed, 0, 2, 2, pool, 1000)
+		for row := range full {
+			if len(hierarchical[row]) != len(full[row]) {
+				t.Fatalf("pool %d row %d: length %d, want %d", pool, row, len(hierarchical[row]), len(full[row]))
+			}
+			for index := range full[row] {
+				if hierarchical[row][index] != full[row][index] {
+					t.Fatalf("pool %d row %d: selection %v, want %v", pool, row, hierarchical[row], full[row])
+				}
+			}
+		}
+	}
+}
+
+func TestHierarchicalSelectRespectsCausality(t *testing.T) {
+	indexer, hidden, compressed := testIndexer()
+	selection := indexer.HierarchicalSelect(hidden, compressed, 0, 2, 2, 2, 2)
+	if len(selection[0]) != 0 {
+		t.Fatalf("token 0 must have no preceding block, got %v", selection[0])
+	}
+	for _, row := range selection {
+		for _, block := range row {
+			if block < 0 || block >= compressed.Shape[1] {
+				t.Fatalf("selected out-of-range block %d", block)
+			}
+		}
+	}
+}
+
 func TestSelectBlocksRespectsCausalityAndTopK(t *testing.T) {
 	// 5 tokens, 4 blocks, ratio 2: token t may use blocks < t/2.
 	// Scores.put the highest scores at later blocks so causality matters.

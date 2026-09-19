@@ -250,6 +250,36 @@ func TestEngineMatchesRecomputeSparseCompressed(test *testing.T) {
 	}
 }
 
+func TestEngineMatchesRecomputeHierarchicalSparse(test *testing.T) {
+	config := model.Config{
+		SequenceLen: 16, VocabSize: 32, NumLayer: 2, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L", CompressionRatio: 2, SparseTopK: 2,
+		IndexerDim: 4, IndexerPool: 2, IndexerCandidates: 1000,
+	}
+	transformer := model.NewTransformer(config)
+	transformer.InitWeights(tensors.NewRNG(42))
+	ranks := make(map[string]int, 256)
+	for index := 0; index < 256; index++ {
+		ranks[string([]byte{byte(index)})] = index
+	}
+	tokenizerImpl := tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
+	engine := NewEngine(transformer, tokenizerImpl)
+	prompt := []int{1, 5, 2, 8, 3, 7, 4, 6}
+
+	want := compressedReference(transformer, prompt, 6)
+	got, _ := engine.GenerateBatch(prompt, 1, 6, 0, 0, 7)
+
+	limit := len(want)
+	if len(got[0]) < limit {
+		limit = len(got[0])
+	}
+	for index := 0; index < limit; index++ {
+		if got[0][index] != want[index] {
+			test.Fatalf("token %d: engine=%d recompute=%d", index, got[0][index], want[index])
+		}
+	}
+}
+
 func TestEngineMatchesRecomputeCompressed(test *testing.T) {
 	transformer, tokenizerImpl := testCompressedEngineModel()
 	engine := NewEngine(transformer, tokenizerImpl)

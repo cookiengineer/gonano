@@ -27,6 +27,8 @@ func main() {
 	qat := flag.String("qat", "", "quantization-aware training mode (\"\" or int8)")
 	sparseTopK := flag.Int("sparse-topk", 0, "CSA sparse attention top-k compressed blocks (0 disables)")
 	indexerDim := flag.Int("indexer-dim", 64, "lightning indexer per-head dimension")
+	indexerPool := flag.Int("indexer-pool", 0, "hierarchical indexer super-block size (0 disables)")
+	indexerCandidates := flag.Int("indexer-candidates", 0, "hierarchical indexer candidate budget (0 = auto)")
 	vocabSize := flag.Int("vocab-size", 32768, "vocabulary size")
 	numIterations := flag.Int("num-iterations", 50, "optimization steps")
 	deviceBatchSize := flag.Int("device-batch-size", 1, "per-step batch size")
@@ -62,6 +64,8 @@ func main() {
 	configuration.QAT = *qat
 	configuration.SparseTopK = *sparseTopK
 	configuration.IndexerDim = *indexerDim
+	configuration.IndexerPool = *indexerPool
+	configuration.IndexerCandidates = *indexerCandidates
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 

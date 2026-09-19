@@ -22,23 +22,25 @@ import (
 
 func main() {
 	var (
-		dataDir          string
-		format           string
-		tokenizerPath    string
-		trainTok         bool
-		vocabSize        int
-		maxChars         int
-		depth            int
-		maxSeqLen        int
-		kvHeadRatio      int
-		compressionRatio int
-		qat              string
-		sparseTopK       int
-		indexerDim       int
-		numIterations    int
-		batchSize        int
-		modelTag         string
-		baseDir          string
+		dataDir           string
+		format            string
+		tokenizerPath     string
+		trainTok          bool
+		vocabSize         int
+		maxChars          int
+		depth             int
+		maxSeqLen         int
+		kvHeadRatio       int
+		compressionRatio  int
+		qat               string
+		sparseTopK        int
+		indexerDim        int
+		indexerPool       int
+		indexerCandidates int
+		numIterations     int
+		batchSize         int
+		modelTag          string
+		baseDir           string
 	)
 	flag.StringVar(&dataDir, "data-dir", "", "directory of training data (.parquet or .md) (required)")
 	flag.StringVar(&format, "format", "parquet", "data format: parquet|markdown")
@@ -53,6 +55,8 @@ func main() {
 	flag.StringVar(&qat, "qat", "", "quantization-aware training mode (\"\" or int8)")
 	flag.IntVar(&sparseTopK, "sparse-topk", 0, "CSA sparse attention top-k compressed blocks (0 disables)")
 	flag.IntVar(&indexerDim, "indexer-dim", 64, "lightning indexer per-head dimension")
+	flag.IntVar(&indexerPool, "indexer-pool", 0, "hierarchical indexer super-block size (0 disables)")
+	flag.IntVar(&indexerCandidates, "indexer-candidates", 0, "hierarchical indexer candidate budget (0 = auto)")
 	flag.IntVar(&numIterations, "num-iterations", 50, "optimization steps")
 	flag.IntVar(&batchSize, "device-batch-size", 1, "sequences per step")
 	flag.StringVar(&modelTag, "model-tag", "", "checkpoint directory name (default d<depth>)")
@@ -81,6 +85,8 @@ func main() {
 	configuration.QAT = qat
 	configuration.SparseTopK = sparseTopK
 	configuration.IndexerDim = indexerDim
+	configuration.IndexerPool = indexerPool
+	configuration.IndexerCandidates = indexerCandidates
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5)

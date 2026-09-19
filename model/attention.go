@@ -94,6 +94,8 @@ type CausalSelfAttention struct {
 	indexer           *SparseIndexer
 	sparseTopK        int
 	indexerLossWeight float32
+	indexerPool       int
+	indexerCandidates int
 }
 
 // NewCausalSelfAttention builds an attention layer. hasValueEmbedding selects
@@ -120,6 +122,8 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool) *Causa
 			dim, heads := configuration.indexerDefaults()
 			attention.sparseTopK = configuration.SparseTopK
 			attention.indexerLossWeight = configuration.IndexerWeight()
+			attention.indexerPool = configuration.IndexerPool
+			attention.indexerCandidates = configuration.IndexerCandidateBudget()
 			attention.indexer = NewSparseIndexer(configuration.EmbedDim, headDimension, dim, heads)
 		}
 	}

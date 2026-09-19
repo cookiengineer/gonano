@@ -45,6 +45,10 @@ type KVBuffer struct {
 	compressedValue [][]*tensors.Tensor
 	// compressedCount[layer][batch] is the number of complete blocks.
 	compressedCount [][]int
+	// indexerKey[layer][batch*kvHead] caches the indexer key projections of the
+	// compressed entries as [maxBlocks, indexerKeyWidth].
+	indexerKeyWidth int
+	indexerKey      [][]*tensors.Tensor
 }
 
 // NewKVBuffer allocates a zeroed KV cache for the given model geometry.
@@ -151,6 +155,40 @@ func (cache *KVBuffer) EnableCompression(ratio, embeddingDimension, kvWidth, max
 	}
 }
 
+// EnableIndexerKeys allocates the cached indexer key projections, one
+// [maxBlocks, width] buffer per (layer, row, kv-head). EnableCompression must
+// be called first.
+func (cache *KVBuffer) EnableIndexerKeys(width int) {
+	cache.indexerKeyWidth = width
+	cache.indexerKey = make([][]*tensors.Tensor, cache.layerCount)
+	for layer := 0; layer < cache.layerCount; layer++ {
+		cache.indexerKey[layer] = make([]*tensors.Tensor, cache.batchSize*cache.keyValueHeadCount)
+		for index := range cache.indexerKey[layer] {
+			cache.indexerKey[layer][index] = tensors.New(cache.compressedMaxBlocks, width)
+		}
+	}
+}
+
+// AppendIndexerKey stores the indexer key projection of one compressed entry.
+func (cache *KVBuffer) AppendIndexerKey(layer, batch, head int, key []float32) {
+	if cache.indexerKey == nil {
+		return
+	}
+	count := cache.compressedCount[layer][batch]
+	index := batch*cache.keyValueHeadCount + head
+	copy(cache.indexerKey[layer][index].Data[count*cache.indexerKeyWidth:], key)
+}
+
+// IndexerKey returns the first count cached indexer key projections for a
+// (row, kv-head).
+func (cache *KVBuffer) IndexerKey(layer, batch, head, count int) []float32 {
+	if cache.indexerKey == nil {
+		return nil
+	}
+	index := batch*cache.keyValueHeadCount + head
+	return cache.indexerKey[layer][index].Data[:count*cache.indexerKeyWidth]
+}
+
 // CompressionEnabled reports whether compression state was allocated.
 func (cache *KVBuffer) CompressionEnabled() bool { return cache.compressionRatio > 1 }
 
@@ -255,6 +293,10 @@ func PrefillFrom(destination, source *KVBuffer) {
 					destinationIndex := batch*destination.keyValueHeadCount + head
 					copy(destination.compressedKey[layer][destinationIndex].Data[:sourceCount*headDimension], source.compressedKey[layer][head].Data[:sourceCount*headDimension])
 					copy(destination.compressedValue[layer][destinationIndex].Data[:sourceCount*headDimension], source.compressedValue[layer][head].Data[:sourceCount*headDimension])
+					if destination.indexerKey != nil && source.indexerKey != nil {
+						indexerWidth := source.indexerKey[layer][head].Shape[1]
+						copy(destination.indexerKey[layer][destinationIndex].Data[:sourceCount*indexerWidth], source.indexerKey[layer][head].Data[:sourceCount*indexerWidth])
+					}
 				}
 			}
 		}
