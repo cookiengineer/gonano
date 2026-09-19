@@ -56,6 +56,37 @@ type Config struct {
 	// historical global-only compressed attention. It is ignored unless
 	// CompressionRatio > 1.
 	SWAWindow int `json:"swa_window,omitempty"`
+	// CED enables the Causal Encoder-Decoder split (DeepSeek-V4.1 §2.2). The
+	// bottom half of the layers is a causal encoder; the top half is a decoder
+	// whose global (compressed) keys/values are projected from the encoder's
+	// final hidden state rather than from the decoder layer's own hidden state.
+	// The decoder's local sliding-window branch still reads its own hidden
+	// state. CED requires compression and a local window.
+	CED bool `json:"ced,omitempty"`
+}
+
+// CEDEnabled reports whether the causal encoder-decoder split is active.
+func (config Config) CEDEnabled() bool { return config.CED }
+
+// CEDSplit returns the first decoder layer index, or 0 when CED is disabled.
+// The encoder is layers [0, CEDSplit) and the decoder is [CEDSplit, NumLayer).
+func (config Config) CEDSplit() int {
+	if !config.CED {
+		return 0
+	}
+	return config.NumLayer / 2
+}
+
+// IsEncoderLayer reports whether a layer belongs to the CED causal encoder.
+func (config Config) IsEncoderLayer(layer int) bool {
+	split := config.CEDSplit()
+	return split > 0 && layer < split
+}
+
+// IsDecoderLayer reports whether a layer belongs to the CED decoder.
+func (config Config) IsDecoderLayer(layer int) bool {
+	split := config.CEDSplit()
+	return split > 0 && layer >= split
 }
 
 // ReuseMode is the per-layer compressed-attention reuse role.
@@ -70,14 +101,27 @@ const (
 	ReuseReuse
 )
 
+// reuseHalfStart returns the first layer of the reuse cycle that contains the
+// given layer. Under CED the pattern restarts at the decoder split so that a
+// decoder group never borrows an encoder layer's compressed KV. Without CED the
+// cycle always starts at layer zero.
+func (config Config) reuseHalfStart(layer int) int {
+	if config.CED && layer >= config.CEDSplit() && config.CEDSplit() > 0 {
+		return config.CEDSplit()
+	}
+	return 0
+}
+
 // ReuseModeAt returns the reuse mode of a layer, cycling the configured
-// pattern. An empty pattern yields ReuseFull for every layer.
+// pattern. An empty pattern yields ReuseFull for every layer. Under CED the
+// pattern is applied independently to the encoder and decoder halves.
 func (config Config) ReuseModeAt(layer int) ReuseMode {
 	pattern := config.ReusePattern
 	if len(pattern) == 0 {
 		return ReuseFull
 	}
-	switch pattern[layer%len(pattern)] {
+	start := config.reuseHalfStart(layer)
+	switch pattern[(layer-start)%len(pattern)] {
 	case 'R', 'r':
 		return ReuseReindex
 	case 'U', 'u':
@@ -106,7 +150,7 @@ func (config Config) ReuseProducer(layer int) int {
 	if config.ReuseModeAt(layer) == ReuseFull {
 		return layer
 	}
-	for index := layer - 1; index >= 0; index-- {
+	for index := layer - 1; index >= config.reuseHalfStart(layer); index-- {
 		if config.ReuseModeAt(index) == ReuseFull {
 			return index
 		}
@@ -223,6 +267,20 @@ func (config Config) Validate() {
 		}
 		if config.ReuseModeAt(0) != ReuseFull {
 			panic(fmt.Sprintf("model: reuse pattern %q must start with F", config.ReusePattern))
+		}
+	}
+	if config.CED {
+		if config.Compression() <= 1 {
+			panic("model: CED requires CompressionRatio > 1")
+		}
+		if config.SWAWindowSize() <= 0 {
+			panic("model: CED requires SWAWindow > 0")
+		}
+		if config.NumLayer < 2 {
+			panic(fmt.Sprintf("model: CED requires NumLayer >= 2, got %d", config.NumLayer))
+		}
+		if config.ReusePattern != "" && config.ReuseModeAt(config.CEDSplit()) != ReuseFull {
+			panic(fmt.Sprintf("model: CED reuse pattern %q must start each half with F", config.ReusePattern))
 		}
 	}
 }

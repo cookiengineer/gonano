@@ -34,7 +34,17 @@ its own row, so the cells are not one single end-to-end run.
 | Rank-1 score-tile GEMM | attention kernel, seq 1024 | 1.25× | — | — | — |
 | HCA dense KV compression (÷4 sequence) | uncompressed, seq 4096 | 0.7–0.8× | 1.37× | 1.02× | 1.14× |
 | CSA sparse attention + hierarchical indexer | compression-only, seq 4096 | ~1.5× | 0.96× | 1.27× | 1.29× |
-| Compression + sparsity (recommended config) | uncompressed, seq 4096 | 1.05–1.23× | 1.31× | 1.29× | 1.48× |
+| Compression + sparsity | uncompressed, seq 4096 | 1.05–1.23× | 1.31× | 1.29× | 1.48× |
+| Compression + sparsity + SWA + CED (recommended, long context) | uncompressed, seq 16384 | ~3.3× | 1.6× | 1.8× | 2.1× |
+
+**Recommended configuration:** for long-context workloads enable the full stack,
+`--compression-ratio 4 --sparse-topk 8 --swa-window 128 --ced`. It is the best
+combined result: prefill ≈3.3× and decode ≈1.6–2.1× versus uncompressed at seq
+16384, because CED's bounded replay cuts prefill by another ≈1.5× over SWA-only
+without a measurable decode cost. The one exception is a **decode-only**
+workload with short prompts, where plain `--compression-ratio 4 --sparse-topk 8`
+(no SWA/CED) is ~10–15% faster on decode; SWA and CED trade that decode margin
+for local fidelity and the large prefill win.
 
 Architectural features that reduce memory rather than latency:
 
@@ -65,17 +75,61 @@ throughput at short context; the cost does not grow with context. Depth-4 models
 |:------|----:|----------:|----------------:|----:|----:|
 | compression + sparsity | 4096 | 854–1012 | 1152 | 1610 | 2003 |
 | + SWA (`--swa-window 128`) | 4096 | 1051–1173 | 912 | 1449 | 1773 |
+| + CED (`--ced`) | 4096 | 739–752 | 975 | 1460 | 1785 |
 | compression + sparsity | 16384 | 4566–5023 | 427 | 779 | 872 |
 | + SWA (`--swa-window 128`) | 16384 | 5269–5956 | 465 | 735 | 831 |
+| + CED (`--ced`) | 16384 | 3604–3641 | 530 | 745 | 855 |
 | uncompressed (reference) | 16384 | 11691–12825 | 325 | 408 | 412 |
 
 SWA costs ≈ 10–15% decode and ≈ 11–19% prefill versus compression-only at seq
 4096, narrowing to ≈ 5–13% decode at seq 16384. Against the uncompressed
 reference the **compression + sparsity + SWA stack is still ≈ 2.0× decode and
-≈ 2.2× prefill at seq 16384** — the local branch is what retains local fidelity,
-and it is the prerequisite for the CED encoder/decoder split (decoder global KV
-projected from the encoder hidden state) whose bounded-replay prefill is the
-next milestone.
+≈ 2.2× prefill at seq 16384** — the local branch is what retains local fidelity.
+
+CED shares the SWA config (`--compression-ratio 4 --sparse-topk 8
+--swa-window 128`) and cuts prefill TTFT by **≈1.4–1.6× at seq 4096 and
+≈1.46–1.51× at seq 16384** versus SWA-only, while decode stays within the
+run-to-run spread: decode still runs every layer per token, so CED only adds the
+decoder's global K/V projection at decode time. The bounded replay's window
+bounds the decoder prefill work independent of context length, which is why the
+prefill saving holds from 4k to 16k.
+
+### Causal encoder-decoder prefill
+
+`--ced` activates the Causal Encoder-Decoder split (DeepSeek-V4.1 §2.2). The
+bottom half of the layers `[0, d/2)` is a causal encoder; the top half
+`[d/2, d)` is a decoder whose **global compressed keys/values are projected from
+the encoder's final hidden state** rather than from each decoder layer's own
+hidden state. The decoder's local sliding-window keys/values still come from its
+own hidden state, and the layer's own query, MLP, and output projections are
+unchanged. The projection reuses each decoder layer's existing K/V projections
+and compressor, so `--ced` adds **no parameters and no new cache layout**.
+
+Prefill is encoder-only plus a **bounded replay**: the encoder runs over the
+full prompt and fills every decoder layer's global compressed cache (and
+indexer keys) from its final hidden state; the decoder is then replayed over
+only the last `--swa-window` tokens to rebuild its local state. The last prompt
+position's logits remain exact when the window covers the replay segment, the
+decoder SWA state is used for decoding but never persisted as prefix cache, and
+decode is unchanged because every layer still runs per token.
+
+`--ced` requires `--compression-ratio > 1` and `--swa-window > 0`. The M6.1
+`--reuse-pattern` is applied independently within each half (restarting at the
+decoder split), so a decoder group never borrows an encoder layer's cache; the
+decoder producer projects the shared cache from the encoder hidden state.
+
+A/B benchmark (depth 4, ratio 4, top-k 8, pool 8, `--swa-window 128`, prompt ≈
+seq, decode 16, `GOMAXPROCS=16`; see the table above and the Features table):
+
+| config | seq | TTFT (ms) | prefill tok/s ×1 | ×16 | ×64 |
+|:-------|----:|----------:|-----------------:|----:|----:|
+| compression + sparsity + SWA | 4096 | 1051–1173 | 13–15 | 207–210 | 600–603 |
+| + CED (`--ced`) | 4096 | 739–752 | 21 | 271–275 | 716–730 |
+| compression + sparsity + SWA | 16384 | 5256–5490 | 3 | 44 | 145–147 |
+| + CED (`--ced`) | 16384 | 3604–3641 | 4 | 62 | 192–195 |
+
+Decode token rates are unchanged within noise (4k ≈ 975/1460/1785 tok/s,
+16k ≈ 530/745/855 tok/s at batch 1/16/64).
 
 ### Notes
 

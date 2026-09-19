@@ -50,11 +50,20 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 			}
 		}
 		inputIDs := tensors.NewInt32sWithData([]int{1, len(tokens)}, toI32(tokens))
-		logits := engine.Model.Forward(inputIDs, prefillCache) // [1, T, vocab]
+		var logits *tensors.Tensor
+		if config.CEDEnabled() {
+			// The causal encoder-decoder prefill runs the encoder over the full
+			// prompt and replays only the last window tokens through the
+			// decoder; the returned logits cover that replay.
+			logits = engine.Model.PrefillCED(inputIDs, prefillCache)
+		} else {
+			logits = engine.Model.Forward(inputIDs, prefillCache) // [1, T, vocab]
+		}
 		vocab := config.VocabSize
-		lastLogits := logits.Reshape(len(tokens), vocab)
+		rows := logits.Shape[1]
+		lastLogits := logits.Reshape(rows, vocab)
 		// Expand the last position's logits to numSamples rows.
-		base := lastLogits.Data[(len(tokens)-1)*vocab : len(tokens)*vocab]
+		base := lastLogits.Data[(rows-1)*vocab : rows*vocab]
 		expanded := make([]float32, numSamples*vocab)
 		for index := 0; index < numSamples; index++ {
 			copy(expanded[index*vocab:], base)

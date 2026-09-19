@@ -22,11 +22,14 @@ func negateSineTable(sine *tensors.Tensor) *tensors.Tensor {
 // attentionContext holds the activations saved by the training attention
 // forward.
 type attentionContext struct {
-	queryRotary     *tensors.Tensor // [B,T,Hq,D] post-rotary, pre-norm
-	keyRotary       *tensors.Tensor // [B,T,Hkv,D] post-rotary, pre-norm
-	queryHeadMajor  *tensors.Tensor // [B,Hq,T,D] post-norm+scale
-	keyHeadMajor    *tensors.Tensor // [B,Hkv,T,D] post-norm+scale
-	valueHeadMajor  *tensors.Tensor // [B,Hkv,T,D] final value (post gate)
+	queryRotary    *tensors.Tensor // [B,T,Hq,D] post-rotary, pre-norm
+	keyRotary      *tensors.Tensor // [B,T,Hkv,D] post-rotary, pre-norm
+	queryHeadMajor *tensors.Tensor // [B,Hq,T,D] post-norm+scale
+	keyHeadMajor   *tensors.Tensor // [B,Hkv,T,D] post-norm+scale
+	valueHeadMajor *tensors.Tensor // [B,Hkv,T,D] final value (post gate)
+	// cedKeyRotary is the CED global key (projected from the encoder hidden
+	// state) after RoPE and before the QK norm, needed by the backward pass.
+	cedKeyRotary    *tensors.Tensor // [B,T,Hkv,D] (CED decoder layers only)
 	logSumExp       *tensors.Tensor // [B,Hq,T] flash-attention statistic
 	outputHeadMajor *tensors.Tensor // [B,Hq,T,D] attention output (pre outputProjection)
 	window          int
@@ -81,8 +84,18 @@ func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cos
 
 	if attention.usesCompression() {
 		context.share = share
+		// CED decoder layers project their global keys/values from the encoder's
+		// final hidden state instead of the layer's own hidden state. The local
+		// sliding-window branch still uses the layer's own keys/values.
+		compressorInput := input
+		globalKeyHeadMajor := keyHeadMajor
+		globalValueHeadMajor := valueHeadMajor
+		if attention.ced && share != nil && share.encoderHidden != nil {
+			globalKeyHeadMajor, globalValueHeadMajor, context.cedKeyRotary = attention.cedGlobalKeyValue(share.encoderHidden, cosine, sine, positionOffset)
+			compressorInput = share.encoderHidden
+		}
 		if attention.reuseMode == ReuseFull {
-			context.compression = compressForward(attention.compressor, input, keyHeadMajor, valueHeadMajor, attention.compressionRatio)
+			context.compression = compressForward(attention.compressor, compressorInput, globalKeyHeadMajor, globalValueHeadMajor, attention.compressionRatio)
 			share.keyCompressed = context.compression.keyCompressed
 			share.valueCompressed = context.compression.valueCompressed
 			// Allocate the group's gradient accumulators up front so reuse
@@ -196,21 +209,38 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 				gradientKeyCompressed = tensors.New(batchSize, attention.keyValueHeadCount, context.compression.blocks, headDimension)
 				gradientValueCompressed = tensors.New(batchSize, attention.keyValueHeadCount, context.compression.blocks, headDimension)
 			}
+			var indexerInputGradient *tensors.Tensor
 			if attention.sparseTopK > 0 {
 				compressedAttentionBackwardSparse(context.queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed,
 					context.outputHeadMajor, gradientOutputHeadMajor, context.logSumExp, rowCorrection,
 					gradientQuery, gradientKeyCompressed, gradientValueCompressed, context.compression.selection, headRatio, attention.compressionRatio)
-				indexerInputGradient, indexerKeyGradient := attention.indexerDistillationGradient(context.compression)
+				var indexerKeyGradient *tensors.Tensor
+				indexerInputGradient, indexerKeyGradient = attention.indexerDistillationGradient(context.compression)
 				for element := range gradientKeyCompressed.Data {
 					gradientKeyCompressed.Data[element] += indexerKeyGradient.Data[element]
 				}
-				gradientInputFromCompressor, gradientKey, gradientValue = compressBackward(attention.compressor, context.compression, gradientKeyCompressed, gradientValueCompressed)
-				gradientInputFromCompressor = tensors.Add(gradientInputFromCompressor, indexerInputGradient)
 			} else {
 				compressedAttentionBackward(context.queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed,
 					context.outputHeadMajor, gradientOutputHeadMajor, context.logSumExp, rowCorrection,
 					gradientQuery, gradientKeyCompressed, gradientValueCompressed, headRatio, attention.compressionRatio)
-				gradientInputFromCompressor, gradientKey, gradientValue = compressBackward(attention.compressor, context.compression, gradientKeyCompressed, gradientValueCompressed)
+			}
+			gradientInputFromCompressor, gradientKey, gradientValue = compressBackward(attention.compressor, context.compression, gradientKeyCompressed, gradientValueCompressed)
+			if attention.ced {
+				// A CED decoder layer's global keys/values are projected from
+				// the encoder hidden state, so their gradients flow there rather
+				// than to this layer's own input. Only the indexer query and the
+				// local sliding-window branch touch the layer's own input.
+				gradientEncoder := gradientInputFromCompressor
+				gradientEncoder = tensors.Add(gradientEncoder, attention.cedKeyProjectionBackward(share.encoderHidden, context, gradientKey, cosine, sine, positionOffset))
+				gradientValueSequence := toBatchSequenceLayout(gradientValue).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount*headDimension)
+				gradientEncoder = tensors.Add(gradientEncoder, attention.valueProjection.Backward(share.encoderHidden, gradientValueSequence))
+				// Every decoder layer shares one accumulator, so add in place.
+				share.gradientEncoder = accumulateTensor(share.gradientEncoder, gradientEncoder)
+				gradientKey = tensors.New(batchSize, attention.keyValueHeadCount, sequenceLength, headDimension)
+				gradientValue = tensors.New(batchSize, attention.keyValueHeadCount, sequenceLength, headDimension)
+				gradientInputFromCompressor = indexerInputGradient
+			} else if indexerInputGradient != nil {
+				gradientInputFromCompressor = tensors.Add(gradientInputFromCompressor, indexerInputGradient)
 			}
 		} else {
 			// Reindex/Reuse contribute their compressed key/value gradients to
@@ -336,6 +366,33 @@ func normalizeLastDimBackward(input, gradientOutput *tensors.Tensor) *tensors.Te
 	lastDimension := input.Shape[len(input.Shape)-1]
 	rowCount := input.Numel() / lastDimension
 	return tensors.RMSNormBackward(input.Reshape(rowCount, lastDimension), gradientOutput.Reshape(rowCount, lastDimension), normEps).Reshape(input.Shape...)
+}
+
+// accumulateTensor adds source into destination in place and returns
+// destination, allocating it when nil. It is used to gather the CED decoder
+// global-KV gradients, which every decoder layer contributes to, into a single
+// encoder-hidden accumulator.
+func accumulateTensor(destination, source *tensors.Tensor) *tensors.Tensor {
+	if destination == nil {
+		return source
+	}
+	for index := range destination.Data {
+		destination.Data[index] += source.Data[index]
+	}
+	return destination
+}
+
+// cedKeyProjectionBackward backpropagates the head-major gradient of a CED
+// decoder's global key through the QK norm, RoPE, and the key projection. It
+// returns the gradient with respect to the encoder hidden state.
+func (attention *CausalSelfAttention) cedKeyProjectionBackward(encoderHidden *tensors.Tensor, context *attentionContext, gradientKeyHeadMajor, cosine, sine *tensors.Tensor, positionOffset int) *tensors.Tensor {
+	gradient := tensors.Scale(gradientKeyHeadMajor, qkScale)
+	gradientSequence := toBatchSequenceLayout(gradient)
+	gradientPreNorm := normalizeLastDimBackward(context.cedKeyRotary, gradientSequence)
+	negatedSine := negateSineTable(sine)
+	gradientProjected := ApplyRotary(gradientPreNorm, cosine, negatedSine, positionOffset)
+	flat := gradientProjected.Reshape(encoderHidden.Shape[0], encoderHidden.Shape[1], attention.keyValueHeadCount*attention.headDimension)
+	return attention.keyProjection.Backward(encoderHidden, flat)
 }
 
 // mlpContext holds activations for the MLP backward.

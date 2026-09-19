@@ -107,6 +107,13 @@ type CausalSelfAttention struct {
 	// compressed state this layer uses (== its own index on full layers).
 	reuseMode ReuseMode
 	producer  int
+
+	// ced marks a decoder layer of the causal encoder-decoder split. On such a
+	// layer the global compressed keys/values are projected from the encoder's
+	// final hidden state (held in the group's compressionShare) instead of the
+	// layer's own hidden state; the local sliding-window branch still reads the
+	// layer's own hidden state.
+	ced bool
 }
 
 // usesCompression reports whether the layer takes the compressed-attention
@@ -114,6 +121,22 @@ type CausalSelfAttention struct {
 // ratio is configured.
 func (attention *CausalSelfAttention) usesCompression() bool {
 	return attention.compressionRatio > 1
+}
+
+// cedGlobalKeyValue projects a decoder layer's encoder-hidden state into its
+// global keys and values using the layer's own projections, applying RoPE and
+// the QK norm to the key. It returns head-major key/value tensors plus the
+// post-rope, pre-norm key (needed by the backward pass). The value-embedding
+// gate does not apply to the global branch because it reads the layer's own
+// hidden state.
+func (attention *CausalSelfAttention) cedGlobalKeyValue(encoderHidden, cosine, sine *tensors.Tensor, positionOffset int) (keyHeadMajor, valueHeadMajor, keyRotary *tensors.Tensor) {
+	batchSize, sequenceLength := encoderHidden.Shape[0], encoderHidden.Shape[1]
+	key := attention.keyProjection.Forward(encoderHidden).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+	value := attention.valueProjection.Forward(encoderHidden).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+	key = ApplyRotary(key, cosine, sine, positionOffset)
+	keyRotary = key
+	key = tensors.Scale(normalizeLastDim(key), qkScale)
+	return toBatchHeadLayout(key), toBatchHeadLayout(value), keyRotary
 }
 
 // NewCausalSelfAttention builds an attention layer. hasValueEmbedding selects
@@ -132,6 +155,7 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool, layer 
 		outputProjection:   layers.NewLinear(configuration.EmbedDim, configuration.EmbedDim),
 		reuseMode:          configuration.ReuseModeAt(layer),
 		producer:           configuration.ReuseProducer(layer),
+		ced:                configuration.IsDecoderLayer(layer),
 	}
 	if hasValueEmbedding {
 		attention.valueEmbeddingGate = layers.NewLinear(veGateChannels, configuration.NumKVHead)
@@ -185,7 +209,17 @@ func (attention *CausalSelfAttention) Forward(input, valueEmbedding, cosine, sin
 		if cache == nil {
 			panic("model: compressed attention requires a KV cache during inference")
 		}
-		return attention.forwardCompressed(input, query, key, value, cache, layer, positionOffset, share)
+		// CED decoder layers project their global keys/values from the encoder's
+		// final hidden state. The local branch keeps using the layer's own
+		// keys/values.
+		var encoderHidden, cedKeySequence, cedValueSequence *tensors.Tensor
+		if attention.ced && share != nil && share.encoderHidden != nil {
+			encoderHidden = share.encoderHidden
+			keyHead, valueHead, _ := attention.cedGlobalKeyValue(encoderHidden, cosine, sine, positionOffset)
+			cedKeySequence = toBatchSequenceLayout(keyHead)
+			cedValueSequence = toBatchSequenceLayout(valueHead)
+		}
+		return attention.forwardCompressed(input, query, key, value, encoderHidden, cedKeySequence, cedValueSequence, cache, layer, positionOffset, share)
 	}
 
 	// Transpose to [batch, head, sequence, dim] so per-head slices are

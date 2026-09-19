@@ -38,6 +38,7 @@ func main() {
 		indexerCandidates int
 		reusePattern      string
 		swaWindow         int
+		ced               bool
 		numIterations     int
 		batchSize         int
 		modelTag          string
@@ -59,6 +60,7 @@ func main() {
 	flag.IntVar(&indexerCandidates, "indexer-candidates", 0, "hierarchical indexer candidate budget (0 = auto)")
 	flag.StringVar(&reusePattern, "reuse-pattern", "", "cross-layer reuse pattern of F/R/U per layer (empty = all full)")
 	flag.IntVar(&swaWindow, "swa-window", 0, "local sliding-window branch width on compressed layers (0 disables)")
+	flag.BoolVar(&ced, "ced", false, "causal encoder-decoder split (decoder global KV from the encoder hidden state; requires --compression-ratio and --swa-window)")
 	flag.IntVar(&numIterations, "num-iterations", 50, "optimization steps")
 	flag.IntVar(&batchSize, "device-batch-size", 1, "sequences per step")
 	flag.StringVar(&modelTag, "model-tag", "", "checkpoint directory name (default d<depth>)")
@@ -90,6 +92,7 @@ func main() {
 	configuration.IndexerCandidates = indexerCandidates
 	configuration.ReusePattern = reusePattern
 	configuration.SWAWindow = swaWindow
+	configuration.CED = ced
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5)

@@ -30,6 +30,7 @@ func main() {
 	indexerCandidates := flag.Int("indexer-candidates", 0, "hierarchical indexer candidate budget (0 = auto)")
 	reusePattern := flag.String("reuse-pattern", "", "cross-layer reuse pattern of F/R/U per layer (empty = all full)")
 	swaWindow := flag.Int("swa-window", 0, "local sliding-window branch width on compressed layers (0 disables)")
+	ced := flag.Bool("ced", false, "causal encoder-decoder split (decoder global KV from the encoder hidden state; requires --compression-ratio and --swa-window)")
 	vocabSize := flag.Int("vocab-size", 32768, "vocabulary size")
 	numIterations := flag.Int("num-iterations", 50, "optimization steps")
 	deviceBatchSize := flag.Int("device-batch-size", 1, "per-step batch size")
@@ -68,6 +69,7 @@ func main() {
 	configuration.IndexerCandidates = *indexerCandidates
 	configuration.ReusePattern = *reusePattern
 	configuration.SWAWindow = *swaWindow
+	configuration.CED = *ced
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 

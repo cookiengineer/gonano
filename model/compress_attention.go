@@ -368,9 +368,14 @@ func attentionBackwardWindowed(queryHeadMajor, keyHeadMajor, valueHeadMajor, out
 }
 
 // localAttentionRow runs the local sliding-window branch for one inference query
-// row against the raw key/value prefix of a (batch, KV head).
-func localAttentionRow(queryRow, keyPrefix, valuePrefix []float32, absolutePosition, window, headDim int, output, logSumExp []float32) {
+// row against the raw key/value prefix of a (batch, KV head). floor is the
+// first absolute position that may be attended; it is 0 normally and the replay
+// start during CED bounded replay (where earlier cached slots are zero).
+func localAttentionRow(queryRow, keyPrefix, valuePrefix []float32, absolutePosition, floor, window, headDim int, output, logSumExp []float32) {
 	localStart := absolutePosition - window
+	if localStart < floor {
+		localStart = floor
+	}
 	if localStart < 0 {
 		localStart = 0
 	}
@@ -540,10 +545,30 @@ func (attention *CausalSelfAttention) compressTail(cache *KVBuffer, layer, batch
 	}
 }
 
+// appendGlobalTail appends a chunk of rows to a layer's global compression
+// buffer, flushing each completed block into the layer's compressed cache. It
+// is shared by incremental inference and by the CED prefill global-cache fill.
+func (attention *CausalSelfAttention) appendGlobalTail(cache *KVBuffer, layer int, hidden, key, value *tensors.Tensor, batchSize, sequenceLength, embeddingDimension, headDimension int) {
+	ratio := attention.compressionRatio
+	kvHeadCount := attention.keyValueHeadCount
+	for position := 0; position < sequenceLength; position++ {
+		for batch := 0; batch < batchSize; batch++ {
+			row := batch*sequenceLength + position
+			hiddenRow := hidden.Data[row*embeddingDimension : row*embeddingDimension+embeddingDimension]
+			keyRow := key.Data[row*kvHeadCount*headDimension : row*kvHeadCount*headDimension+kvHeadCount*headDimension]
+			valueRow := value.Data[row*kvHeadCount*headDimension : row*kvHeadCount*headDimension+kvHeadCount*headDimension]
+			cache.AppendTailRow(layer, batch, hiddenRow, keyRow, valueRow)
+		}
+		if cache.TailLength(layer, 0) == ratio {
+			attention.compressTail(cache, layer, batchSize, embeddingDimension, headDimension)
+		}
+	}
+}
+
 // forwardCompressed is the inference path of an HCA-style compressed attention
 // layer. It buffers incoming rows, compresses each completed block, and attends
 // every query to the compressed blocks that strictly precede its own block.
-func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value *tensors.Tensor, cache *KVBuffer, layer, positionOffset int, share *compressionShare) *tensors.Tensor {
+func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value *tensors.Tensor, encoderHidden, cedKeySequence, cedValueSequence *tensors.Tensor, cache *KVBuffer, layer, positionOffset int, share *compressionShare) *tensors.Tensor {
 	batchSize := input.Shape[0]
 	sequenceLength := input.Shape[1]
 	embeddingDimension := input.Shape[2]
@@ -581,22 +606,23 @@ func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value
 	if attention.reuseMode != ReuseFull {
 		cacheLayer = share.producer
 	}
-	if attention.reuseMode == ReuseFull {
-		for position := 0; position < sequenceLength; position++ {
-			for batch := 0; batch < batchSize; batch++ {
-				row := batch*sequenceLength + position
-				hiddenRow := input.Data[row*embeddingDimension : row*embeddingDimension+embeddingDimension]
-				keyRow := key.Data[row*kvHeadCount*headDimension : row*kvHeadCount*headDimension+kvHeadCount*headDimension]
-				valueRow := value.Data[row*kvHeadCount*headDimension : row*kvHeadCount*headDimension+kvHeadCount*headDimension]
-				cache.AppendTailRow(layer, batch, hiddenRow, keyRow, valueRow)
-			}
-			if cache.TailLength(layer, 0) == ratio {
-				attention.compressTail(cache, layer, batchSize, embeddingDimension, headDimension)
-			}
+	replay := share != nil && share.replay
+	if attention.reuseMode == ReuseFull && !replay {
+		// CED decoder layers buffer the encoder hidden state together with the
+		// global keys/values projected from it instead of the layer's own
+		// hidden state and keys/values.
+		bufferHidden := input
+		bufferKey := key
+		bufferValue := value
+		if attention.ced && encoderHidden != nil {
+			bufferHidden = encoderHidden
+			bufferKey = cedKeySequence
+			bufferValue = cedValueSequence
 		}
+		attention.appendGlobalTail(cache, layer, bufferHidden, bufferKey, bufferValue, batchSize, sequenceLength, embeddingDimension, headDimension)
 	}
 
-	if attention.reuseMode == ReuseReindex && attention.sparseTopK > 0 {
+	if !replay && attention.reuseMode == ReuseReindex && attention.sparseTopK > 0 {
 		attention.cacheReusedIndexerKeys(cache, layer, cacheLayer, batchSize, headDimension)
 	}
 
@@ -607,6 +633,12 @@ func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value
 		localOutput := make([]float32, headDimension)
 		globalLogSumExp := make([]float32, 1)
 		localLogSumExp := make([]float32, 1)
+		// During bounded replay the local window is truncated to the replay
+		// segment, so cached slots before positionOffset are excluded.
+		localFloor := 0
+		if replay {
+			localFloor = positionOffset
+		}
 		for batch := 0; batch < batchSize; batch++ {
 			for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
 				keyValueHead := queryHead / headRatio
@@ -629,7 +661,7 @@ func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value
 							tensors.AttentionForward(queryRow, keySlice, valueSlice, globalOutput, globalLogSumExp, 1, count, headDimension, count, -1)
 						}
 						local := localKV[batch*kvHeadCount+keyValueHead]
-						localAttentionRow(queryRow, local.key, local.value, absolutePosition, attention.swaWindow, headDimension, localOutput, localLogSumExp)
+						localAttentionRow(queryRow, local.key, local.value, absolutePosition, localFloor, attention.swaWindow, headDimension, localOutput, localLogSumExp)
 						mergeAttentionRow(outputRow, globalOutput, localOutput, globalLogSumExp[0], localLogSumExp[0])
 						continue
 					}
@@ -677,6 +709,10 @@ func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMa
 	localScratch := make([]float32, headDimension)
 	globalLogSumExp := make([]float32, 1)
 	localLogSumExp := make([]float32, 1)
+	localFloor := 0
+	if share != nil && share.replay {
+		localFloor = positionOffset
+	}
 
 	for batch := 0; batch < batchSize; batch++ {
 		available := cache.CompressedCount(cacheLayer, batch)
@@ -750,7 +786,7 @@ func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMa
 					}
 					if attention.swaWindow > 0 {
 						local := localKV[batch*kvHeadCount+keyValueHead]
-						localAttentionRow(queryRow, local.key, local.value, positionOffset+position, attention.swaWindow, headDimension, localScratch, localLogSumExp)
+						localAttentionRow(queryRow, local.key, local.value, positionOffset+position, localFloor, attention.swaWindow, headDimension, localScratch, localLogSumExp)
 						mergeAttentionRow(outputRow, globalOutput, localScratch, globalLogSumExp[0], localLogSumExp[0])
 					}
 				}

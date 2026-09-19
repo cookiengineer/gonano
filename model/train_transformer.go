@@ -47,7 +47,17 @@ func (model *Transformer) TrainForward(indexes *tensors.Int32s) (*tensors.Tensor
 	backoutLayerIndex := model.Config.NumLayer / 2
 	var backoutActivations *tensors.Tensor
 	var currentShare *compressionShare
+	var encoderHidden *tensors.Tensor
+	// All CED decoder layers accumulate their global-KV gradients into one
+	// buffer, which TrainBackward injects at the encoder/decoder boundary.
+	var cedGradientEncoder *tensors.Tensor
+	if model.Config.CEDEnabled() {
+		cedGradientEncoder = tensors.New(batchSize, sequenceLength, model.Config.EmbedDim)
+	}
 	for layerIndex, block := range model.blocks {
+		if model.Config.CEDEnabled() && layerIndex == model.Config.CEDSplit() {
+			encoderHidden = activations
+		}
 		context.previousActivations = append(context.previousActivations, activations)
 		activations = combineResidual(activations, initialResidual, model.residLambdas.Data[layerIndex], model.x0Lambdas.Data[layerIndex])
 		var valueEmbedding *tensors.Tensor
@@ -57,6 +67,10 @@ func (model *Transformer) TrainForward(indexes *tensors.Int32s) (*tensors.Tensor
 		}
 		if model.Config.ReuseModeAt(layerIndex) == ReuseFull {
 			currentShare = &compressionShare{producer: layerIndex}
+			if model.Config.IsDecoderLayer(layerIndex) {
+				currentShare.encoderHidden = encoderHidden
+				currentShare.gradientEncoder = cedGradientEncoder
+			}
 		}
 		var blockCtx *blockContext
 		activations, blockCtx = block.forwardTraining(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, 0, model.windowSizes[layerIndex], currentShare)
@@ -127,6 +141,14 @@ func (model *Transformer) TrainBackward(context *trainCtx, gradLogits *tensors.T
 		initialWeight := model.x0Lambdas.Data[layerIndex]
 		previousActivations := context.previousActivations[layerIndex]
 		gradActivations = tensors.Scale(gradBlockInput, residualWeight)
+		// CED: the decoder's global KV projections read the encoder's final
+		// hidden state, so their accumulated gradient is injected here, at the
+		// boundary between the encoder and the first decoder layer.
+		if model.Config.CEDEnabled() && layerIndex == model.Config.CEDSplit() {
+			if attentionContext := context.blockContexts[layerIndex].attentionContext; attentionContext != nil && attentionContext.share != nil && attentionContext.share.gradientEncoder != nil {
+				gradActivations = tensors.Add(gradActivations, attentionContext.share.gradientEncoder)
+			}
+		}
 		gradInitialResidual = tensors.AddScaled(gradInitialResidual, gradBlockInput, initialWeight)
 
 		model.residLambdas.EnsureGrad()

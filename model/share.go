@@ -20,4 +20,18 @@ type compressionShare struct {
 	selection       [][][]int       // [B*Hkv][token][], most recently published
 	gradientKey     *tensors.Tensor // [B, Hkv, blocks, D] (training only)
 	gradientValue   *tensors.Tensor // [B, Hkv, blocks, D] (training only)
+
+	// encoderHidden is the CED encoder's final hidden state H_(d/2) [B, T, d].
+	// Decoder full layers project their global compressed KV from it; it is nil
+	// on encoder groups and when CED is disabled.
+	encoderHidden *tensors.Tensor
+	// gradientEncoder accumulates the gradient of the decoder's global KV
+	// projections with respect to encoderHidden. It is injected into the
+	// encoder output at the split boundary during the backward pass.
+	gradientEncoder *tensors.Tensor
+
+	// replay marks a CED decoder bounded-replay pass: the group's global
+	// compressed cache has already been filled from the encoder hidden state,
+	// so the layers must not buffer or compress it again.
+	replay bool
 }

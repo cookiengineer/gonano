@@ -175,7 +175,11 @@ func (model *Transformer) Forward(indexes *tensors.Int32s, cache *KVBuffer) *ten
 	backoutLayerIndex := model.Config.NumLayer / 2
 	var backoutActivation *tensors.Tensor
 	var currentShare *compressionShare
+	var encoderHidden *tensors.Tensor
 	for layerIndex, block := range model.blocks {
+		if model.Config.CEDEnabled() && layerIndex == model.Config.CEDSplit() {
+			encoderHidden = activations
+		}
 		activations = combineResidual(activations, initialResidual, model.residLambdas.Data[layerIndex], model.x0Lambdas.Data[layerIndex])
 		var valueEmbedding *tensors.Tensor
 		if embedding, ok := model.valueEmbeds[layerIndex]; ok {
@@ -183,6 +187,9 @@ func (model *Transformer) Forward(indexes *tensors.Int32s, cache *KVBuffer) *ten
 		}
 		if model.Config.ReuseModeAt(layerIndex) == ReuseFull {
 			currentShare = &compressionShare{producer: layerIndex}
+			if model.Config.IsDecoderLayer(layerIndex) {
+				currentShare.encoderHidden = encoderHidden
+			}
 		}
 		activations = block.Forward(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, positionOffset, model.windowSizes[layerIndex], cache, layerIndex, currentShare)
 		if layerIndex == backoutLayerIndex {
@@ -203,6 +210,147 @@ func (model *Transformer) Forward(indexes *tensors.Int32s, cache *KVBuffer) *ten
 	logits = trimVocab(logits, model.paddedVocab, model.Config.VocabSize)
 	logits = tensors.Softcap(logits, softcap)
 	return logits.Reshape(batchSize, sequenceLength, model.Config.VocabSize)
+}
+
+// PrefillCED runs the causal encoder-decoder prefill. The encoder half
+// processes the full prompt and its final hidden state is used to fill every
+// decoder layer's global compressed cache; the decoder half is then replayed
+// over only the last SWAWindow tokens to reconstruct its local state. The
+// returned logits cover the replayed tokens (callers use the last row) and the
+// cache is left at the full prompt length for decoding.
+func (model *Transformer) PrefillCED(indexes *tensors.Int32s, cache *KVBuffer) *tensors.Tensor {
+	config := model.Config
+	batchSize, sequenceLength := indexes.Shape[0], indexes.Shape[1]
+	split := config.CEDSplit()
+	embeddingDimension := config.EmbedDim
+	headDimension := config.HeadDim()
+	replayLength := config.SWAWindowSize()
+	if replayLength > sequenceLength {
+		replayLength = sequenceLength
+	}
+	replayStart := sequenceLength - replayLength
+
+	// Phase 1: encoder over the full prompt.
+	activations := model.embedAndSmear(indexes, cache, sequenceLength)
+	initialResidual := activations
+	var currentShare *compressionShare
+	for layerIndex := 0; layerIndex < split; layerIndex++ {
+		activations = combineResidual(activations, initialResidual, model.residLambdas.Data[layerIndex], model.x0Lambdas.Data[layerIndex])
+		var valueEmbedding *tensors.Tensor
+		if embedding, ok := model.valueEmbeds[layerIndex]; ok {
+			valueEmbedding = embedding.Forward(indexes)
+		}
+		if config.ReuseModeAt(layerIndex) == ReuseFull {
+			currentShare = &compressionShare{producer: layerIndex}
+		}
+		activations = model.blocks[layerIndex].Forward(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, 0, model.windowSizes[layerIndex], cache, layerIndex, currentShare)
+	}
+	encoderHidden := activations
+
+	// Phase 2: fill each decoder layer's global compressed cache from the
+	// encoder hidden state, and reindex layers' indexer key caches.
+	for layerIndex := split; layerIndex < config.NumLayer; layerIndex++ {
+		attention := model.blocks[layerIndex].attention
+		switch {
+		case attention.reuseMode == ReuseFull:
+			keyHead, valueHead, _ := attention.cedGlobalKeyValue(encoderHidden, model.rotaryCosine, model.rotarySine, 0)
+			keySequence := toBatchSequenceLayout(keyHead)
+			valueSequence := toBatchSequenceLayout(valueHead)
+			attention.appendGlobalTail(cache, layerIndex, encoderHidden, keySequence, valueSequence, batchSize, sequenceLength, embeddingDimension, headDimension)
+		case attention.reuseMode == ReuseReindex && attention.sparseTopK > 0:
+			attention.cacheReusedIndexerKeys(cache, layerIndex, attention.producer, batchSize, headDimension)
+		}
+	}
+
+	// Phase 3: decoder bounded replay over the last window tokens. The global
+	// cache is already full, so replay mode writes only the local SWA state.
+	replayIndexes := sliceTokenRange(indexes, replayStart, sequenceLength)
+	cache.sequenceLength = int32(replayStart)
+	initialResidual = model.embedAndSmear(replayIndexes, cache, replayLength)
+	// The decoder consumes the encoder's final hidden state, so the replay
+	// starts from its rows for the replayed positions.
+	activations = sliceTensorRows(encoderHidden, replayStart, sequenceLength)
+	backoutLayerIndex := config.NumLayer / 2
+	var backoutActivation *tensors.Tensor
+	currentShare = nil
+	for layerIndex := split; layerIndex < config.NumLayer; layerIndex++ {
+		activations = combineResidual(activations, initialResidual, model.residLambdas.Data[layerIndex], model.x0Lambdas.Data[layerIndex])
+		var valueEmbedding *tensors.Tensor
+		if embedding, ok := model.valueEmbeds[layerIndex]; ok {
+			valueEmbedding = embedding.Forward(replayIndexes)
+		}
+		if config.ReuseModeAt(layerIndex) == ReuseFull {
+			currentShare = &compressionShare{producer: layerIndex, replay: true}
+		}
+		activations = model.blocks[layerIndex].Forward(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, replayStart, model.windowSizes[layerIndex], cache, layerIndex, currentShare)
+		if layerIndex == backoutLayerIndex {
+			backoutActivation = activations.Clone()
+		}
+	}
+	cache.sequenceLength = int32(sequenceLength)
+
+	if backoutActivation != nil {
+		activations = tensors.AddScaled(activations, backoutActivation, -model.backoutLambda.Data[0])
+	}
+	activations = normalizeLastDim(activations)
+	logits := model.lmHead.Forward(activations)
+	logits = trimVocab(logits, model.paddedVocab, config.VocabSize)
+	logits = tensors.Softcap(logits, softcap)
+	return logits.Reshape(batchSize, replayLength, config.VocabSize)
+}
+
+// embedAndSmear computes the token embedding followed by the smear mechanism,
+// using the KV cache's previous-embedding slot when a cache is present.
+func (model *Transformer) embedAndSmear(indexes *tensors.Int32s, cache *KVBuffer, sequenceLength int) *tensors.Tensor {
+	activations := model.tokenEmbedding.Forward(indexes)
+	activations = normalizeLastDim(activations)
+	if cache == nil {
+		if sequenceLength <= 1 {
+			panic("model: training forward requires T > 1")
+		}
+		gate := model.smearGate.Forward(sliceChannels(activations, 1, sequenceLength, smearGateChannels))
+		gate = tensors.Scale(tensors.Sigmoid(gate), model.smearLambda.Data[0])
+		smearAdd(activations, gate)
+		return activations
+	}
+	previousEmbedding := cache.PrevEmbedding()
+	cache.SetPrevEmbedding(lastTokenEmbedding(activations))
+	if sequenceLength > 1 {
+		gate := model.smearGate.Forward(sliceChannels(activations, 1, sequenceLength, smearGateChannels))
+		gate = tensors.Scale(tensors.Sigmoid(gate), model.smearLambda.Data[0])
+		smearAdd(activations, gate)
+	} else if previousEmbedding != nil {
+		gate := model.smearGate.Forward(sliceChannels(activations, 0, 1, smearGateChannels))
+		gate = tensors.Scale(tensors.Sigmoid(gate), model.smearLambda.Data[0])
+		smearDecode(activations, gate, previousEmbedding)
+	}
+	return activations
+}
+
+// sliceTensorRows returns the [start, end) rows of a [B, T, width] tensor.
+func sliceTensorRows(input *tensors.Tensor, start, end int) *tensors.Tensor {
+	batchSize := input.Shape[0]
+	sequenceLength := input.Shape[1]
+	width := input.Shape[2]
+	length := end - start
+	output := tensors.New(batchSize, length, width)
+	for batch := 0; batch < batchSize; batch++ {
+		sourceOffset := (batch*sequenceLength + start) * width
+		copy(output.Data[batch*length*width:(batch+1)*length*width], input.Data[sourceOffset:sourceOffset+length*width])
+	}
+	return output
+}
+
+// sliceTokenRange returns the token columns [start, end) of every batch row.
+func sliceTokenRange(indexes *tensors.Int32s, start, end int) *tensors.Int32s {
+	batchSize := indexes.Shape[0]
+	length := end - start
+	output := tensors.NewInt32sWithData([]int{batchSize, length}, make([]int32, batchSize*length))
+	for batch := 0; batch < batchSize; batch++ {
+		sourceOffset := batch*indexes.Shape[1] + start
+		copy(output.Data[batch*length:(batch+1)*length], indexes.Data[sourceOffset:sourceOffset+length])
+	}
+	return output
 }
 
 // lastTokenEmbedding copies the last token's embedding of each batch row into

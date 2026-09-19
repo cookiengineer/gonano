@@ -79,6 +79,9 @@ func (model *Transformer) EstimateDecodeFlops(contextLength int) float64 {
 
 // EstimatePrefillFlops returns the forward FLOPs to prefill numTokens tokens.
 func (model *Transformer) EstimatePrefillFlops(numTokens int) float64 {
+	if model.Config.CEDEnabled() {
+		return model.estimatePrefillFlopsCED(numTokens)
+	}
 	headCount := model.Config.NumHead
 	headDimension := model.Config.HeadDim()
 	attentionFlops := 0.0
@@ -102,6 +105,71 @@ func (model *Transformer) EstimatePrefillFlops(numTokens int) float64 {
 		attentionFlops += 4 * float64(headCount) * float64(headDimension) * (globalPairs + localPairs)
 	}
 	return 2*float64(model.MatmulParams())*float64(numTokens) + attentionFlops
+}
+
+// estimatePrefillFlopsCED accounts for the causal encoder-decoder split: the
+// encoder runs over the full prompt, while the decoder is replayed only over
+// the last SWAWindow tokens. Decoder global keys/values are still projected
+// from the full encoder hidden state.
+func (model *Transformer) estimatePrefillFlopsCED(numTokens int) float64 {
+	config := model.Config
+	headCount := config.NumHead
+	headDimension := config.HeadDim()
+	replayTokens := numTokens
+	if window := config.SWAWindowSize(); window < replayTokens {
+		replayTokens = window
+	}
+	ratio := config.Compression()
+
+	matmulFlops := 0.0
+	for layer := 0; layer < config.NumLayer; layer++ {
+		block := model.blocks[layer]
+		isDecoder := config.IsDecoderLayer(layer)
+		tokens := float64(numTokens)
+		if isDecoder {
+			tokens = float64(replayTokens)
+		}
+		blockParams := block.attention.queryProjection.Weight.Numel() +
+			block.attention.outputProjection.Weight.Numel() +
+			block.mlp.inputProjection.Weight.Numel() +
+			block.mlp.outputProjection.Weight.Numel()
+		if block.attention.valueEmbeddingGate != nil {
+			blockParams += block.attention.valueEmbeddingGate.Weight.Numel()
+		}
+		kvParams := block.attention.keyProjection.Weight.Numel() + block.attention.valueProjection.Weight.Numel()
+		if isDecoder {
+			// Global K/V over the full encoder hidden state plus local K/V over
+			// the replayed tokens.
+			matmulFlops += 2 * float64(kvParams) * (float64(numTokens) + tokens)
+		} else {
+			matmulFlops += 2 * float64(kvParams) * tokens
+		}
+		matmulFlops += 2 * float64(blockParams) * tokens
+	}
+	matmulFlops += 2 * float64(model.lmHead.Weight.Numel()) * float64(replayTokens)
+	matmulFlops += 2 * float64(model.smearGate.Weight.Numel()) * float64(numTokens)
+
+	attentionFlops := 0.0
+	for layer := 0; layer < config.NumLayer; layer++ {
+		global, local := model.attentionLengths(layer, numTokens)
+		if config.IsDecoderLayer(layer) {
+			// Only the replayed queries are computed, each still attending to
+			// the full global compressed key set and the local window.
+			attentionFlops += 4 * float64(headCount) * float64(headDimension) * float64(replayTokens) * (float64(global) + float64(local))
+			continue
+		}
+		var globalPairs, localPairs float64
+		if ratio > 1 {
+			blockCount := float64(global)
+			globalPairs = float64(ratio) * blockCount * (blockCount - 1) / 2
+		}
+		if local > 0 {
+			effective := float64(local)
+			localPairs = effective*(effective+1)/2 + float64(numTokens-int(effective))*effective
+		}
+		attentionFlops += 4 * float64(headCount) * float64(headDimension) * (globalPairs + localPairs)
+	}
+	return matmulFlops + attentionFlops
 }
 
 // WeightReadBytes returns the bytes of matmul weights read by one decode step.
