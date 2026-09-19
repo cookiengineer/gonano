@@ -89,6 +89,11 @@ type CausalSelfAttention struct {
 	// it merges every compressionRatio key/value rows into one entry.
 	compressor       *ChannelCompressor
 	compressionRatio int
+	// indexer is non-nil when CSA-style sparse selection is enabled on top of
+	// compression; sparseTopK is the number of blocks each query attends to.
+	indexer           *SparseIndexer
+	sparseTopK        int
+	indexerLossWeight float32
 }
 
 // NewCausalSelfAttention builds an attention layer. hasValueEmbedding selects
@@ -111,6 +116,12 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool) *Causa
 	if ratio := configuration.Compression(); ratio > 1 {
 		attention.compressionRatio = ratio
 		attention.compressor = NewChannelCompressor(configuration.EmbedDim, headDimension, ratio)
+		if configuration.SparseTopK > 0 {
+			dim, heads := configuration.indexerDefaults()
+			attention.sparseTopK = configuration.SparseTopK
+			attention.indexerLossWeight = configuration.IndexerWeight()
+			attention.indexer = NewSparseIndexer(configuration.EmbedDim, headDimension, dim, heads)
+		}
 	}
 	return attention
 }

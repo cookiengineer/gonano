@@ -53,21 +53,13 @@ func (backend *Backend) ReluSquared(destination, source []float32) {
 	reluSquaredCore(destination, source)
 }
 
-// Exp computes destination[i] = exp(source[i]). The simd package exposes no
-// exp, so this is computed element-wise with the math package.
-func (backend *Backend) Exp(destination, source []float32) {
-	for index, value := range source {
-		destination[index] = float32(math.Exp(float64(value)))
-	}
-}
+// Exp computes destination[i] = exp(source[i]) using the vectorized exp
+// approximation.
+func (backend *Backend) Exp(destination, source []float32) { expCore(destination, source) }
 
-// Sigmoid computes destination[i] = 1 / (1 + exp(-source[i])). The simd
-// package exposes no sigmoid, so this is computed element-wise.
-func (backend *Backend) Sigmoid(destination, source []float32) {
-	for index, value := range source {
-		destination[index] = float32(1.0 / (1.0 + math.Exp(float64(-value))))
-	}
-}
+// Sigmoid computes destination[i] = 1 / (1 + exp(-source[i])) using the
+// vectorized exp approximation.
+func (backend *Backend) Sigmoid(destination, source []float32) { sigmoidCore(destination, source) }
 
 // Tanh computes destination[i] = tanh(source[i]). The simd package exposes no
 // tanh, so this is computed element-wise.

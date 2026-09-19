@@ -33,6 +33,8 @@ func main() {
 		kvHeadRatio      int
 		compressionRatio int
 		qat              string
+		sparseTopK       int
+		indexerDim       int
 		numIterations    int
 		batchSize        int
 		modelTag         string
@@ -49,6 +51,8 @@ func main() {
 	flag.IntVar(&kvHeadRatio, "kv-head-ratio", 1, "query heads per key/value head (1 = MHA, >1 = GQA)")
 	flag.IntVar(&compressionRatio, "compression-ratio", 0, "HCA-style dense KV compression ratio (0/1 disables)")
 	flag.StringVar(&qat, "qat", "", "quantization-aware training mode (\"\" or int8)")
+	flag.IntVar(&sparseTopK, "sparse-topk", 0, "CSA sparse attention top-k compressed blocks (0 disables)")
+	flag.IntVar(&indexerDim, "indexer-dim", 64, "lightning indexer per-head dimension")
 	flag.IntVar(&numIterations, "num-iterations", 50, "optimization steps")
 	flag.IntVar(&batchSize, "device-batch-size", 1, "sequences per step")
 	flag.StringVar(&modelTag, "model-tag", "", "checkpoint directory name (default d<depth>)")
@@ -75,6 +79,8 @@ func main() {
 	configuration := model.ConfigForDepthRatio(depth, tokenizer.VocabSize(), 64, 128, maxSeqLen, "SSSL", kvHeadRatio)
 	configuration.CompressionRatio = compressionRatio
 	configuration.QAT = qat
+	configuration.SparseTopK = sparseTopK
+	configuration.IndexerDim = indexerDim
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5)

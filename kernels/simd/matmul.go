@@ -81,6 +81,38 @@ func (backend *Backend) MatMulTransposed(destination, left, right []float32, row
 	})
 }
 
+// MatMulTransposedInt8 computes destination = left @ dequant(right), where
+// right is a per-row symmetric int8 weight matrix [columnCount, innerCount] and
+// scales is its per-row scale. Each weight column block is dequantized once
+// into a float32 tile and reused across all rows, so packed weights are read
+// once per forward instead of once per row.
+func (backend *Backend) MatMulTransposedInt8(destination, left []float32, right []int8, scales []float32, rowCount, columnCount, innerCount int) {
+	numberColumnBlocks := (columnCount + columnBlockSize - 1) / columnBlockSize
+	parallel.KernelPool().For(0, numberColumnBlocks, func(blockIndex int) {
+		columnStart := blockIndex * columnBlockSize
+		columnEnd := min(columnStart+columnBlockSize, columnCount)
+		columns := columnEnd - columnStart
+
+		tile := make([]float32, columns*innerCount)
+		for column := 0; column < columns; column++ {
+			scale := scales[columnStart+column]
+			packedRow := right[(columnStart+column)*innerCount : (columnStart+column+1)*innerCount]
+			tileRow := tile[column*innerCount : (column+1)*innerCount]
+			for inner := 0; inner < innerCount; inner++ {
+				tileRow[inner] = float32(packedRow[inner]) * scale
+			}
+		}
+
+		for row := 0; row < rowCount; row++ {
+			leftRow := left[row*innerCount:]
+			destinationRow := destination[row*columnCount:]
+			for column := 0; column < columns; column++ {
+				destinationRow[columnStart+column] = dotProduct(leftRow, tile[column*innerCount:(column+1)*innerCount], innerCount)
+			}
+		}
+	})
+}
+
 // DotProduct returns the sum of left[i]*right[i] over the shorter input.
 func (backend *Backend) DotProduct(left, right []float32) float32 {
 	return dotProduct(left, right, min(len(left), len(right)))

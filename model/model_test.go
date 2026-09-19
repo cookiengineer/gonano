@@ -287,6 +287,85 @@ func TestQATCompressedTrainStepFinite(t *testing.T) {
 	}
 }
 
+func TestSparseSelectAllMatchesDense(t *testing.T) {
+	config := testConfig()
+	config.CompressionRatio = 2
+	config.SparseTopK = 1000 // far more than the block count: selects every allowed block
+	transformer := NewTransformer(config)
+	transformer.InitWeights(tensors.NewRNG(42))
+	indexes, _ := tinyData()
+
+	sparseLogits, _ := transformer.TrainForward(indexes)
+	for _, block := range transformer.blocks {
+		block.attention.indexer = nil
+	}
+	denseLogits, _ := transformer.TrainForward(indexes)
+
+	for index := range sparseLogits.Data {
+		if math.Abs(float64(sparseLogits.Data[index]-denseLogits.Data[index])) > 1e-4 {
+			t.Fatalf("sparse-with-all-blocks differs from dense at %d: %v vs %v", index, sparseLogits.Data[index], denseLogits.Data[index])
+		}
+	}
+}
+
+func TestSparseCompressedTrainStepFinite(t *testing.T) {
+	config := testConfig()
+	config.CompressionRatio = 2
+	config.SparseTopK = 1
+	config.IndexerDim = 4
+	transformer := NewTransformer(config)
+	transformer.InitWeights(tensors.NewRNG(42))
+	indexes, targets := tinyData()
+
+	logits, context := transformer.TrainForward(indexes)
+	for _, value := range logits.Data {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			t.Fatalf("non-finite logit %v", value)
+		}
+	}
+	flattened := logits.Reshape(indexes.Numel(), config.VocabSize)
+	_, valid := tensors.CrossEntropyPerPosition(flattened, targets.Reshape(indexes.Numel()), -1)
+	gradLogits := tensors.CrossEntropyGrad(flattened, targets.Reshape(indexes.Numel()), -1, 1/float32(valid))
+	transformer.TrainBackward(context, gradLogits.Reshape(indexes.Shape[0], indexes.Shape[1], config.VocabSize))
+	for _, parameter := range transformer.Parameters() {
+		for _, value := range parameter.Grad {
+			if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+				t.Fatalf("non-finite gradient")
+			}
+		}
+	}
+}
+
+func TestSparseIndexerReceivesDistillationGradient(t *testing.T) {
+	config := testConfig()
+	config.CompressionRatio = 2
+	config.SparseTopK = 1
+	config.IndexerDim = 4
+	transformer := NewTransformer(config)
+	transformer.InitWeights(tensors.NewRNG(42))
+	indexes, targets := tinyData()
+
+	transformer.ZeroGrad()
+	logits, context := transformer.TrainForward(indexes)
+	flattened := logits.Reshape(indexes.Numel(), config.VocabSize)
+	_, valid := tensors.CrossEntropyPerPosition(flattened, targets.Reshape(indexes.Numel()), -1)
+	gradLogits := tensors.CrossEntropyGrad(flattened, targets.Reshape(indexes.Numel()), -1, 1/float32(valid))
+	transformer.TrainBackward(context, gradLogits.Reshape(indexes.Shape[0], indexes.Shape[1], config.VocabSize))
+
+	indexer := transformer.blocks[0].attention.indexer
+	nonZero := false
+	for _, parameter := range indexer.Parameters() {
+		for _, value := range parameter.Grad {
+			if value != 0 {
+				nonZero = true
+			}
+		}
+	}
+	if !nonZero {
+		t.Fatal("indexer parameters received no distillation gradient")
+	}
+}
+
 func TestForwardShapes(t *testing.T) {
 	model := buildTestTransformer(t)
 	indexes := tensors.NewInt32sWithData([]int{1, 4}, []int32{1, 2, 3, 4})

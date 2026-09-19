@@ -31,6 +31,21 @@ func (backend *Backend) MatMulTransposed(destination, left, right []float32, row
 	}
 }
 
+// MatMulTransposedInt8 computes destination = left @ dequant(right), where
+// right is a per-row symmetric int8 weight matrix [columnCount, innerCount] and
+// scales is its per-row scale. Accumulation is performed in float64.
+func (backend *Backend) MatMulTransposedInt8(destination, left []float32, right []int8, scales []float32, rowCount, columnCount, innerCount int) {
+	for row := 0; row < rowCount; row++ {
+		for column := 0; column < columnCount; column++ {
+			var accumulator float64
+			for inner := 0; inner < innerCount; inner++ {
+				accumulator += float64(left[row*innerCount+inner]) * float64(right[column*innerCount+inner])
+			}
+			destination[row*columnCount+column] = float32(accumulator) * scales[column]
+		}
+	}
+}
+
 // DotProduct returns the sum of left[i]*right[i] over the shorter input.
 func (backend *Backend) DotProduct(left, right []float32) float32 {
 	length := min(len(left), len(right))

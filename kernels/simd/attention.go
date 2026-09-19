@@ -3,6 +3,8 @@ package simdbackend
 import (
 	"math"
 
+	"simd"
+
 	"github.com/cookiengineer/gonano/kernels"
 )
 
@@ -16,6 +18,10 @@ const maskedAttentionScore = -1e30
 const (
 	queryBlockSize = 16
 	keyBlockSize   = 64
+	// scoreTileGemmMinRows is the query-block size at which transposing the key
+	// tile (needed by the rank-1-update score GEMM) is amortized. Below it the
+	// direct dot-product path is faster.
+	scoreTileGemmMinRows = 8
 )
 
 // AttentionForward computes Output = softmax(mask(Query @ Key^T)) @ Value for a
@@ -106,6 +112,13 @@ func (backend *Backend) AttentionCombine(parameters kernels.AttentionCombinePara
 // accumulator. maximum must be initialized to -Inf and sum/accumulator zeroed.
 func attentionForwardRange(query, key, value []float32, queryLength, headDim, positionOffset, window, keyStartBound, keyEndBound int, maximum, sum, accumulator []float32) {
 	scoreTile := make([]float32, queryBlockSize*keyBlockSize)
+	// The key-transpose scratch is only needed by the rank-1 GEMM path, which
+	// requires a full query block; single-token decode uses the dot-product
+	// path and must not pay the allocation.
+	var keyTranspose []float32
+	if queryLength >= scoreTileGemmMinRows {
+		keyTranspose = make([]float32, headDim*keyBlockSize)
+	}
 	for queryStart := 0; queryStart < queryLength; queryStart += queryBlockSize {
 		queryEnd := min(queryStart+queryBlockSize, queryLength)
 		blockRows := queryEnd - queryStart
@@ -113,7 +126,7 @@ func attentionForwardRange(query, key, value []float32, queryLength, headDim, po
 		for keyStart := keyStartBound; keyStart < keyEndBound; keyStart += keyBlockSize {
 			keyEnd := min(keyStart+keyBlockSize, keyEndBound)
 			blockColumns := keyEnd - keyStart
-			computeMaskedScoreTile(scoreTile, query, key, queryLength, headDim, positionOffset, window, queryStart, keyStart, blockRows, blockColumns)
+			computeMaskedScoreTile(scoreTile, keyTranspose, query, key, queryLength, headDim, positionOffset, window, queryStart, keyStart, blockRows, blockColumns)
 
 			for row := 0; row < blockRows; row++ {
 				globalRow := queryStart + row
@@ -132,10 +145,9 @@ func attentionForwardRange(query, key, value []float32, queryLength, headDim, po
 				accumulatorRow := accumulator[globalRow*headDim : (globalRow+1)*headDim]
 				scaleCore(accumulatorRow, accumulatorRow, rescale)
 
+				expShiftedCore(rowScores[:blockColumns], rowScores[:blockColumns], newMaximum)
 				var blockSum float64
-				for column := 0; column < blockColumns; column++ {
-					probability := float32(math.Exp(float64(rowScores[column] - newMaximum)))
-					rowScores[column] = probability
+				for _, probability := range rowScores[:blockColumns] {
 					blockSum += float64(probability)
 				}
 				sum[globalRow] += float32(blockSum)
@@ -154,23 +166,73 @@ func attentionForwardRange(query, key, value []float32, queryLength, headDim, po
 	}
 }
 
-// computeMaskedScoreTile fills the [blockRows, keyBlockSize] score tile with
+// computeMaskedScoreTile fills the [blockRows, blockColumns] score tile with
 // Query @ Key^T values, replacing disallowed positions with the mask constant.
-func computeMaskedScoreTile(scoreTile, query, key []float32, queryLength, headDim, positionOffset, window, queryStart, keyStart, blockRows, blockColumns int) {
+//
+// For enough query rows the score tile is computed as a rank-1-update GEMM: the
+// key block is transposed to [headDim, blockColumns] so each step broadcasts
+// one query element and updates every key column with a vectorized
+// multiply-add, avoiding the per-score horizontal reduction. The transpose is
+// only worthwhile when it is amortized across several query rows, so for the
+// single-row decode case the direct dot-product path is used instead.
+// keyTranspose is caller-provided scratch of length headDim*keyBlockSize.
+func computeMaskedScoreTile(scoreTile, keyTranspose, query, key []float32, queryLength, headDim, positionOffset, window, queryStart, keyStart, blockRows, blockColumns int) {
+	if blockRows < scoreTileGemmMinRows {
+		for row := 0; row < blockRows; row++ {
+			queryIndex := queryStart + row
+			if queryIndex >= queryLength {
+				break
+			}
+			queryPosition := positionOffset + queryIndex
+			queryRow := query[queryIndex*headDim : (queryIndex+1)*headDim]
+			scoreRow := scoreTile[row*keyBlockSize : row*keyBlockSize+blockColumns]
+			for column := 0; column < blockColumns; column++ {
+				keyIndex := keyStart + column
+				score := dotProduct(queryRow, key[keyIndex*headDim:(keyIndex+1)*headDim], headDim)
+				if keyIndex > queryPosition || (window >= 0 && queryPosition-keyIndex > window) {
+					score = maskedAttentionScore
+				}
+				scoreRow[column] = score
+			}
+		}
+		return
+	}
+
+	for column := 0; column < blockColumns; column++ {
+		keyRow := key[(keyStart+column)*headDim : (keyStart+column)*headDim+headDim]
+		for inner := 0; inner < headDim; inner++ {
+			keyTranspose[inner*blockColumns+column] = keyRow[inner]
+		}
+	}
+
 	for row := 0; row < blockRows; row++ {
 		queryIndex := queryStart + row
 		if queryIndex >= queryLength {
 			break
 		}
-		queryPosition := positionOffset + queryIndex
 		queryRow := query[queryIndex*headDim : (queryIndex+1)*headDim]
+		scoreRow := scoreTile[row*keyBlockSize : row*keyBlockSize+blockColumns]
+		clear(scoreRow)
+		for inner := 0; inner < headDim; inner++ {
+			elementVector := simd.BroadcastFloat32s(queryRow[inner])
+			keyRow := keyTranspose[inner*blockColumns : (inner+1)*blockColumns]
+			column := 0
+			for ; column+float32LaneCount <= blockColumns; column += float32LaneCount {
+				accumulator := simd.LoadFloat32s(scoreRow[column:])
+				keyVector := simd.LoadFloat32s(keyRow[column:])
+				keyVector.MulAdd(elementVector, accumulator).Store(scoreRow[column:])
+			}
+			for ; column < blockColumns; column++ {
+				scoreRow[column] += queryRow[inner] * keyRow[column]
+			}
+		}
+
+		queryPosition := positionOffset + queryIndex
 		for column := 0; column < blockColumns; column++ {
 			keyIndex := keyStart + column
-			score := dotProduct(queryRow, key[keyIndex*headDim:(keyIndex+1)*headDim], headDim)
 			if keyIndex > queryPosition || (window >= 0 && queryPosition-keyIndex > window) {
-				score = maskedAttentionScore
+				scoreRow[column] = maskedAttentionScore
 			}
-			scoreTile[row*keyBlockSize+column] = score
 		}
 	}
 }

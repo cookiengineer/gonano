@@ -73,6 +73,11 @@ type LinearAlgebra interface {
 	// [rowCount, innerCount] and right is [columnCount, innerCount] (a weight
 	// matrix stored as [out, in]). The destination is [rowCount, columnCount].
 	MatMulTransposed(destination, left, right []float32, rowCount, columnCount, innerCount int)
+	// MatMulTransposedInt8 is MatMulTransposed with the right operand stored as
+	// per-row symmetric int8: right is packed [columnCount, innerCount] int8
+	// with one float32 scale per row. Implementations dequantize each weight
+	// tile once and reuse it across rows.
+	MatMulTransposedInt8(destination, left []float32, right []int8, scales []float32, rowCount, columnCount, innerCount int)
 	// DotProduct returns the sum of left[i]*right[i] over the shorter input.
 	DotProduct(left, right []float32) float32
 }

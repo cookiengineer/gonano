@@ -26,6 +26,21 @@ type Linear struct {
 	// master weight stays float32; the forward use a fake-quantized copy so the
 	// network adapts to quantization (straight-through on the backward).
 	QuantMode int
+	// Packed, PackedWeight, and PackedScales hold an int8 inference weight
+	// representation produced by PackInt8. When Packed is set the forward uses
+	// the quantized GEMM, which reads packed weights once per forward.
+	Packed       bool
+	PackedWeight []int8
+	PackedScales []float32
+}
+
+// PackInt8 quantizes the float32 master weight into a per-row symmetric int8
+// representation for the quantized inference GEMM.
+func (layer *Linear) PackInt8() {
+	quantized := tensors.QuantizeInt8Rows(layer.Weight)
+	layer.PackedWeight = quantized.Packed
+	layer.PackedScales = quantized.Scales
+	layer.Packed = true
 }
 
 // NewLinear allocates a zero-initialized Linear layer.
@@ -45,13 +60,18 @@ func (layer *Linear) Forward(input *tensors.Tensor) *tensors.Tensor {
 	}
 	rows := input.Numel() / layer.InFeatures
 	inputMatrix := input.Reshape(rows, layer.InFeatures)
-	weight := layer.Weight
-	if layer.QuantMode == QuantInt8 {
+	var outputMatrix *tensors.Tensor
+	switch {
+	case layer.Packed:
+		// Int8 inference: read packed weights once per forward.
+		outputMatrix = tensors.MatMulTransposedInt8(inputMatrix, layer.PackedWeight, layer.PackedScales, layer.OutFeatures)
+	case layer.QuantMode == QuantInt8:
 		// Quantization-aware training: use a fake-quantized weight in the
 		// forward pass. Backward keeps the straight-through estimator.
-		weight = tensors.FakeQuantizeInt8Rows(weight)
+		outputMatrix = tensors.MatMulTransposed(inputMatrix, tensors.FakeQuantizeInt8Rows(layer.Weight))
+	default:
+		outputMatrix = tensors.MatMulTransposed(inputMatrix, layer.Weight)
 	}
-	outputMatrix := tensors.MatMulTransposed(inputMatrix, weight) // [rows, out]
 	return outputMatrix.Reshape(append(append([]int(nil), input.Shape[:len(input.Shape)-1]...), layer.OutFeatures)...)
 }
 

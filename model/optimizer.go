@@ -27,6 +27,10 @@ func (model *Transformer) SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, w
 		if block.attention.compressor != nil {
 			matrixParameters = append(matrixParameters, block.attention.compressor.logitWeight.Weight)
 		}
+		if block.attention.indexer != nil {
+			matrixParameters = append(matrixParameters,
+				block.attention.indexer.query.Weight, block.attention.indexer.key.Weight)
+		}
 	}
 
 	var valueEmbeddingParameters []*tensors.Tensor
@@ -38,6 +42,9 @@ func (model *Transformer) SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, w
 	for _, block := range model.blocks {
 		if block.attention.compressor != nil {
 			smearParameters = append(smearParameters, block.attention.compressor.bias)
+		}
+		if block.attention.indexer != nil {
+			smearParameters = append(smearParameters, block.attention.indexer.headWeights)
 		}
 	}
 

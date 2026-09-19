@@ -27,6 +27,11 @@ func (model *Transformer) NamedParameters() map[string]*tensors.Tensor {
 			parameters[fmt.Sprintf("transformer.h.%d.attn.compress_logits.weight", layerIndex)] = block.attention.compressor.logitWeight.Weight
 			parameters[fmt.Sprintf("transformer.h.%d.attn.compress_bias", layerIndex)] = block.attention.compressor.bias
 		}
+		if block.attention.indexer != nil {
+			parameters[fmt.Sprintf("transformer.h.%d.attn.indexer_query.weight", layerIndex)] = block.attention.indexer.query.Weight
+			parameters[fmt.Sprintf("transformer.h.%d.attn.indexer_key.weight", layerIndex)] = block.attention.indexer.key.Weight
+			parameters[fmt.Sprintf("transformer.h.%d.attn.indexer_heads", layerIndex)] = block.attention.indexer.headWeights
+		}
 		parameters[fmt.Sprintf("transformer.h.%d.mlp.c_fc.weight", layerIndex)] = block.mlp.inputProjection.Weight
 		parameters[fmt.Sprintf("transformer.h.%d.mlp.c_proj.weight", layerIndex)] = block.mlp.outputProjection.Weight
 	}

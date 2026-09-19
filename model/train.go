@@ -80,7 +80,13 @@ func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cos
 
 	if attention.compressor != nil {
 		context.compression = compressForward(attention.compressor, input, keyHeadMajor, valueHeadMajor, attention.compressionRatio)
-		compressedAttentionForward(queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed, outputHeadMajor, logSumExp, headRatio, attention.compressionRatio)
+		if attention.indexer != nil {
+			context.compression.selection, context.compression.indexerContexts, context.compression.indexerScores, context.compression.indexerTargets =
+				sparseTrainingPlan(attention, input, context.compression.keyCompressed, queryHeadMajor)
+			compressedAttentionForwardSparse(queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed, outputHeadMajor, logSumExp, context.compression.selection, headRatio, attention.compressionRatio)
+		} else {
+			compressedAttentionForward(queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed, outputHeadMajor, logSumExp, headRatio, attention.compressionRatio)
+		}
 	} else {
 		for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
 			for queryHead := 0; queryHead < attention.queryHeadCount; queryHead++ {
@@ -122,10 +128,22 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 		blocks := context.compression.blocks
 		gradientKeyCompressed := tensors.New(batchSize, attention.keyValueHeadCount, blocks, headDimension)
 		gradientValueCompressed := tensors.New(batchSize, attention.keyValueHeadCount, blocks, headDimension)
-		compressedAttentionBackward(context.queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed,
-			context.outputHeadMajor, gradientOutputHeadMajor, context.logSumExp,
-			gradientQuery, gradientKeyCompressed, gradientValueCompressed, headRatio, attention.compressionRatio)
-		gradientInputFromCompressor, gradientKey, gradientValue = compressBackward(attention.compressor, context.compression, gradientKeyCompressed, gradientValueCompressed)
+		if attention.indexer != nil {
+			compressedAttentionBackwardSparse(context.queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed,
+				context.outputHeadMajor, gradientOutputHeadMajor, context.logSumExp,
+				gradientQuery, gradientKeyCompressed, gradientValueCompressed, context.compression.selection, headRatio, attention.compressionRatio)
+			indexerInputGradient, indexerKeyGradient := attention.indexerDistillationGradient(context.compression)
+			for element := range gradientKeyCompressed.Data {
+				gradientKeyCompressed.Data[element] += indexerKeyGradient.Data[element]
+			}
+			gradientInputFromCompressor, gradientKey, gradientValue = compressBackward(attention.compressor, context.compression, gradientKeyCompressed, gradientValueCompressed)
+			gradientInputFromCompressor = tensors.Add(gradientInputFromCompressor, indexerInputGradient)
+		} else {
+			compressedAttentionBackward(context.queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed,
+				context.outputHeadMajor, gradientOutputHeadMajor, context.logSumExp,
+				gradientQuery, gradientKeyCompressed, gradientValueCompressed, headRatio, attention.compressionRatio)
+			gradientInputFromCompressor, gradientKey, gradientValue = compressBackward(attention.compressor, context.compression, gradientKeyCompressed, gradientValueCompressed)
+		}
 	} else {
 		gradientKey = tensors.New(batchSize, attention.keyValueHeadCount, sequenceLength, headDimension)
 		gradientValue = tensors.New(batchSize, attention.keyValueHeadCount, sequenceLength, headDimension)

@@ -16,6 +16,255 @@ type compressedContext struct {
 	valueContexts   []*compressorContext
 	blocks          int
 	ratio           int
+	// selection[b*Hkv+h][token] holds the selected compressed block indices for
+	// sparse layers; nil on dense layers.
+	selection [][][]int
+	// indexerContexts, indexerScores, and indexerTargets are the per-(batch,
+	// kv-head) indexer projections, scores, and distillation targets; nil on
+	// dense layers.
+	indexerContexts []*indexerContext
+	indexerScores   []*tensors.Tensor
+	indexerTargets  []*tensors.Tensor
+}
+
+// sparseTrainingPlan scores every compressed block with the indexer, selects
+// the top-k blocks per token, and computes the distillation target: for each
+// query token the softmax over its allowed compressed blocks of the mean main
+// attention logit across the query heads sharing that key/value head. Training
+// sees the full sequence, so the position offset is zero.
+func sparseTrainingPlan(attention *CausalSelfAttention, input, keyCompressed, queryHeadMajor *tensors.Tensor) ([][][]int, []*indexerContext, []*tensors.Tensor, []*tensors.Tensor) {
+	batchSize := keyCompressed.Shape[0]
+	kvHeadCount := keyCompressed.Shape[1]
+	blockCount := keyCompressed.Shape[2]
+	headDimension := keyCompressed.Shape[3]
+	sequenceLength := input.Shape[1]
+	embeddingDimension := input.Shape[2]
+	queryHeadCount := queryHeadMajor.Shape[1]
+	headRatio := queryHeadCount / kvHeadCount
+	ratio := attention.compressionRatio
+
+	selection := make([][][]int, batchSize*kvHeadCount)
+	contexts := make([]*indexerContext, batchSize*kvHeadCount)
+	scoresByHead := make([]*tensors.Tensor, batchSize*kvHeadCount)
+	targets := make([]*tensors.Tensor, batchSize*kvHeadCount)
+
+	for batch := 0; batch < batchSize; batch++ {
+		hiddenSlice := tensors.NewWithData([]int{1, sequenceLength, embeddingDimension},
+			input.Data[batch*sequenceLength*embeddingDimension:(batch+1)*sequenceLength*embeddingDimension])
+		for head := 0; head < kvHeadCount; head++ {
+			index := batch*kvHeadCount + head
+			compressed := tensors.NewWithData([]int{1, blockCount, headDimension}, headSlice(keyCompressed.Data, index, blockCount, headDimension))
+			scores, context := attention.indexer.ScoresWithContext(hiddenSlice, compressed)
+			selection[index] = SelectBlocks(scores, 0, ratio, attention.sparseTopK)
+			contexts[index] = context
+			scoresByHead[index] = scores
+			targets[index] = distillationTarget(queryHeadMajor, keyCompressed, batch, head, headRatio, ratio, sequenceLength, blockCount, headDimension)
+		}
+	}
+	return selection, contexts, scoresByHead, targets
+}
+
+// indexerDistillationGradient backpropagates the indexer distillation loss,
+// whose gradient with respect to the index scores is (softmax(I) - target). It
+// returns the gradients with respect to the attention input and the compressed
+// keys.
+func (attention *CausalSelfAttention) indexerDistillationGradient(context *compressedContext) (gradientInput, gradientKeyCompressed *tensors.Tensor) {
+	batchSize := context.keyCompressed.Shape[0]
+	kvHeadCount := context.keyCompressed.Shape[1]
+	blockCount := context.keyCompressed.Shape[2]
+	headDimension := context.keyCompressed.Shape[3]
+	sequenceLength := context.input.Shape[1]
+	embeddingDimension := context.input.Shape[2]
+	weight := attention.indexerLossWeight
+
+	gradientInput = tensors.New(batchSize, sequenceLength, embeddingDimension)
+	gradientKeyCompressed = tensors.New(batchSize, kvHeadCount, blockCount, headDimension)
+
+	for batch := 0; batch < batchSize; batch++ {
+		for head := 0; head < kvHeadCount; head++ {
+			index := batch*kvHeadCount + head
+			probabilities := maskedIndexerSoftmax(context.indexerScores[index], attention.compressionRatio)
+			target := context.indexerTargets[index]
+			gradientScores := tensors.New(sequenceLength, blockCount)
+			for element := range gradientScores.Data {
+				gradientScores.Data[element] = (probabilities[element] - target.Data[element]) * weight
+			}
+			gradientHidden, gradientCompressed := attention.indexer.Backward(gradientScores, context.indexerContexts[index])
+			for element := range gradientHidden.Data {
+				gradientInput.Data[batch*sequenceLength*embeddingDimension+element] += gradientHidden.Data[element]
+			}
+			copy(gradientKeyCompressed.Data[index*blockCount*headDimension:], gradientCompressed.Data)
+		}
+	}
+	return gradientInput, gradientKeyCompressed
+}
+
+// distillationTarget builds the [T, blocks] target distribution over the
+// allowed compressed blocks from the mean main attention logits.
+func distillationTarget(queryHeadMajor, keyCompressed *tensors.Tensor, batch, keyValueHead, headRatio, ratio, sequenceLength, blockCount, headDimension int) *tensors.Tensor {
+	target := tensors.New(sequenceLength, blockCount)
+	queryHeadCount := queryHeadMajor.Shape[1]
+	for token := 0; token < sequenceLength; token++ {
+		allowed := token / ratio
+		if allowed > blockCount {
+			allowed = blockCount
+		}
+		if allowed == 0 {
+			continue
+		}
+		logits := make([]float32, allowed)
+		maximum := float32(math.Inf(-1))
+		for block := 0; block < allowed; block++ {
+			var sum float32
+			for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
+				if queryHead/headRatio != keyValueHead {
+					continue
+				}
+				queryRow := queryHeadMajor.Data[(batch*queryHeadCount+queryHead)*sequenceLength*headDimension+token*headDimension : (batch*queryHeadCount+queryHead)*sequenceLength*headDimension+(token+1)*headDimension]
+				keyRow := keyCompressed.Data[((batch*keyCompressed.Shape[1]+keyValueHead)*blockCount+block)*headDimension : ((batch*keyCompressed.Shape[1]+keyValueHead)*blockCount+block+1)*headDimension]
+				var dot float32
+				for element := 0; element < headDimension; element++ {
+					dot += queryRow[element] * keyRow[element]
+				}
+				sum += dot
+			}
+			logits[block] = sum / float32(headRatio)
+			if logits[block] > maximum {
+				maximum = logits[block]
+			}
+		}
+		var total float64
+		for block := 0; block < allowed; block++ {
+			value := math.Exp(float64(logits[block] - maximum))
+			target.Data[token*blockCount+block] = float32(value)
+			total += value
+		}
+		for block := 0; block < allowed; block++ {
+			target.Data[token*blockCount+block] /= float32(total)
+		}
+	}
+	return target
+}
+
+// maskedIndexerSoftmax returns the indexer softmax restricted to each token's
+// allowed blocks (others are zero).
+func maskedIndexerSoftmax(scores *tensors.Tensor, ratio int) []float32 {
+	tokenCount := scores.Shape[0]
+	blockCount := scores.Shape[1]
+	probabilities := make([]float32, len(scores.Data))
+	for token := 0; token < tokenCount; token++ {
+		allowed := token / ratio
+		if allowed > blockCount {
+			allowed = blockCount
+		}
+		if allowed == 0 {
+			continue
+		}
+		maximum := scores.Data[token*blockCount]
+		for block := 1; block < allowed; block++ {
+			if scores.Data[token*blockCount+block] > maximum {
+				maximum = scores.Data[token*blockCount+block]
+			}
+		}
+		var total float64
+		for block := 0; block < allowed; block++ {
+			value := math.Exp(float64(scores.Data[token*blockCount+block] - maximum))
+			probabilities[token*blockCount+block] = float32(value)
+			total += value
+		}
+		for block := 0; block < allowed; block++ {
+			probabilities[token*blockCount+block] /= float32(total)
+		}
+	}
+	return probabilities
+}
+
+// compressedAttentionForwardSparse is the training/prefill attention over the
+// selected compressed blocks for every (batch, query head).
+func compressedAttentionForwardSparse(queryHeadMajor, keyCompressed, valueCompressed, outputHeadMajor, logSumExp *tensors.Tensor, selection [][][]int, headRatio, ratio int) {
+	batchSize := queryHeadMajor.Shape[0]
+	queryHeadCount := queryHeadMajor.Shape[1]
+	sequenceLength := queryHeadMajor.Shape[2]
+	headDimension := queryHeadMajor.Shape[3]
+	kvHeadCount := keyCompressed.Shape[1]
+	blockCount := keyCompressed.Shape[2]
+
+	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
+			queryIndex := batchIndex*queryHeadCount + queryHead
+			keyValueHead := queryHead / headRatio
+			keyBase := (batchIndex*kvHeadCount + keyValueHead) * blockCount * headDimension
+			for token := 0; token < sequenceLength; token++ {
+				outputSlice := outputHeadMajor.Data[queryIndex*sequenceLength*headDimension+token*headDimension : queryIndex*sequenceLength*headDimension+(token+1)*headDimension]
+				selected := selection[batchIndex*kvHeadCount+keyValueHead][token]
+				if len(selected) == 0 {
+					clear(outputSlice)
+					if logSumExp != nil {
+						logSumExp.Data[queryIndex*sequenceLength+token] = float32(math.Inf(-1))
+					}
+					continue
+				}
+				// Gather the selected compressed rows into contiguous scratch.
+				keySlice := make([]float32, len(selected)*headDimension)
+				valueSlice := make([]float32, len(selected)*headDimension)
+				for index, block := range selected {
+					copy(keySlice[index*headDimension:(index+1)*headDimension], keyCompressed.Data[keyBase+block*headDimension:keyBase+(block+1)*headDimension])
+					copy(valueSlice[index*headDimension:(index+1)*headDimension], valueCompressed.Data[keyBase+block*headDimension:keyBase+(block+1)*headDimension])
+				}
+				querySlice := queryHeadMajor.Data[queryIndex*sequenceLength*headDimension+token*headDimension : queryIndex*sequenceLength*headDimension+(token+1)*headDimension]
+				var logSumExpSlice []float32
+				if logSumExp != nil {
+					logSumExpSlice = logSumExp.Data[queryIndex*sequenceLength+token : queryIndex*sequenceLength+token+1]
+				}
+				tensors.AttentionForward(querySlice, keySlice, valueSlice, outputSlice, logSumExpSlice, 1, len(selected), headDimension, len(selected), -1)
+			}
+		}
+	}
+}
+
+// compressedAttentionBackwardSparse backpropagates through the selected blocks.
+func compressedAttentionBackwardSparse(queryHeadMajor, keyCompressed, valueCompressed, outputHeadMajor, gradientOutputHeadMajor, logSumExp, gradientQueryHeadMajor, gradientKeyCompressed, gradientValueCompressed *tensors.Tensor, selection [][][]int, headRatio, ratio int) {
+	batchSize := queryHeadMajor.Shape[0]
+	queryHeadCount := queryHeadMajor.Shape[1]
+	sequenceLength := queryHeadMajor.Shape[2]
+	headDimension := queryHeadMajor.Shape[3]
+	kvHeadCount := keyCompressed.Shape[1]
+	blockCount := keyCompressed.Shape[2]
+
+	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
+			queryIndex := batchIndex*queryHeadCount + queryHead
+			keyValueHead := queryHead / headRatio
+			keyBase := (batchIndex*kvHeadCount + keyValueHead) * blockCount * headDimension
+			for token := 0; token < sequenceLength; token++ {
+				selected := selection[batchIndex*kvHeadCount+keyValueHead][token]
+				if len(selected) == 0 {
+					continue
+				}
+				keySlice := make([]float32, len(selected)*headDimension)
+				valueSlice := make([]float32, len(selected)*headDimension)
+				gradientKeySlice := make([]float32, len(selected)*headDimension)
+				gradientValueSlice := make([]float32, len(selected)*headDimension)
+				for index, block := range selected {
+					copy(keySlice[index*headDimension:(index+1)*headDimension], keyCompressed.Data[keyBase+block*headDimension:keyBase+(block+1)*headDimension])
+					copy(valueSlice[index*headDimension:(index+1)*headDimension], valueCompressed.Data[keyBase+block*headDimension:keyBase+(block+1)*headDimension])
+				}
+				querySlice := queryHeadMajor.Data[queryIndex*sequenceLength*headDimension+token*headDimension : queryIndex*sequenceLength*headDimension+(token+1)*headDimension]
+				outputSlice := outputHeadMajor.Data[queryIndex*sequenceLength*headDimension+token*headDimension : queryIndex*sequenceLength*headDimension+(token+1)*headDimension]
+				gradientOutputSlice := gradientOutputHeadMajor.Data[queryIndex*sequenceLength*headDimension+token*headDimension : queryIndex*sequenceLength*headDimension+(token+1)*headDimension]
+				gradientQuerySlice := gradientQueryHeadMajor.Data[queryIndex*sequenceLength*headDimension+token*headDimension : queryIndex*sequenceLength*headDimension+(token+1)*headDimension]
+				logSumExpSlice := logSumExp.Data[queryIndex*sequenceLength+token : queryIndex*sequenceLength+token+1]
+				tensors.AttentionBackward(querySlice, keySlice, valueSlice, outputSlice, gradientOutputSlice, logSumExpSlice,
+					gradientQuerySlice, gradientKeySlice, gradientValueSlice, 1, len(selected), headDimension, len(selected), -1)
+				for index, block := range selected {
+					for element := 0; element < headDimension; element++ {
+						gradientKeyCompressed.Data[keyBase+block*headDimension+element] += gradientKeySlice[index*headDimension+element]
+						gradientValueCompressed.Data[keyBase+block*headDimension+element] += gradientValueSlice[index*headDimension+element]
+					}
+				}
+			}
+		}
+	}
 }
 
 // compressForward compresses the head-major key and value [B, Hkv, T, D] into
@@ -198,28 +447,86 @@ func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value
 		}
 	}
 
-	for batch := 0; batch < batchSize; batch++ {
-		for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
-			keyValueHead := queryHead / headRatio
-			queryIndex := batch*queryHeadCount + queryHead
-			for position := 0; position < sequenceLength; position++ {
-				absolutePosition := positionOffset + position
-				count := absolutePosition / ratio
-				outputRow := outputHeadMajor.Data[(queryIndex*sequenceLength+position)*headDimension : (queryIndex*sequenceLength+position+1)*headDimension]
-				if count == 0 {
-					clear(outputRow)
-					continue
+	if attention.indexer != nil {
+		attention.forwardCompressedSparse(input, queryHeadMajor, cache, layer, positionOffset, outputHeadMajor)
+	} else {
+		for batch := 0; batch < batchSize; batch++ {
+			for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
+				keyValueHead := queryHead / headRatio
+				queryIndex := batch*queryHeadCount + queryHead
+				for position := 0; position < sequenceLength; position++ {
+					absolutePosition := positionOffset + position
+					count := absolutePosition / ratio
+					outputRow := outputHeadMajor.Data[(queryIndex*sequenceLength+position)*headDimension : (queryIndex*sequenceLength+position+1)*headDimension]
+					if count == 0 {
+						clear(outputRow)
+						continue
+					}
+					queryRow := queryHeadMajor.Data[(queryIndex*sequenceLength+position)*headDimension : (queryIndex*sequenceLength+position+1)*headDimension]
+					keySlice := cache.CompressedKey(layer, batch, keyValueHead, count)
+					valueSlice := cache.CompressedValue(layer, batch, keyValueHead, count)
+					tensors.AttentionForward(queryRow, keySlice, valueSlice, outputRow, nil, 1, count, headDimension, count, -1)
 				}
-				queryRow := queryHeadMajor.Data[(queryIndex*sequenceLength+position)*headDimension : (queryIndex*sequenceLength+position+1)*headDimension]
-				keySlice := cache.CompressedKey(layer, batch, keyValueHead, count)
-				valueSlice := cache.CompressedValue(layer, batch, keyValueHead, count)
-				tensors.AttentionForward(queryRow, keySlice, valueSlice, outputRow, nil, 1, count, headDimension, count, -1)
 			}
 		}
 	}
 
 	output := toBatchSequenceLayout(outputHeadMajor).Reshape(batchSize, sequenceLength, queryHeadCount*headDimension)
 	return attention.outputProjection.Forward(output)
+}
+
+// forwardCompressedSparse is the inference attention over the top-k compressed
+// blocks selected by the lightning indexer. Selection is shared across the
+// query heads that map to one key/value head.
+func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMajor *tensors.Tensor, cache *KVBuffer, layer, positionOffset int, outputHeadMajor *tensors.Tensor) {
+	batchSize := input.Shape[0]
+	sequenceLength := input.Shape[1]
+	embeddingDimension := input.Shape[2]
+	queryHeadCount := attention.queryHeadCount
+	kvHeadCount := attention.keyValueHeadCount
+	headDimension := attention.headDimension
+	ratio := attention.compressionRatio
+	headRatio := queryHeadCount / kvHeadCount
+	topK := attention.sparseTopK
+
+	for batch := 0; batch < batchSize; batch++ {
+		available := cache.CompressedCount(layer, batch)
+		hiddenSlice := tensors.NewWithData([]int{1, sequenceLength, embeddingDimension},
+			input.Data[batch*sequenceLength*embeddingDimension:(batch+1)*sequenceLength*embeddingDimension])
+		for keyValueHead := 0; keyValueHead < kvHeadCount; keyValueHead++ {
+			var selection [][]int
+			var keyData, valueData []float32
+			if available > 0 {
+				keyData = cache.CompressedKey(layer, batch, keyValueHead, available)
+				valueData = cache.CompressedValue(layer, batch, keyValueHead, available)
+				compressed := tensors.NewWithData([]int{1, available, headDimension}, keyData)
+				scores := attention.indexer.Scores(hiddenSlice, compressed)
+				selection = SelectBlocks(scores, positionOffset, ratio, topK)
+			}
+			keyBuffer := make([]float32, topK*headDimension)
+			valueBuffer := make([]float32, topK*headDimension)
+			for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
+				if queryHead/headRatio != keyValueHead {
+					continue
+				}
+				queryIndex := batch*queryHeadCount + queryHead
+				for position := 0; position < sequenceLength; position++ {
+					outputRow := outputHeadMajor.Data[(queryIndex*sequenceLength+position)*headDimension : (queryIndex*sequenceLength+position+1)*headDimension]
+					if available == 0 || len(selection[position]) == 0 {
+						clear(outputRow)
+						continue
+					}
+					selected := selection[position]
+					for index, block := range selected {
+						copy(keyBuffer[index*headDimension:(index+1)*headDimension], keyData[block*headDimension:(block+1)*headDimension])
+						copy(valueBuffer[index*headDimension:(index+1)*headDimension], valueData[block*headDimension:(block+1)*headDimension])
+					}
+					queryRow := queryHeadMajor.Data[(queryIndex*sequenceLength+position)*headDimension : (queryIndex*sequenceLength+position+1)*headDimension]
+					tensors.AttentionForward(queryRow, keyBuffer[:len(selected)*headDimension], valueBuffer[:len(selected)*headDimension], outputRow, nil, 1, len(selected), headDimension, len(selected), -1)
+				}
+			}
+		}
+	}
 }
 
 // compressBackward backpropagates the compressed key/value gradients through

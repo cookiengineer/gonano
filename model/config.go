@@ -27,6 +27,39 @@ type Config struct {
 	// empty string disables it; "int8" uses per-row symmetric int8 fake
 	// quantization with a straight-through estimator.
 	QAT string `json:"qat,omitempty"`
+	// SparseTopK enables CSA-style sparse attention on compressed layers: each
+	// query attends only to the top-k compressed blocks selected by the
+	// lightning indexer. Zero disables sparsity (dense compressed attention).
+	SparseTopK int `json:"sparse_top_k,omitempty"`
+	// IndexerDim is the per-head dimension of the lightning indexer.
+	IndexerDim int `json:"indexer_dim,omitempty"`
+	// IndexerHeads is the number of indexer query heads.
+	IndexerHeads int `json:"indexer_heads,omitempty"`
+	// IndexerLossWeight scales the indexer distillation loss used to train the
+	// sparse selection. Zero uses the default of 1.
+	IndexerLossWeight float32 `json:"indexer_loss_weight,omitempty"`
+}
+
+// IndexerWeight returns the effective indexer distillation loss weight.
+func (config Config) IndexerWeight() float32 {
+	if config.IndexerLossWeight <= 0 {
+		return 1.0
+	}
+	return config.IndexerLossWeight
+}
+
+// indexerDefaults returns the indexer dimension and head count, applying
+// defaults when unset.
+func (config Config) indexerDefaults() (dim, heads int) {
+	dim = config.IndexerDim
+	if dim <= 0 {
+		dim = 64
+	}
+	heads = config.IndexerHeads
+	if heads <= 0 {
+		heads = 1
+	}
+	return dim, heads
 }
 
 // Compression returns the effective KV compression ratio (>= 1).
@@ -78,6 +111,9 @@ func (config Config) Validate() {
 	}
 	if config.QAT != "" && config.QAT != "int8" {
 		panic(fmt.Sprintf("model: unsupported QAT mode %q", config.QAT))
+	}
+	if config.SparseTopK > 0 && config.Compression() <= 1 {
+		panic("model: SparseTopK requires CompressionRatio > 1")
 	}
 }
 
