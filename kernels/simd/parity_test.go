@@ -285,6 +285,42 @@ func TestAttentionSplitParity(t *testing.T) {
 	}
 }
 
+// TestAttentionBackwardCorrectionParity verifies that the optional row
+// correction used to merge several attention branches is implemented
+// identically by the SIMD and scalar backends.
+func TestAttentionBackwardCorrectionParity(t *testing.T) {
+	simdBackend := simdbackend.New()
+	scalarBackend := scalar.New()
+	queryLength, keyLength, headDim := 7, 9, 8
+	query := kerneltest.Data(queryLength * headDim)
+	key := kerneltest.Data(keyLength * headDim)
+	value := kerneltest.DataB(keyLength * headDim)
+	outputGradient := kerneltest.Data(queryLength * headDim)
+	logSumExp := make([]float32, queryLength)
+	correction := kerneltest.Data(queryLength)
+	for index := range logSumExp {
+		logSumExp[index] = -float32(index) - 0.5
+	}
+
+	parameters := kernels.AttentionBackwardParameters{
+		Query: query, Key: key, Value: value, OutputGradient: outputGradient,
+		LogSumExp: logSumExp, RowCorrection: correction,
+		QueryLength: queryLength, KeyLength: keyLength, HeadDim: headDim,
+		PositionOffset: queryLength + keyLength, Window: -1,
+	}
+	gotQuery := make([]float32, queryLength*headDim)
+	gotKey := make([]float32, keyLength*headDim)
+	gotValue := make([]float32, keyLength*headDim)
+	wantQuery := make([]float32, queryLength*headDim)
+	wantKey := make([]float32, keyLength*headDim)
+	wantValue := make([]float32, keyLength*headDim)
+	simdBackend.AttentionBackward(parameters, kernels.AttentionBackwardResult{QueryGradient: gotQuery, KeyGradient: gotKey, ValueGradient: gotValue})
+	scalarBackend.AttentionBackward(parameters, kernels.AttentionBackwardResult{QueryGradient: wantQuery, KeyGradient: wantKey, ValueGradient: wantValue})
+	kerneltest.AssertSlicesClose(t, gotQuery, wantQuery, 5e-3, 1e-5)
+	kerneltest.AssertSlicesClose(t, gotKey, wantKey, 5e-3, 1e-5)
+	kerneltest.AssertSlicesClose(t, gotValue, wantValue, 5e-3, 1e-5)
+}
+
 // TestAttentionParity verifies the attention forward and backward against the
 // scalar reference across decode, sliding-window, and full-causal shapes.
 func TestAttentionParity(t *testing.T) {

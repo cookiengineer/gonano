@@ -49,6 +49,13 @@ type Config struct {
 	// and the most recently published selection. The pattern must start with
 	// 'F'. Empty or all-'F' keeps the historical all-layers-full behaviour.
 	ReusePattern string `json:"reuse_pattern,omitempty"`
+	// SWAWindow enables the local sliding-window attention branch on
+	// compressed layers (DeepSeek-V4.1 §2.2). Each compressed query attends to
+	// the global compressed blocks together with the raw keys/values in the
+	// preceding window. Zero disables the local branch, preserving the
+	// historical global-only compressed attention. It is ignored unless
+	// CompressionRatio > 1.
+	SWAWindow int `json:"swa_window,omitempty"`
 }
 
 // ReuseMode is the per-layer compressed-attention reuse role.
@@ -149,6 +156,15 @@ func (config Config) Compression() int {
 	return config.CompressionRatio
 }
 
+// SWAWindowSize returns the local sliding-window width used by compressed
+// layers. Zero disables the local branch.
+func (config Config) SWAWindowSize() int {
+	if config.SWAWindow < 0 {
+		return 0
+	}
+	return config.SWAWindow
+}
+
 // defaultRotaryDims is the partial-RoPE width used by ConfigForDepthRatio when
 // the head dimension allows it, matching DeepSeek-V4's 64-dim rotary slice.
 const defaultRotaryDims = 64
@@ -190,6 +206,9 @@ func (config Config) Validate() {
 	}
 	if config.SparseTopK > 0 && config.Compression() <= 1 {
 		panic("model: SparseTopK requires CompressionRatio > 1")
+	}
+	if config.SWAWindow < 0 {
+		panic(fmt.Sprintf("model: SWAWindow %d must be >= 0", config.SWAWindow))
 	}
 	if config.ReusePattern != "" {
 		if config.Compression() <= 1 {

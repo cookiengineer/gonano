@@ -29,6 +29,7 @@ func main() {
 	indexerPool := flag.Int("indexer-pool", 0, "hierarchical indexer super-block size (0 disables)")
 	indexerCandidates := flag.Int("indexer-candidates", 0, "hierarchical indexer candidate budget (0 = auto)")
 	reusePattern := flag.String("reuse-pattern", "", "cross-layer reuse pattern of F/R/U per layer (empty = all full)")
+	swaWindow := flag.Int("swa-window", 0, "local sliding-window branch width on compressed layers (0 disables)")
 	vocabSize := flag.Int("vocab-size", 32768, "vocabulary size")
 	numIterations := flag.Int("num-iterations", 50, "optimization steps")
 	deviceBatchSize := flag.Int("device-batch-size", 1, "per-step batch size")
@@ -66,6 +67,7 @@ func main() {
 	configuration.IndexerPool = *indexerPool
 	configuration.IndexerCandidates = *indexerCandidates
 	configuration.ReusePattern = *reusePattern
+	configuration.SWAWindow = *swaWindow
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 

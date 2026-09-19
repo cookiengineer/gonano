@@ -96,6 +96,10 @@ type CausalSelfAttention struct {
 	indexerLossWeight float32
 	indexerPool       int
 	indexerCandidates int
+	// swaWindow is the local sliding-window width merged with the compressed
+	// global branch on compressed layers (DeepSeek-V4.1 §2.2). Zero disables
+	// the local branch.
+	swaWindow int
 
 	// reuseMode/producer implement cross-layer compressed KV/index reuse. A
 	// full layer produces compressed KV (and selection); reindex/reuse layers
@@ -135,6 +139,7 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool, layer 
 	if ratio := configuration.Compression(); ratio > 1 {
 		attention.compressionRatio = ratio
 		attention.sparseTopK = configuration.SparseTopK
+		attention.swaWindow = configuration.SWAWindowSize()
 		// Only full layers produce compressed KV. Reindex layers borrow the
 		// compressed KV but keep their own indexer for fresh selection; reuse
 		// layers borrow both and own neither.

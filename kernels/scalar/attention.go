@@ -174,8 +174,12 @@ func (backend *Backend) AttentionBackward(parameters kernels.AttentionBackwardPa
 	for queryIndex := 0; queryIndex < queryLength; queryIndex++ {
 		base := queryIndex * keyLength
 		var rowDotProduct float64
-		for keyIndex := 0; keyIndex < keyLength; keyIndex++ {
-			rowDotProduct += float64(outputGradientProbability[base+keyIndex]) * float64(probabilities[base+keyIndex])
+		if parameters.RowCorrection != nil {
+			rowDotProduct = float64(parameters.RowCorrection[queryIndex])
+		} else {
+			for keyIndex := 0; keyIndex < keyLength; keyIndex++ {
+				rowDotProduct += float64(outputGradientProbability[base+keyIndex]) * float64(probabilities[base+keyIndex])
+			}
 		}
 		for keyIndex := 0; keyIndex < keyLength; keyIndex++ {
 			probability := float64(probabilities[base+keyIndex])

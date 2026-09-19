@@ -82,3 +82,32 @@ func AttentionBackward(query, key, value, output, outputGradient, logSumExp, que
 		},
 	)
 }
+
+// AttentionBackwardCorrected is AttentionBackward with an explicit row
+// correction term (length queryLength). It is used to merge several attention
+// branches (e.g. a global compressed branch and a local sliding-window branch)
+// that share one softmax: every branch is backpropagated with the merged
+// log-sum-exp and the merged correction dO_i . O_i.
+func AttentionBackwardCorrected(query, key, value, output, outputGradient, logSumExp, rowCorrection, queryGradient, keyGradient, valueGradient []float32, queryLength, keyLength, headDim, positionOffset, window int) {
+	KernelBackend().AttentionBackward(
+		kernels.AttentionBackwardParameters{
+			Query:          query,
+			Key:            key,
+			Value:          value,
+			Output:         output,
+			OutputGradient: outputGradient,
+			LogSumExp:      logSumExp,
+			RowCorrection:  rowCorrection,
+			QueryLength:    queryLength,
+			KeyLength:      keyLength,
+			HeadDim:        headDim,
+			PositionOffset: positionOffset,
+			Window:         window,
+		},
+		kernels.AttentionBackwardResult{
+			QueryGradient: queryGradient,
+			KeyGradient:   keyGradient,
+			ValueGradient: valueGradient,
+		},
+	)
+}

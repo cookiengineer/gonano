@@ -269,6 +269,10 @@ func (backend *Backend) AttentionBackward(parameters kernels.AttentionBackwardPa
 
 		logSumExp := parameters.LogSumExp[queryIndex]
 		var rowDotProduct float64
+		useCorrection := parameters.RowCorrection != nil
+		if useCorrection {
+			rowDotProduct = float64(parameters.RowCorrection[queryIndex])
+		}
 		for keyIndex := 0; keyIndex < keyLength; keyIndex++ {
 			probability := float32(0)
 			if scores[keyIndex] > maskedAttentionScore {
@@ -277,7 +281,9 @@ func (backend *Backend) AttentionBackward(parameters kernels.AttentionBackwardPa
 			probabilities[keyIndex] = probability
 			gradientProbability := dotProduct(outputGradientRow, parameters.Value[keyIndex*headDim:(keyIndex+1)*headDim], headDim)
 			outputGradientProbability[keyIndex] = gradientProbability
-			rowDotProduct += float64(gradientProbability) * float64(probability)
+			if !useCorrection {
+				rowDotProduct += float64(gradientProbability) * float64(probability)
+			}
 		}
 
 		for keyIndex := 0; keyIndex < keyLength; keyIndex++ {

@@ -117,6 +117,13 @@ type AttentionForwardResult struct {
 // AttentionBackwardParameters describes a single (batch, head) attention
 // backward pass. Output and OutputGradient are [queryLength, headDim];
 // LogSumExp is the forward statistic (length queryLength).
+//
+// RowCorrection is optional (length queryLength). When supplied, it replaces
+// the row correction term sum_j P_ij (dO_i . V_ij) with the provided value.
+// This lets several attention branches (for example a global compressed branch
+// and a local sliding-window branch) share one merged softmax: each branch is
+// backpropagated with the merged log-sum-exp and the merged correction
+// dO_i . O_i, which is exactly the gradient of the union of their keys.
 type AttentionBackwardParameters struct {
 	Query          []float32
 	Key            []float32
@@ -124,6 +131,7 @@ type AttentionBackwardParameters struct {
 	Output         []float32
 	OutputGradient []float32
 	LogSumExp      []float32
+	RowCorrection  []float32
 	QueryLength    int
 	KeyLength      int
 	HeadDim        int

@@ -24,6 +24,31 @@ func (model *Transformer) MatmulParams() int {
 	return total
 }
 
+// attentionLengths returns the global and local (sliding-window) attention
+// context lengths for one layer at the given context length. With compression
+// the global branch attends to ceil(context/ratio) compressed entries and, when
+// SWAWindow is set, the local branch attends to at most SWAWindow recent
+// tokens. Without compression the historical per-layer window applies.
+func (model *Transformer) attentionLengths(layer, contextLength int) (global, local int) {
+	if model.Config.Compression() > 1 {
+		ratio := model.Config.Compression()
+		global = (contextLength + ratio - 1) / ratio
+		if global < 1 {
+			global = 1
+		}
+		local = model.Config.SWAWindowSize()
+		if local > contextLength {
+			local = contextLength
+		}
+		return global, local
+	}
+	global = contextLength
+	if window := model.windowSizes[layer][0]; window >= 0 && window < global {
+		global = window
+	}
+	return global, 0
+}
+
 // EstimateFlopsPerToken returns the FLOPs per token for a full forward+backward
 // pass, following nanochat's formula: 6 flops per matmul param plus attention
 // flops (12*h*q*effective_seq per layer, capped by the sliding window).
@@ -32,13 +57,9 @@ func (model *Transformer) EstimateFlopsPerToken() float64 {
 	headDimension := model.Config.HeadDim()
 	sequenceLength := model.Config.SequenceLen
 	attentionFlops := 0.0
-	for _, windowSize := range model.windowSizes {
-		window := windowSize[0]
-		effectiveLength := sequenceLength
-		if window >= 0 && window < effectiveLength {
-			effectiveLength = window
-		}
-		attentionFlops += 12 * float64(headCount) * float64(headDimension) * float64(effectiveLength)
+	for layer := 0; layer < model.Config.NumLayer; layer++ {
+		global, local := model.attentionLengths(layer, sequenceLength)
+		attentionFlops += 12 * float64(headCount) * float64(headDimension) * float64(global+local)
 	}
 	return 6*float64(model.MatmulParams()) + attentionFlops
 }
@@ -49,13 +70,9 @@ func (model *Transformer) EstimateDecodeFlops(contextLength int) float64 {
 	headCount := model.Config.NumHead
 	headDimension := model.Config.HeadDim()
 	attentionFlops := 0.0
-	for _, windowSize := range model.windowSizes {
-		window := windowSize[0]
-		effectiveLength := contextLength
-		if window >= 0 && window < effectiveLength {
-			effectiveLength = window
-		}
-		attentionFlops += 4 * float64(headCount) * float64(headDimension) * float64(effectiveLength)
+	for layer := 0; layer < model.Config.NumLayer; layer++ {
+		global, local := model.attentionLengths(layer, contextLength)
+		attentionFlops += 4 * float64(headCount) * float64(headDimension) * float64(global+local)
 	}
 	return 2*float64(model.MatmulParams()) + attentionFlops
 }
@@ -65,14 +82,24 @@ func (model *Transformer) EstimatePrefillFlops(numTokens int) float64 {
 	headCount := model.Config.NumHead
 	headDimension := model.Config.HeadDim()
 	attentionFlops := 0.0
-	for _, windowSize := range model.windowSizes {
-		window := windowSize[0]
-		effectiveWindow := window
-		if window < 0 || window > numTokens {
-			effectiveWindow = numTokens
+	ratio := model.Config.Compression()
+	for layer := 0; layer < model.Config.NumLayer; layer++ {
+		global, local := model.attentionLengths(layer, numTokens)
+		var globalPairs, localPairs float64
+		if ratio > 1 {
+			// Each compressed block holds `ratio` queries that attend to the
+			// strictly preceding compressed keys.
+			blockCount := float64(global)
+			globalPairs = float64(ratio) * blockCount * (blockCount - 1) / 2
+		} else {
+			effective := float64(global)
+			globalPairs = effective*(effective+1)/2 + float64(numTokens-int(effective))*effective
 		}
-		attendedTokens := float64(effectiveWindow)*(float64(effectiveWindow)+1)/2 + float64(numTokens-effectiveWindow)*float64(effectiveWindow)
-		attentionFlops += 4 * float64(headCount) * float64(headDimension) * attendedTokens
+		if local > 0 {
+			effective := float64(local)
+			localPairs = effective*(effective+1)/2 + float64(numTokens-int(effective))*effective
+		}
+		attentionFlops += 4 * float64(headCount) * float64(headDimension) * (globalPairs + localPairs)
 	}
 	return 2*float64(model.MatmulParams())*float64(numTokens) + attentionFlops
 }

@@ -47,7 +47,37 @@ Architectural features that reduce memory rather than latency:
   number of entries scored per query, making deeper indexing constant-cost in
   context length.
 
-Notes:
+### Local sliding-window attention
+
+`--swa-window N` adds a **layer-local sliding-window branch** to compressed
+layers: every query attends to the global compressed blocks *and* the raw
+keys/values of the last `N` tokens. The two branches are merged through a single
+exact softmax (they share one log-sum-exp, and each branch's backward is
+corrected by the merged row term `dO·O`), so the local branch adds local context
+without changing the attention semantics. Its cost is bounded by `N` and is
+independent of context length, which is the key property for long context.
+
+Because decode is compute/overhead bound, adding a second branch costs
+throughput at short context; the cost does not grow with context. Depth-4 models,
+`GOMAXPROCS=16`, prompt ≈ seq length, decode 16:
+
+| Model | seq | TTFT (ms) | decode tok/s ×1 | ×16 | ×64 |
+|:------|----:|----------:|----------------:|----:|----:|
+| compression + sparsity | 4096 | 854–1012 | 1152 | 1610 | 2003 |
+| + SWA (`--swa-window 128`) | 4096 | 1051–1173 | 912 | 1449 | 1773 |
+| compression + sparsity | 16384 | 4566–5023 | 427 | 779 | 872 |
+| + SWA (`--swa-window 128`) | 16384 | 5269–5956 | 465 | 735 | 831 |
+| uncompressed (reference) | 16384 | 11691–12825 | 325 | 408 | 412 |
+
+SWA costs ≈ 10–15% decode and ≈ 11–19% prefill versus compression-only at seq
+4096, narrowing to ≈ 5–13% decode at seq 16384. Against the uncompressed
+reference the **compression + sparsity + SWA stack is still ≈ 2.0× decode and
+≈ 2.2× prefill at seq 16384** — the local branch is what retains local fidelity,
+and it is the prerequisite for the CED encoder/decoder split (decoder global KV
+projected from the encoder hidden state) whose bounded-replay prefill is the
+next milestone.
+
+### Notes
 
 - Benchmarks: 16-core AMD Ryzen 7 7840HS (AVX-512), Go 1.27.1,
   `GOEXPERIMENT=simd`, `GOMAXPROCS=16`, float32. Reproduce with `benchmark.sh`
