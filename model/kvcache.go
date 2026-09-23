@@ -356,6 +356,86 @@ func PrefillFrom(destination, source *KVBuffer) {
 	}
 }
 
+// Clone returns a deep copy of the cache, including compression and indexer
+// state. It is used by the inference prefix cache to snapshot a prefill and by
+// callers that need to branch from an existing state.
+func (cache *KVBuffer) Clone() *KVBuffer {
+	clone := &KVBuffer{
+		batchSize:             cache.batchSize,
+		maximumSequenceLength: cache.maximumSequenceLength,
+		layerCount:            cache.layerCount,
+		keyValueHeadCount:     cache.keyValueHeadCount,
+		headDimension:         cache.headDimension,
+		sequenceLength:        cache.sequenceLength,
+		keyCache:              make([][]*tensors.Tensor, cache.layerCount),
+		valueCache:            make([][]*tensors.Tensor, cache.layerCount),
+	}
+	for layer := 0; layer < cache.layerCount; layer++ {
+		clone.keyCache[layer] = make([]*tensors.Tensor, len(cache.keyCache[layer]))
+		clone.valueCache[layer] = make([]*tensors.Tensor, len(cache.valueCache[layer]))
+		for index := range cache.keyCache[layer] {
+			clone.keyCache[layer][index] = cache.keyCache[layer][index].Clone()
+			clone.valueCache[layer][index] = cache.valueCache[layer][index].Clone()
+		}
+	}
+
+	if cache.compressionRatio > 1 {
+		clone.compressionRatio = cache.compressionRatio
+		clone.compressedMaxBlocks = cache.compressedMaxBlocks
+		clone.compressedEmbeddingDim = cache.compressedEmbeddingDim
+		clone.compressedKVWidth = cache.compressedKVWidth
+		clone.tailHidden = make([][][]float32, cache.layerCount)
+		clone.tailKey = make([][][]float32, cache.layerCount)
+		clone.tailValue = make([][][]float32, cache.layerCount)
+		clone.tailLength = make([][]int, cache.layerCount)
+		clone.compressedKey = make([][]*tensors.Tensor, cache.layerCount)
+		clone.compressedValue = make([][]*tensors.Tensor, cache.layerCount)
+		clone.compressedCount = make([][]int, cache.layerCount)
+		for layer := 0; layer < cache.layerCount; layer++ {
+			clone.tailLength[layer] = append([]int(nil), cache.tailLength[layer]...)
+			clone.compressedCount[layer] = append([]int(nil), cache.compressedCount[layer]...)
+			if cache.tailHidden[layer] == nil {
+				continue
+			}
+			clone.tailHidden[layer] = make([][]float32, len(cache.tailHidden[layer]))
+			for batch := range cache.tailHidden[layer] {
+				clone.tailHidden[layer][batch] = append([]float32(nil), cache.tailHidden[layer][batch]...)
+			}
+			clone.tailKey[layer] = make([][]float32, len(cache.tailKey[layer]))
+			clone.tailValue[layer] = make([][]float32, len(cache.tailValue[layer]))
+			for index := range cache.tailKey[layer] {
+				clone.tailKey[layer][index] = append([]float32(nil), cache.tailKey[layer][index]...)
+				clone.tailValue[layer][index] = append([]float32(nil), cache.tailValue[layer][index]...)
+			}
+			clone.compressedKey[layer] = make([]*tensors.Tensor, len(cache.compressedKey[layer]))
+			clone.compressedValue[layer] = make([]*tensors.Tensor, len(cache.compressedValue[layer]))
+			for index := range cache.compressedKey[layer] {
+				clone.compressedKey[layer][index] = cache.compressedKey[layer][index].Clone()
+				clone.compressedValue[layer][index] = cache.compressedValue[layer][index].Clone()
+			}
+		}
+	}
+
+	if cache.indexerKey != nil {
+		clone.indexerKeyWidth = cache.indexerKeyWidth
+		clone.indexerKey = make([][]*tensors.Tensor, cache.layerCount)
+		for layer := 0; layer < cache.layerCount; layer++ {
+			if cache.indexerKey[layer] == nil {
+				continue
+			}
+			clone.indexerKey[layer] = make([]*tensors.Tensor, len(cache.indexerKey[layer]))
+			for index := range cache.indexerKey[layer] {
+				clone.indexerKey[layer][index] = cache.indexerKey[layer][index].Clone()
+			}
+		}
+	}
+
+	if cache.previousEmbedding != nil {
+		clone.previousEmbedding = cache.previousEmbedding.Clone()
+	}
+	return clone
+}
+
 // CompressedBytesAllocated returns the bytes allocated for compressed key/value
 // storage and cached indexer keys across every layer. Reuse/reindex layers own
 // no compressed KV, so only full layers contribute key/value bytes; reindex

@@ -24,6 +24,10 @@ type Engine struct {
 	// Tools is the registry used to execute tool calls. It defaults to the
 	// built-in calculator; register additional Go tools to extend it.
 	Tools *Registry
+	// Prefix, when non-nil, enables in-memory prefix caching: a request whose
+	// prompt strictly extends a previously prefilled prompt reuses that KV
+	// state and only prefills the new suffix. It is ignored for CED models.
+	Prefix *PrefixCache
 }
 
 // NewEngine builds an inference engine over the given model and tokenizer. It
@@ -40,16 +44,37 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 		config := engine.Model.Config
 		headDim := config.HeadDim()
 
-		// 1) Batch-1 prefill of the prompt.
-		prefillCache := model.NewKVBuffer(1, len(tokens), config.NumLayer, config.NumKVHead, headDim)
-		if ratio := config.Compression(); ratio > 1 {
-			kvWidth := config.NumKVHead * headDim
-			prefillCache.EnableCompressionLayers(ratio, config.EmbedDim, kvWidth, len(tokens)/ratio+1, compressionAllocMask(config))
-			if config.SparseTopK > 0 {
-				prefillCache.EnableIndexerKeysLayers(indexerKeyWidth(config), indexerAllocMask(config))
+		// 1) Batch-1 prefill of the prompt, reusing a cached prefix when the
+		// cached prompt strictly precedes the new one.
+		var prefillCache *model.KVBuffer
+		matched := 0
+		if !config.CEDEnabled() && engine.Prefix != nil {
+			if cached, hit := engine.Prefix.Lookup(tokens); cached != nil {
+				prefillCache = cached
+				matched = hit
 			}
 		}
-		inputIDs := tensors.NewInt32sWithData([]int{1, len(tokens)}, toI32(tokens))
+		if prefillCache == nil {
+			// When prefix caching is enabled the prefill buffer is sized to the
+			// full context so a later request can extend it in place.
+			capacity := len(tokens)
+			if engine.Prefix != nil && !config.CEDEnabled() {
+				capacity = config.SequenceLen
+			}
+			prefillCache = model.NewKVBuffer(1, capacity, config.NumLayer, config.NumKVHead, headDim)
+			if ratio := config.Compression(); ratio > 1 {
+				kvWidth := config.NumKVHead * headDim
+				prefillCache.EnableCompressionLayers(ratio, config.EmbedDim, kvWidth, capacity/ratio+1, compressionAllocMask(config))
+				if config.SparseTopK > 0 {
+					prefillCache.EnableIndexerKeysLayers(indexerKeyWidth(config), indexerAllocMask(config))
+				}
+			}
+		}
+		inputTokens := tokens
+		if matched > 0 {
+			inputTokens = tokens[matched:]
+		}
+		inputIDs := tensors.NewInt32sWithData([]int{1, len(inputTokens)}, toI32(inputTokens))
 		var logits *tensors.Tensor
 		if config.CEDEnabled() {
 			// The causal encoder-decoder prefill runs the encoder over the full
@@ -58,6 +83,9 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 			logits = engine.Model.PrefillCED(inputIDs, prefillCache)
 		} else {
 			logits = engine.Model.Forward(inputIDs, prefillCache) // [1, T, vocab]
+		}
+		if engine.Prefix != nil && !config.CEDEnabled() {
+			engine.Prefix.Store(tokens, prefillCache)
 		}
 		vocab := config.VocabSize
 		rows := logits.Shape[1]
