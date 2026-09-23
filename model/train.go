@@ -116,11 +116,20 @@ func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cos
 			if attention.reuseMode == ReuseReuse {
 				context.compression.selection = share.selection
 			} else {
-				// Full produces the selection; Reindex refreshes it with its
-				// own indexer against the shared compressed keys.
-				context.compression.selection, context.compression.indexerContexts, context.compression.indexerScores, context.compression.indexerTargets =
-					sparseTrainingPlan(attention, input, context.compression.keyCompressed, queryHeadMajor)
+				// Full produces the selection and the hierarchical candidate
+				// pool; Reindex refreshes its own selection within that pool,
+				// using its own indexer against the shared compressed keys.
+				var sharedPool [][][]int
+				if attention.reuseMode == ReuseReindex {
+					sharedPool = share.candidatePool
+				}
+				var producedPool [][][]int
+				context.compression.selection, context.compression.indexerContexts, context.compression.indexerScores, context.compression.indexerTargets, producedPool =
+					sparseTrainingPlan(attention, input, context.compression.keyCompressed, queryHeadMajor, sharedPool)
 				share.selection = context.compression.selection
+				if attention.reuseMode == ReuseFull {
+					share.candidatePool = producedPool
+				}
 			}
 		}
 

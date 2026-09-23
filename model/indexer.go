@@ -267,17 +267,38 @@ func (indexer *SparseIndexer) HierarchicalSelect(hidden, compressed *tensors.Ten
 // projections [batch*blocks*H*dim]. Caching these projections lets decode skip
 // re-projecting every compressed key on each step.
 func (indexer *SparseIndexer) SelectProjected(hidden *tensors.Tensor, keyProjections []float32, blockCount, positionOffset, ratio, topK, pool, candidateBudget int) [][]int {
+	selection, _ := indexer.SelectProjectedWithCandidates(hidden, keyProjections, blockCount, positionOffset, ratio, topK, pool, candidateBudget)
+	return selection
+}
+
+// SelectProjectedWithCandidates is SelectProjected and additionally returns the
+// candidate block pool that was fully scored after the coarse stage, one slice
+// per query row. Publishing this pool lets later Reindex layers skip the coarse
+// scoring pass and score only the pool (DeepSeek-V4.1 §2.3.2).
+func (indexer *SparseIndexer) SelectProjectedWithCandidates(hidden *tensors.Tensor, keyProjections []float32, blockCount, positionOffset, ratio, topK, pool, candidateBudget int) (selection, candidatePool [][]int) {
+	query := indexer.query.Forward(hidden) // [B*T, H, dim]
+	return indexer.selectHierarchical(query.Data, keyProjections, hidden.Shape[0], hidden.Shape[1], blockCount, positionOffset, ratio, topK, pool, candidateBudget)
+}
+
+// SelectWithinPool selects the top-k blocks for every query row from a
+// caller-provided candidate pool. It is the Reindex-layer path: it computes the
+// indexer query but skips the coarse pooled scoring entirely, so its per-query
+// cost is bounded by the pool size rather than the context length.
+func (indexer *SparseIndexer) SelectWithinPool(hidden *tensors.Tensor, keyProjections []float32, blockCount, positionOffset, ratio, topK int, candidatePool [][]int) [][]int {
+	query := indexer.query.Forward(hidden)
+	return indexer.selectWithinPool(query.Data, keyProjections, hidden.Shape[0], hidden.Shape[1], blockCount, positionOffset, ratio, topK, candidatePool)
+}
+
+// selectHierarchical is the core coarse-to-fine selection. queryData has shape
+// [batch*sequence, headCount, dim] and keyData [batch*blockCount, headCount,
+// dim], both flattened. It returns the top-k selection and the coarse-stage
+// candidate pool for every query row.
+func (indexer *SparseIndexer) selectHierarchical(queryData, keyData []float32, batchSize, sequenceLength, blockCount, positionOffset, ratio, topK, pool, candidateBudget int) (selection, candidatePool [][]int) {
 	if pool < 1 {
 		pool = 1
 	}
-	batchSize := hidden.Shape[0]
-	sequenceLength := hidden.Shape[1]
 	dim := indexer.Dim
 	headCount := indexer.HeadCount
-
-	query := indexer.query.Forward(hidden) // [B*T, H, dim]
-	queryData := query.Data
-	keyData := keyProjections
 	weightData := indexer.headWeights.Data
 	headWidth := headCount * dim
 
@@ -286,7 +307,8 @@ func (indexer *SparseIndexer) SelectProjected(hidden *tensors.Tensor, keyProject
 		groupsPerToken = 1
 	}
 
-	selection := make([][]int, batchSize*sequenceLength)
+	selection = make([][]int, batchSize*sequenceLength)
+	candidatePool = make([][]int, batchSize*sequenceLength)
 	for batch := 0; batch < batchSize; batch++ {
 		batchKeyBase := batch * blockCount * headWidth
 		groups := (blockCount + pool - 1) / pool
@@ -315,6 +337,7 @@ func (indexer *SparseIndexer) SelectProjected(hidden *tensors.Tensor, keyProject
 			}
 			if allowed <= 0 || topK <= 0 {
 				selection[row] = []int{}
+				candidatePool[row] = []int{}
 				continue
 			}
 			queryBase := row * headWidth
@@ -347,36 +370,84 @@ func (indexer *SparseIndexer) SelectProjected(hidden *tensors.Tensor, keyProject
 					candidates = append(candidates, entry)
 				}
 			}
-			if len(candidates) == 0 {
+			candidatePool[row] = candidates
+			selection[row] = indexer.fineSelect(queryData, keyData, row, batchKeyBase, headWidth, candidates, topK, allowed)
+		}
+	}
+	return selection, candidatePool
+}
+
+// selectWithinPool scores only the candidate blocks of each query row and
+// selects its top-k. The caller must guarantee the pool contains only causally
+// allowed blocks (as published by the producing Full layer for the same
+// positions).
+func (indexer *SparseIndexer) selectWithinPool(queryData, keyData []float32, batchSize, sequenceLength, blockCount, positionOffset, ratio, topK int, candidatePool [][]int) [][]int {
+	dim := indexer.Dim
+	headCount := indexer.HeadCount
+	headWidth := headCount * dim
+	selection := make([][]int, batchSize*sequenceLength)
+	for batch := 0; batch < batchSize; batch++ {
+		batchKeyBase := batch * blockCount * headWidth
+		for token := 0; token < sequenceLength; token++ {
+			row := batch*sequenceLength + token
+			if topK <= 0 || candidatePool == nil || row >= len(candidatePool) {
 				selection[row] = []int{}
 				continue
 			}
-
-			fine := make([]float32, len(candidates))
-			for index, entry := range candidates {
-				var total float32
-				for head := 0; head < headCount; head++ {
-					var dot float32
-					entryBase := batchKeyBase + entry*headWidth + head*dim
-					for dimension := 0; dimension < dim; dimension++ {
-						dot += queryData[queryBase+head*dim+dimension] * keyData[entryBase+dimension]
-					}
-					if dot > 0 {
-						total += weightData[head] * dot
-					}
-				}
-				fine[index] = total
+			allowed := (positionOffset + token) / ratio
+			if allowed > blockCount {
+				allowed = blockCount
 			}
-			order := argsortDescending(fine)
-			count := min(topK, len(order))
-			selected := make([]int, count)
-			for index := 0; index < count; index++ {
-				selected[index] = candidates[order[index]]
-			}
-			selection[row] = selected
+			selection[row] = indexer.fineSelect(queryData, keyData, row, batchKeyBase, headWidth, candidatePool[row], topK, allowed)
 		}
 	}
 	return selection
+}
+
+// fineSelect scores the candidate blocks for one query row and returns the
+// top-k in descending score order with ties broken toward the smaller block
+// index. Candidates with a block index >= maxBlock are ignored, which enforces
+// causality when the pool originated from a different query.
+func (indexer *SparseIndexer) fineSelect(queryData, keyData []float32, row, batchKeyBase, headWidth int, candidates []int, topK, maxBlock int) []int {
+	if len(candidates) == 0 || topK <= 0 {
+		return []int{}
+	}
+	dim := indexer.Dim
+	headCount := indexer.HeadCount
+	weightData := indexer.headWeights.Data
+	queryBase := row * headWidth
+	kept := make([]int, 0, len(candidates))
+	fine := make([]float32, 0, len(candidates))
+	for _, entry := range candidates {
+		if entry < 0 || entry >= maxBlock {
+			continue
+		}
+		var total float32
+		entryBase := batchKeyBase + entry*headWidth
+		for head := 0; head < headCount; head++ {
+			var dot float32
+			queryHead := queryBase + head*dim
+			keyHead := entryBase + head*dim
+			for dimension := 0; dimension < dim; dimension++ {
+				dot += queryData[queryHead+dimension] * keyData[keyHead+dimension]
+			}
+			if dot > 0 {
+				total += weightData[head] * dot
+			}
+		}
+		kept = append(kept, entry)
+		fine = append(fine, total)
+	}
+	if len(kept) == 0 {
+		return []int{}
+	}
+	order := argsortDescending(fine)
+	count := min(topK, len(order))
+	selected := make([]int, count)
+	for index := 0; index < count; index++ {
+		selected[index] = kept[order[index]]
+	}
+	return selected
 }
 
 // Parameters returns the indexer's trainable tensors.

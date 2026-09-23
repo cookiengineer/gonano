@@ -32,7 +32,13 @@ type compressedContext struct {
 // query token the softmax over its allowed compressed blocks of the mean main
 // attention logit across the query heads sharing that key/value head. Training
 // sees the full sequence, so the position offset is zero.
-func sparseTrainingPlan(attention *CausalSelfAttention, input, keyCompressed, queryHeadMajor *tensors.Tensor) ([][][]int, []*indexerContext, []*tensors.Tensor, []*tensors.Tensor) {
+//
+// When the hierarchical indexer is enabled, a Full layer also produces the
+// coarse candidate pool that matching Reindex layers consume via sharedPool, so
+// training and inference restrict deeper indexers to the same search domain
+// (DeepSeek-V4.1 §2.3.2). The returned producedPool is nil unless this layer is
+// a Full layer with the hierarchical indexer enabled.
+func sparseTrainingPlan(attention *CausalSelfAttention, input, keyCompressed, queryHeadMajor *tensors.Tensor, sharedPool [][][]int) ([][][]int, []*indexerContext, []*tensors.Tensor, []*tensors.Tensor, [][][]int) {
 	batchSize := keyCompressed.Shape[0]
 	kvHeadCount := keyCompressed.Shape[1]
 	blockCount := keyCompressed.Shape[2]
@@ -42,11 +48,16 @@ func sparseTrainingPlan(attention *CausalSelfAttention, input, keyCompressed, qu
 	queryHeadCount := queryHeadMajor.Shape[1]
 	headRatio := queryHeadCount / kvHeadCount
 	ratio := attention.compressionRatio
+	usePool := attention.indexerPool > 1
 
 	selection := make([][][]int, batchSize*kvHeadCount)
 	contexts := make([]*indexerContext, batchSize*kvHeadCount)
 	scoresByHead := make([]*tensors.Tensor, batchSize*kvHeadCount)
 	targets := make([]*tensors.Tensor, batchSize*kvHeadCount)
+	var producedPool [][][]int
+	if attention.reuseMode == ReuseFull && usePool {
+		producedPool = make([][][]int, batchSize*kvHeadCount)
+	}
 
 	for batch := 0; batch < batchSize; batch++ {
 		hiddenSlice := tensors.NewWithData([]int{1, sequenceLength, embeddingDimension},
@@ -55,13 +66,29 @@ func sparseTrainingPlan(attention *CausalSelfAttention, input, keyCompressed, qu
 			index := batch*kvHeadCount + head
 			compressed := tensors.NewWithData([]int{1, blockCount, headDimension}, headSlice(keyCompressed.Data, index, blockCount, headDimension))
 			scores, context := attention.indexer.ScoresWithContext(hiddenSlice, compressed)
-			selection[index] = SelectBlocks(scores, 0, ratio, attention.sparseTopK)
 			contexts[index] = context
 			scoresByHead[index] = scores
+			if attention.reuseMode == ReuseReindex && usePool && sharedPool != nil {
+				var candidatePool [][]int
+				if index < len(sharedPool) {
+					candidatePool = sharedPool[index]
+				}
+				selection[index] = attention.indexer.selectWithinPool(context.query.Data, context.key.Data, 1, sequenceLength, blockCount, 0, ratio, attention.sparseTopK, candidatePool)
+			} else {
+				poolSize := attention.indexerPool
+				if poolSize < 1 {
+					poolSize = 1
+				}
+				selected, candidates := attention.indexer.selectHierarchical(context.query.Data, context.key.Data, 1, sequenceLength, blockCount, 0, ratio, attention.sparseTopK, poolSize, attention.indexerCandidates)
+				selection[index] = selected
+				if producedPool != nil {
+					producedPool[index] = candidates
+				}
+			}
 			targets[index] = distillationTarget(queryHeadMajor, keyCompressed, batch, head, headRatio, ratio, sequenceLength, blockCount, headDimension)
 		}
 	}
-	return selection, contexts, scoresByHead, targets
+	return selection, contexts, scoresByHead, targets, producedPool
 }
 
 // indexerDistillationGradient backpropagates the indexer distillation loss,
@@ -704,6 +731,14 @@ func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMa
 	if attention.reuseMode == ReuseReuse {
 		published = share.selection
 	}
+	// The hierarchical candidate pool is published by a Full layer and reused
+	// by later Reindex layers in the group, so deeper indexers score only the
+	// pool instead of the whole context (DeepSeek-V4.1 §2.3.2).
+	usePool := attention.indexerPool > 1
+	var candidatePools [][][]int
+	if attention.reuseMode == ReuseFull && usePool {
+		candidatePools = make([][][]int, batchSize*kvHeadCount)
+	}
 
 	globalScratch := make([]float32, headDimension)
 	localScratch := make([]float32, headDimension)
@@ -731,12 +766,10 @@ func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMa
 						selection = published[selectionIndex]
 					}
 				default:
-					var projectedKeys []float32
-					if attention.reuseMode == ReuseFull {
-						// Indexer key projections cached when the block was
-						// compressed.
-						projectedKeys = cache.IndexerKey(layer, batch, keyValueHead, available)
-					}
+					// Full and Reindex layers cache their own indexer key
+					// projections; fall back to projecting on the fly when the
+					// cache is missing.
+					projectedKeys := cache.IndexerKey(layer, batch, keyValueHead, available)
 					if width := indexerKeyWidthOf(attention); width <= 0 || len(projectedKeys) < available*width {
 						compressed := tensors.NewWithData([]int{1, available, headDimension}, keyData)
 						projectedKeys = attention.indexer.key.Forward(compressed).Data
@@ -750,7 +783,19 @@ func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMa
 						// Flat selection: score every available entry.
 						budget = available
 					}
-					selection = attention.indexer.SelectProjected(hiddenSlice, projectedKeys, available, positionOffset, ratio, topK, pool, budget)
+					if attention.reuseMode == ReuseReindex && usePool && share.candidatePool != nil {
+						var candidatePool [][]int
+						if selectionIndex < len(share.candidatePool) {
+							candidatePool = share.candidatePool[selectionIndex]
+						}
+						selection = attention.indexer.SelectWithinPool(hiddenSlice, projectedKeys, available, positionOffset, ratio, topK, candidatePool)
+					} else {
+						var candidates [][]int
+						selection, candidates = attention.indexer.SelectProjectedWithCandidates(hiddenSlice, projectedKeys, available, positionOffset, ratio, topK, pool, budget)
+						if candidatePools != nil {
+							candidatePools[selectionIndex] = candidates
+						}
+					}
 					if published != nil {
 						published[selectionIndex] = selection
 					}
@@ -795,6 +840,11 @@ func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMa
 	}
 	if attention.reuseMode != ReuseReuse {
 		share.selection = published
+	}
+	if attention.reuseMode == ReuseFull {
+		// Publish the coarse candidate pool for the group's Reindex layers;
+		// clear any stale pool when the hierarchical indexer is disabled.
+		share.candidatePool = candidatePools
 	}
 }
 

@@ -20,6 +20,11 @@ type compressionShare struct {
 	selection       [][][]int       // [B*Hkv][token][], most recently published
 	gradientKey     *tensors.Tensor // [B, Hkv, blocks, D] (training only)
 	gradientValue   *tensors.Tensor // [B, Hkv, blocks, D] (training only)
+	// candidatePool is the hierarchical indexer's coarse-stage candidate blocks,
+	// [B*Hkv][token][], published by the group's producing Full layer and used
+	// as the search domain by later Reindex layers (DeepSeek-V4.1 §2.3.2). It is
+	// nil when the hierarchical indexer is disabled.
+	candidatePool [][][]int
 
 	// encoderHidden is the CED encoder's final hidden state H_(d/2) [B, T, d].
 	// Decoder full layers project their global compressed KV from it; it is nil

@@ -451,6 +451,90 @@ func TestReuseMultiGroupTrainStepFinite(t *testing.T) {
 	}
 }
 
+// TestHierarchicalPoolTrainStepFinite exercises the shared candidate pool: a
+// Full layer publishes the pool and a Reindex layer scores only within it,
+// during both the forward and backward pass.
+func TestHierarchicalPoolTrainStepFinite(t *testing.T) {
+	for _, pattern := range []string{"FRUU", "FR"} {
+		t.Run(pattern, func(t *testing.T) {
+			config := testConfig()
+			config.NumLayer = 4
+			config.CompressionRatio = 2
+			config.SparseTopK = 2
+			config.IndexerDim = 4
+			config.IndexerPool = 2
+			config.IndexerCandidates = 4
+			config.ReusePattern = pattern
+			transformer := NewTransformer(config)
+			transformer.InitWeights(tensors.NewRNG(42))
+			indexes, targets := tinyData()
+
+			transformer.ZeroGrad()
+			logits, context := transformer.TrainForward(indexes)
+			for _, value := range logits.Data {
+				if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+					t.Fatalf("non-finite logit %v", value)
+				}
+			}
+			flattened := logits.Reshape(indexes.Numel(), config.VocabSize)
+			_, valid := tensors.CrossEntropyPerPosition(flattened, targets.Reshape(indexes.Numel()), -1)
+			gradLogits := tensors.CrossEntropyGrad(flattened, targets.Reshape(indexes.Numel()), -1, 1/float32(valid))
+			transformer.TrainBackward(context, gradLogits.Reshape(indexes.Shape[0], indexes.Shape[1], config.VocabSize))
+			for _, parameter := range transformer.Parameters() {
+				for _, value := range parameter.Grad {
+					if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+						t.Fatalf("non-finite gradient")
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestHierarchicalPoolInferenceFinite runs prefill and decode through the
+// inference pool path: the Full layer publishes the pool and the Reindex layer
+// consumes it.
+func TestHierarchicalPoolInferenceFinite(t *testing.T) {
+	config := testConfig()
+	config.NumLayer = 4
+	config.CompressionRatio = 2
+	config.SparseTopK = 2
+	config.IndexerDim = 4
+	config.IndexerPool = 2
+	config.IndexerCandidates = 4
+	config.ReusePattern = "FRUU"
+	transformer := NewTransformer(config)
+	transformer.InitWeights(tensors.NewRNG(42))
+
+	maximum := 16
+	cache := NewKVBuffer(1, maximum, config.NumLayer, config.NumKVHead, config.HeadDim())
+	compressionMask := make([]bool, config.NumLayer)
+	indexerMask := make([]bool, config.NumLayer)
+	for layer := 0; layer < config.NumLayer; layer++ {
+		compressionMask[layer] = config.OwnsCompressed(layer)
+		indexerMask[layer] = config.OwnsIndexer(layer)
+	}
+	cache.EnableCompressionLayers(config.Compression(), config.EmbedDim, config.NumKVHead*config.HeadDim(), maximum/config.Compression()+1, compressionMask)
+	cache.EnableIndexerKeysLayers(config.IndexerDim, indexerMask)
+
+	prefill := tensors.NewInt32sWithData([]int{1, 8}, []int32{1, 2, 3, 4, 5, 6, 7, 8})
+	logits := transformer.Forward(prefill, cache)
+	for _, value := range logits.Data {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			t.Fatalf("non-finite prefill logit %v", value)
+		}
+	}
+	for step := 0; step < 4; step++ {
+		next := tensors.NewInt32sWithData([]int{1, 1}, []int32{int32(step + 1)})
+		logits = transformer.Forward(next, cache)
+		for _, value := range logits.Data {
+			if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+				t.Fatalf("non-finite decode logit %v", value)
+			}
+		}
+	}
+}
+
 // TestReuseLayersReceiveQueryGradient verifies reuse layers still train their
 // own query projection even though they borrow the producing layer's KV. The
 // fixture perturbs the zero-initialized projections so the gradient signal

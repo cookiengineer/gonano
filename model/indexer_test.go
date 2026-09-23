@@ -176,6 +176,99 @@ func TestSparseIndexerGradient(t *testing.T) {
 	}
 }
 
+// TestSelectWithinPoolMatchesFineStage verifies that scoring only the published
+// candidate pool reproduces the fine stage of the hierarchical selection, and
+// that every selected block comes from the pool.
+func TestSelectWithinPoolMatchesFineStage(t *testing.T) {
+	indexer, hidden, compressed := testIndexer()
+	key := indexer.key.Forward(compressed)
+	blockCount := compressed.Shape[1]
+	selection, pool := indexer.SelectProjectedWithCandidates(hidden, key.Data, blockCount, 0, 2, 2, 2, 3)
+	withinPool := indexer.SelectWithinPool(hidden, key.Data, blockCount, 0, 2, 2, pool)
+	for row := range selection {
+		if len(selection[row]) != len(withinPool[row]) {
+			t.Fatalf("row %d: within-pool length %d, want %d", row, len(withinPool[row]), len(selection[row]))
+		}
+		for index := range selection[row] {
+			if selection[row][index] != withinPool[row][index] {
+				t.Fatalf("row %d: within-pool %v, want %v", row, withinPool[row], selection[row])
+			}
+		}
+		inPool := map[int]bool{}
+		for _, block := range pool[row] {
+			inPool[block] = true
+		}
+		for _, block := range selection[row] {
+			if !inPool[block] {
+				t.Fatalf("row %d: selected block %d not in candidate pool %v", row, block, pool[row])
+			}
+		}
+	}
+}
+
+// TestHierarchicalPoolBoundedByBudget checks that the published pool respects
+// the candidate budget and the causality mask.
+func TestHierarchicalPoolBoundedByBudget(t *testing.T) {
+	indexer := NewSparseIndexer(4, 5, 2, 2)
+	rng := tensors.NewRNG(9)
+	for _, parameter := range indexer.Parameters() {
+		for index := range parameter.Data {
+			parameter.Data[index] = rng.NormFloat32()
+		}
+	}
+	hidden := tensors.New(1, 6, 4)
+	compressed := tensors.New(1, 64, 5)
+	tensors.FillNormal(hidden, rng, 1)
+	tensors.FillNormal(compressed, rng, 1)
+
+	key := indexer.key.Forward(compressed)
+	poolSize, budget := 4, 8
+	_, pool := indexer.SelectProjectedWithCandidates(hidden, key.Data, compressed.Shape[1], 0, 2, 4, poolSize, budget)
+	groupsPerToken := (budget + poolSize - 1) / poolSize
+	bound := groupsPerToken * poolSize
+	for row := range pool {
+		if len(pool[row]) > bound {
+			t.Fatalf("row %d: pool size %d exceeds bound %d", row, len(pool[row]), bound)
+		}
+		allowed := row / 2 // positionOffset 0, ratio 2
+		for _, block := range pool[row] {
+			if block < 0 || block >= allowed {
+				t.Fatalf("row %d: candidate block %d outside causal range [0,%d)", row, block, allowed)
+			}
+		}
+	}
+}
+
+// TestHierarchicalPoolCoversAllWhenUnbounded verifies that when the candidate
+// budget covers every block the pool-based selection equals the full selection,
+// so sharing the pool is lossless.
+func TestHierarchicalPoolCoversAllWhenUnbounded(t *testing.T) {
+	indexer, hidden, compressed := testIndexer()
+	key := indexer.key.Forward(compressed)
+	blockCount := compressed.Shape[1]
+	full := indexer.SelectProjected(hidden, key.Data, blockCount, 0, 2, 2, 2, 1000)
+	selection, pool := indexer.SelectProjectedWithCandidates(hidden, key.Data, blockCount, 0, 2, 2, 2, 1000)
+	withinPool := indexer.SelectWithinPool(hidden, key.Data, blockCount, 0, 2, 2, pool)
+	for row := range full {
+		for _, candidate := range []struct {
+			name string
+			got  []int
+		}{
+			{"selection", selection[row]},
+			{"withinPool", withinPool[row]},
+		} {
+			if len(candidate.got) != len(full[row]) {
+				t.Fatalf("row %d %s: length %d, want %d", row, candidate.name, len(candidate.got), len(full[row]))
+			}
+			for index := range full[row] {
+				if candidate.got[index] != full[row][index] {
+					t.Fatalf("row %d %s: %v, want %v", row, candidate.name, candidate.got, full[row])
+				}
+			}
+		}
+	}
+}
+
 func TestHierarchicalSelectMatchesFullWhenUnbounded(t *testing.T) {
 	indexer, hidden, compressed := testIndexer()
 	scores := indexer.Scores(hidden, compressed)
