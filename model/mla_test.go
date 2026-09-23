@@ -366,3 +366,50 @@ func TestMLAKVBytesReduced(t *testing.T) {
 		t.Fatal("MLA KV read bytes must be fewer than full")
 	}
 }
+
+func mlaGQAConfig() Config {
+	config := testConfig()
+	config.NumKVHead = 1 // grouped-query attention
+	config.MLALatent = 8
+	config.MLARotaryDims = 8
+	return config
+}
+
+func TestMLAWithGroupedQueryAttention(t *testing.T) {
+	config := mlaGQAConfig()
+	transformer := NewTransformer(config)
+	transformer.InitWeights(tensors.NewRNG(42))
+	perturb := tensors.NewRNG(7)
+	for _, parameter := range transformer.Parameters() {
+		for index := range parameter.Data {
+			parameter.Data[index] += perturb.NormFloat32() * 0.1
+		}
+	}
+
+	ids := tensors.NewInt32sWithData([]int{1, 6}, []int32{1, 5, 2, 8, 3, 7})
+	trainLogits, _ := transformer.TrainForward(ids)
+	cache := newMLACache(config, 16)
+	forwardLogits := transformer.Forward(ids, cache)
+	for index := range trainLogits.Data {
+		if math.Abs(float64(trainLogits.Data[index]-forwardLogits.Data[index])) > 1e-3 {
+			t.Fatalf("GQA MLA logit %d: training=%v inference=%v", index, trainLogits.Data[index], forwardLogits.Data[index])
+		}
+	}
+	runDirectionalGradientCheck(t, transformer)
+}
+
+// TestMLAForwardNilCache verifies that a cache-less full forward (used by
+// evaluation and distillation) works and matches the cached forward.
+func TestMLAForwardNilCache(t *testing.T) {
+	transformer := mlaTinyModel()
+	ids := tensors.NewInt32sWithData([]int{1, 6}, []int32{1, 5, 2, 8, 3, 7})
+
+	nilLogits := transformer.Forward(ids, nil)
+	cache := newMLACache(transformer.Config, 16)
+	cacheLogits := transformer.Forward(ids, cache)
+	for index := range nilLogits.Data {
+		if math.Abs(float64(nilLogits.Data[index]-cacheLogits.Data[index])) > 1e-5 {
+			t.Fatalf("nil-cache logit %d: nil=%v cached=%v", index, nilLogits.Data[index], cacheLogits.Data[index])
+		}
+	}
+}

@@ -116,3 +116,25 @@ func TestDistillLoop(t *testing.T) {
 		}
 	}
 }
+
+// TestDistillWithMLATeacher verifies that an absorbed MLA model works as a
+// frozen distillation teacher (a cache-less full forward).
+func TestDistillWithMLATeacher(t *testing.T) {
+	student, _ := newDistillPair()
+
+	teacherConfig := model.Config{
+		SequenceLen: 16, VocabSize: 16, NumLayer: 1, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L", MLALatent: 8, MLARotaryDims: 8,
+	}
+	teacher := model.NewTransformer(teacherConfig)
+	teacher.InitWeights(tensors.NewRNG(5))
+	breakZeroProjections(teacher, 6)
+
+	groups := student.SetupOptimizer(0.01, 0.1, 0.01, 0.0, 0.1, false)
+	trainer := NewTrainer(student, groups, 1)
+	inputs, mask := distillBatch()
+	loss := trainer.DistillStep(teacher, inputs, mask, 1)
+	if math.IsNaN(float64(loss)) || math.IsInf(float64(loss), 0) {
+		t.Fatalf("MLA-teacher distillation loss = %v, want finite", loss)
+	}
+}
