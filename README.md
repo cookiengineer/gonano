@@ -242,7 +242,10 @@ calculator, plus any tools you register in `cmd/server`). See
 `guides/03-deployment.md` for the Go library usage.
 
 See `guides/00-quickstart.md` for a copy-pasteable ArchLinux setup, and `guides/` for the
-step-by-step training, export, deployment, and debugging guides.
+step-by-step training, export, deployment, and debugging guides. The long-context
+attention design and the DeepSeek-V4.1-Flash optimizations (CED, CSA2 reuse, the
+hierarchical sparse indexer, low-rank query/KV, the KV prefix cache, and head-wise
+Muon) are documented in `guides/05-deepseek-v4.1-optimizations.md`.
 
 ## Packages
 
