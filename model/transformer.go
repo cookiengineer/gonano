@@ -175,6 +175,12 @@ func (model *Transformer) forward(indexes *tensors.Int32s, cache *KVBuffer, repl
 	if sequenceLength > model.Config.SequenceLen {
 		panic("model: sequence longer than rotary cache")
 	}
+	// MLA inference requires the latent cache. A cache-less full forward (used
+	// by evaluation and distillation on a whole sequence) gets a scratch cache.
+	if cache == nil && model.Config.MLAEnabled() {
+		cache = NewKVBuffer(batchSize, sequenceLength, model.Config.NumLayer, model.Config.NumKVHead, model.Config.HeadDim())
+		cache.EnableMLA(model.Config.MLALatent, model.Config.NumKVHead*model.Config.MLARotaryDimension())
+	}
 
 	activations := model.tokenEmbedding.Forward(indexes) // [B,T,C]
 	activations = normalizeLastDim(activations)
