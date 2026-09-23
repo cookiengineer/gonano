@@ -28,6 +28,29 @@ type Engine struct {
 	// prompt strictly extends a previously prefilled prompt reuses that KV
 	// state and only prefills the new suffix. It is ignored for CED models.
 	Prefix *PrefixCache
+	// Cache, when non-nil, enables the multi-entry persistent KV cache tier
+	// (DeepSeek-V4.1 §3.2.1). It takes precedence over Prefix. It is ignored
+	// for CED models.
+	Cache *CacheManager
+}
+
+// prefixCacheStore is the common interface of the single-entry PrefixCache and
+// the multi-entry CacheManager.
+type prefixCacheStore interface {
+	Lookup(tokens []int) (*model.KVBuffer, int)
+	Store(tokens []int, state *model.KVBuffer)
+}
+
+// prefixStore returns the active prefix cache, preferring the multi-entry
+// CacheManager when both are configured.
+func (engine *Engine) prefixStore() prefixCacheStore {
+	if engine.Cache != nil {
+		return engine.Cache
+	}
+	if engine.Prefix != nil {
+		return engine.Prefix
+	}
+	return nil
 }
 
 // NewEngine builds an inference engine over the given model and tokenizer. It
@@ -43,13 +66,14 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 	return func(yield func([]int, []int) bool) {
 		config := engine.Model.Config
 		headDim := config.HeadDim()
+		store := engine.prefixStore()
 
 		// 1) Batch-1 prefill of the prompt, reusing a cached prefix when the
 		// cached prompt strictly precedes the new one.
 		var prefillCache *model.KVBuffer
 		matched := 0
-		if !config.CEDEnabled() && engine.Prefix != nil {
-			if cached, hit := engine.Prefix.Lookup(tokens); cached != nil {
+		if !config.CEDEnabled() && store != nil {
+			if cached, hit := store.Lookup(tokens); cached != nil {
 				prefillCache = cached
 				matched = hit
 			}
@@ -58,7 +82,7 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 			// When prefix caching is enabled the prefill buffer is sized to the
 			// full context so a later request can extend it in place.
 			capacity := len(tokens)
-			if engine.Prefix != nil && !config.CEDEnabled() {
+			if store != nil && !config.CEDEnabled() {
 				capacity = config.SequenceLen
 			}
 			prefillCache = model.NewKVBuffer(1, capacity, config.NumLayer, config.NumKVHead, headDim)
@@ -84,8 +108,8 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 		} else {
 			logits = engine.Model.Forward(inputIDs, prefillCache) // [1, T, vocab]
 		}
-		if engine.Prefix != nil && !config.CEDEnabled() {
-			engine.Prefix.Store(tokens, prefillCache)
+		if store != nil && !config.CEDEnabled() {
+			store.Store(tokens, prefillCache)
 		}
 		vocab := config.VocabSize
 		rows := logits.Shape[1]

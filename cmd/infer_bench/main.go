@@ -22,6 +22,7 @@ func main() {
 	promptTokens := flag.Int("prompt-tokens", 128, "prompt length")
 	decodeTokens := flag.Int("decode-tokens", 64, "tokens to generate per row")
 	batchSizes := flag.String("batch-sizes", "1,4,16", "comma-separated batch sizes")
+	prefixCache := flag.Bool("prefix-cache", false, "enable the multi-entry KV prefix cache")
 	baseDir := flag.String("base-dir", "", "tokenizer directory (default ~/.cache/gonano)")
 	flag.Parse()
 
@@ -48,6 +49,9 @@ func main() {
 	}
 	model := checkpoint.LoadModel(meta, params)
 	engine := inference.NewEngine(model, tokenizer)
+	if *prefixCache {
+		engine.Cache = inference.NewCacheManager(inference.CacheOptions{MaxEntries: 8})
+	}
 
 	// Clamp the prompt so prompt+decode fits the model context.
 	maxPrompt := meta.ModelConfig.SequenceLen - *decodeTokens

@@ -35,6 +35,7 @@ layout.
 | Full-vocabulary on-policy distillation (OPD) | 5.2.4 | `tensors/loss.go` (`DistillationLossPerPosition`), `trainer/distill.go` | `cmd/chat_opd` |
 | MLA low-rank query / KV latent | 2.3, 4.2.1 | `model/attention.go` `projectQuery`/`projectKeyValue` | `--query-compression-dim`, `--kv-latent-dim` |
 | Global-KV prefix reuse + SWA replay | 3.2.1, 3.2.2 | `inference/prefix.go` `PrefixCache`, `Engine.Prefix` | `Engine.Prefix = NewPrefixCache(...)` |
+| Persistent multi-entry KV cache (LRU/TTL/disk) | 3.2.1 | `inference/cache.go` `CacheManager`, `model/kvcache_codec.go` | `Engine.Cache = NewCacheManager(...)` |
 | FP4 main KV cache / FP4 indexer QAT | 2.4.4 | **not implemented** (float32-only) | — |
 | Engram, MoE, DSpark, Single-Pass mHC | 2.1, 2.4 | **not applicable / not implemented** | — |
 
@@ -260,6 +261,24 @@ state, and it is not a persistent SSD/DRAM tier.
 
 Units: `TestPrefixCacheLookupStore`, `TestPrefixCacheGenerationMatchesFullPrefill`,
 `TestPrefixCacheMissFallsBack`, `TestPrefixCacheCloneIndependence`.
+
+**Persistent multi-entry cache tier.** `inference/cache.go` generalizes the
+single-entry cache into `CacheManager`, the in-memory analogue of the paper's
+persistent KV cache (§3.2.1): it keeps multiple prefixes, evicts by LRU and TTL,
+bounds memory by entry count or allocated bytes, and — when given a directory —
+serializes each snapshot to disk via `KVBuffer.MarshalBinary` /
+`model.UnmarshalKVBuffer`, keeping only metadata in memory. `Engine.Cache` takes
+precedence over `Engine.Prefix`, and `cmd/server` enables a small in-memory tier
+by default (`--prefix-cache-size`, `--prefix-cache-dir`, `--prefix-cache-ttl`).
+As with `PrefixCache`, a hit requires the stored tokens to be a strict prefix of
+the request, so the reused state stays exactly consistent with a full prefill.
+
+Units: `TestKVCacheCodecRoundTrip`, `TestKVCacheCodecPlainRoundTrip`,
+`TestKVCacheCodecRejectsInvalidData`, `TestCacheManagerLookupStore`,
+`TestCacheManagerLongestPrefix`, `TestCacheManagerLRUEviction`,
+`TestCacheManagerTTL`, `TestCacheManagerDiskTier`,
+`TestCacheManagerGenerationMatchesFullPrefill`,
+`TestCacheManagerDiskGenerationMatchesFullPrefill`.
 
 ---
 

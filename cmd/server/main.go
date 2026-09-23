@@ -31,6 +31,9 @@ func main() {
 	baseDir := flag.String("base-dir", "", "base directory (default ~/.cache/gonano)")
 	addr := flag.String("addr", ":8080", "listen address")
 	modelName := flag.String("model-name", "gonano", "model id reported to clients")
+	prefixCacheSize := flag.Int("prefix-cache-size", 8, "KV prefix cache entries (0 disables)")
+	prefixCacheDir := flag.String("prefix-cache-dir", "", "persist the KV prefix cache to this directory")
+	prefixCacheTTL := flag.Duration("prefix-cache-ttl", 0, "KV prefix cache entry TTL (0 = no expiry)")
 	flag.Parse()
 
 	logger := logging.Default(slog.LevelInfo)
@@ -61,6 +64,13 @@ func main() {
 	tools.Register(nowTool{})
 
 	httpServer := server.NewServer(model, tokenizer, tools, *modelName)
+	if *prefixCacheSize > 0 || *prefixCacheDir != "" {
+		httpServer.Engine.Cache = inference.NewCacheManager(inference.CacheOptions{
+			MaxEntries: *prefixCacheSize,
+			TTL:        *prefixCacheTTL,
+			DiskDir:    *prefixCacheDir,
+		})
+	}
 	logger.Info("serving OpenAI-compatible API", "addr", *addr, "model", *modelName, "vocab", tokenizer.VocabSize())
 	if err := http.ListenAndServe(*addr, httpServer.Handler()); err != nil {
 		logger.Error("serve", "err", err)

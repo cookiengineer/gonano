@@ -468,6 +468,69 @@ func (cache *KVBuffer) CompressedBytesAllocated() int {
 	return total
 }
 
+// BytesAllocated returns the approximate bytes allocated for every key/value,
+// compression, indexer, tail, and previous-embedding buffer. It is used by the
+// inference persistent cache to enforce a memory budget.
+func (cache *KVBuffer) BytesAllocated() int {
+	total := 0
+	for layer := 0; layer < cache.layerCount; layer++ {
+		for _, tensor := range cache.keyCache[layer] {
+			if tensor != nil {
+				total += tensor.Numel() * 4
+			}
+		}
+		for _, tensor := range cache.valueCache[layer] {
+			if tensor != nil {
+				total += tensor.Numel() * 4
+			}
+		}
+	}
+	if cache.compressedKey != nil {
+		for layer := 0; layer < cache.layerCount; layer++ {
+			for _, tensor := range cache.compressedKey[layer] {
+				if tensor != nil {
+					total += tensor.Numel() * 4
+				}
+			}
+		}
+	}
+	if cache.compressedValue != nil {
+		for layer := 0; layer < cache.layerCount; layer++ {
+			for _, tensor := range cache.compressedValue[layer] {
+				if tensor != nil {
+					total += tensor.Numel() * 4
+				}
+			}
+		}
+	}
+	if cache.indexerKey != nil {
+		for layer := 0; layer < cache.layerCount; layer++ {
+			for _, tensor := range cache.indexerKey[layer] {
+				if tensor != nil {
+					total += tensor.Numel() * 4
+				}
+			}
+		}
+	}
+	if cache.tailHidden != nil {
+		for layer := 0; layer < cache.layerCount; layer++ {
+			for _, row := range cache.tailHidden[layer] {
+				total += len(row) * 4
+			}
+			for _, row := range cache.tailKey[layer] {
+				total += len(row) * 4
+			}
+			for _, row := range cache.tailValue[layer] {
+				total += len(row) * 4
+			}
+		}
+	}
+	if cache.previousEmbedding != nil {
+		total += cache.previousEmbedding.Numel() * 4
+	}
+	return total
+}
+
 // copyIndexerKeys replicates a layer's cached indexer-key projections from a
 // batch-1 source across every destination row.
 func copyIndexerKeys(destination, source *KVBuffer, layer, count int) {

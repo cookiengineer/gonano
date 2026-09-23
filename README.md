@@ -244,8 +244,9 @@ calculator, plus any tools you register in `cmd/server`). See
 See `guides/00-quickstart.md` for a copy-pasteable ArchLinux setup, and `guides/` for the
 step-by-step training, export, deployment, and debugging guides. The long-context
 attention design and the DeepSeek-V4.1-Flash optimizations (CED, CSA2 reuse, the
-hierarchical sparse indexer, low-rank query/KV, the KV prefix cache, head-wise
-Muon, Sinkhorn-balanced embeddings, and on-policy distillation) are documented in `guides/05-deepseek-v4.1-optimizations.md`.
+hierarchical sparse indexer, low-rank query/KV, the KV prefix cache, the persistent
+multi-entry KV cache tier, head-wise Muon, Sinkhorn-balanced embeddings, and on-policy
+distillation) are documented in `guides/05-deepseek-v4.1-optimizations.md`.
 
 ## Packages
 
