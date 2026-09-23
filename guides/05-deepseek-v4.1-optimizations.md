@@ -548,6 +548,13 @@ low-bit indexer acceleration are the vectorized kernels in §4 and the low-rank
 factorizations in §5. Do not expect per-token KV bytes to match the paper's
 890 bytes/token.
 
+> **Locked-in decision.** QAT and a quantized KV cache are out of scope by
+> decision, not merely unimplemented. The hard float32/SIMD requirement, the
+> rejected int8 QAT experiment, the considered-but-excluded storage-only
+> quantized KV path, and the rules for ever revisiting them are recorded in
+> [06-numeric-precision.md](06-numeric-precision.md). Read that before proposing
+> any low-bit work.
+
 ---
 
 ## 9. Configuration reference

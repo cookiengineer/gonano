@@ -138,3 +138,5 @@ go run ./cmd/chat_cli --model d4.gguf --prompt "hello there"
 - [02 — Export guide](02-export.md) (`.gn` and GGUF)
 - [03 — Deployment guide](03-deployment.md) (loading + inference, Go API)
 - [04 — Debugging guide](04-debugging.md) (symptom → file to look at)
+- [05 — DeepSeek-V4.1-Flash optimizations](05-deepseek-v4.1-optimizations.md)
+- [06 — Numeric precision](06-numeric-precision.md) (float32 requirement + low-bit decisions)

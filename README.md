@@ -154,10 +154,12 @@ Decode token rates are unchanged within noise (4k ≈ 975/1460/1785 tok/s,
 - The HCA prefill cost is an implementation/prefill-load artifact at short
   context; compression pays off in decode and becomes more favourable at longer
   context, where sparsity is layered on top.
-- **Low-bit weights/KV were evaluated and rejected**: an int8 experiment was
+- **Low-bit weights/KV are rejected by decision**: an int8 QAT experiment was
   slower than fp32 on this platform (the Go `simd` package has no vectorized
-  int8→float32 conversion, and decode is compute-bound, not bandwidth-bound), so
-  the backend is float32-only.
+  int8→float32 conversion, and decode is compute-bound here), and a storage-only
+  quantized KV cache is out of scope. The backend is float32-only. See
+  [guides/06-numeric-precision.md](guides/06-numeric-precision.md) for the locked-in
+  decision record.
 
 ## Quickstart
 
