@@ -121,6 +121,9 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 				capacity = config.SequenceLen
 			}
 			prefillCache = model.NewKVBuffer(1, capacity, config.NumLayer, config.NumKVHead, headDim)
+			if config.MLAEnabled() {
+				prefillCache.EnableMLA(config.MLALatent, config.NumKVHead*config.MLARotaryDimension())
+			}
 			if ratio := config.Compression(); ratio > 1 {
 				kvWidth := config.NumKVHead * headDim
 				prefillCache.EnableCompressionLayers(ratio, config.EmbedDim, kvWidth, capacity/ratio+1, compressionAllocMask(config))
@@ -168,6 +171,9 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 			cacheLen += maxTokens
 		}
 		decodeCache := model.NewKVBuffer(numSamples, cacheLen, config.NumLayer, config.NumKVHead, headDim)
+		if config.MLAEnabled() {
+			decodeCache.EnableMLA(config.MLALatent, config.NumKVHead*config.MLARotaryDimension())
+		}
 		if ratio := config.Compression(); ratio > 1 {
 			kvWidth := config.NumKVHead * headDim
 			decodeCache.EnableCompressionLayers(ratio, config.EmbedDim, kvWidth, cacheLen/ratio+1, compressionAllocMask(config))
