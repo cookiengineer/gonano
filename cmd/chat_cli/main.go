@@ -22,6 +22,9 @@ func main() {
 	topK := flag.Int("top-k", 50, "top-k sampling")
 	maxTokens := flag.Int("max-tokens", 256, "max tokens per response")
 	prompt := flag.String("prompt", "", "single-shot prompt (empty = interactive)")
+	drafterPath := flag.String("drafter", "", "path to a DSpark drafter checkpoint")
+	speculative := flag.Bool("speculative", false, "use exact greedy speculative decoding (requires --temperature 0 and --drafter)")
+	draftLength := flag.Int("draft-length", 5, "tokens drafted per speculative round")
 	baseDir := flag.String("base-dir", "", "tokenizer directory (default ~/.cache/gonano)")
 	flag.Parse()
 
@@ -47,6 +50,16 @@ func main() {
 	}
 	model := checkpoint.LoadModel(meta, params)
 	engine := inference.NewEngine(model, tokenizer)
+	if *drafterPath != "" {
+		drafterMeta, drafterParams, err := checkpoint.Load(*drafterPath)
+		if err != nil {
+			logger.Error("load drafter", "err", err)
+			os.Exit(1)
+		}
+		engine.Drafter = checkpoint.LoadModel(drafterMeta, drafterParams)
+		engine.DraftLength = *draftLength
+	}
+	engine.Speculative = *speculative
 
 	bos := tokenizer.BOSTokenID()
 	userStart := tokenizer.EncodeSpecial("<|user_start|>")

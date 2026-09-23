@@ -79,6 +79,17 @@ func (cache *KVBuffer) Position() int { return int(cache.sequenceLength) }
 // Advance moves the cache position forward by tokenCount tokens.
 func (cache *KVBuffer) Advance(tokenCount int) { cache.sequenceLength += int32(tokenCount) }
 
+// SetPosition rewinds or advances the cache position to position. Speculative
+// verification uses it to discard rejected draft tokens: entries beyond the
+// position are ignored and overwritten by the next forward. It is only safe for
+// uncompressed caches, which carry no per-position compression bookkeeping.
+func (cache *KVBuffer) SetPosition(position int) {
+	if position < 0 || position > cache.maximumSequenceLength {
+		panic("model: KV cache position out of range")
+	}
+	cache.sequenceLength = int32(position)
+}
+
 // NumLayers returns the number of layers.
 func (cache *KVBuffer) NumLayers() int { return cache.layerCount }
 

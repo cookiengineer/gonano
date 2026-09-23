@@ -32,6 +32,16 @@ type Engine struct {
 	// (DeepSeek-V4.1 §3.2.1). It takes precedence over Prefix. It is ignored
 	// for CED models.
 	Cache *CacheManager
+	// Drafter, when set alongside Speculative, enables exact greedy speculative
+	// decoding (DeepSeek-V4.1 §2.4.3) with the given draft model.
+	Drafter *model.Transformer
+	// Speculative enables speculative decoding when Drafter is set. It only
+	// applies to single-row greedy requests on uncompressed models and does not
+	// run the tool-call state machine.
+	Speculative bool
+	// DraftLength is the number of tokens the drafter proposes per round.
+	// Values below 2 use the default of 5.
+	DraftLength int
 }
 
 // prefixCacheStore is the common interface of the single-entry PrefixCache and
@@ -64,6 +74,10 @@ func NewEngine(transformer *model.Transformer, tokenizerImpl *tokenizer.Tokenize
 // where tokenMask is 1 for sampled tokens and 0 for forced (tool) tokens.
 func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperature float32, topK int, seed uint64) func(yield func([]int, []int) bool) {
 	return func(yield func([]int, []int) bool) {
+		if engine.speculativeEligible(numSamples, temperature) {
+			engine.speculativeGenerate(tokens, maxTokens, yield)
+			return
+		}
 		config := engine.Model.Config
 		headDim := config.HeadDim()
 		store := engine.prefixStore()

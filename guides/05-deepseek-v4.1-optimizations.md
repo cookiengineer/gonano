@@ -33,6 +33,7 @@ layout.
 | Head-wise Muon for Q/K | 2.5 | `model/optimizer.go` `headWiseViews` | `--head-wise-muon` |
 | Sinkhorn-balanced embeddings / lm_head | 2.5 | `optimizer/sinkhorn.go`, `model/optimizer.go` `sinkhornGroup` | `--sinkhorn-embeddings` |
 | Full-vocabulary on-policy distillation (OPD) | 5.2.4 | `tensors/loss.go` (`DistillationLossPerPosition`), `trainer/distill.go` | `cmd/chat_opd` |
+| DSpark speculative decoding (exact greedy) | 2.4.3 | `model/dspark.go`, `inference/speculative.go` | `--drafter` + `--speculative` |
 | MLA low-rank query / KV latent | 2.3, 4.2.1 | `model/attention.go` `projectQuery`/`projectKeyValue` | `--query-compression-dim`, `--kv-latent-dim` |
 | Global-KV prefix reuse + SWA replay | 3.2.1, 3.2.2 | `inference/prefix.go` `PrefixCache`, `Engine.Prefix` | `Engine.Prefix = NewPrefixCache(...)` |
 | Persistent multi-entry KV cache (LRU/TTL/disk) | 3.2.1 | `inference/cache.go` `CacheManager`, `model/kvcache_codec.go` | `Engine.Cache = NewCacheManager(...)` |
@@ -329,6 +330,36 @@ Units: `TestDistillationMatchesCrossEntropyForOneHotTeacher`,
 `TestDistillStepReducesLoss`, `TestDistillSelfZeroGradient`,
 `TestDistillMaskRestrictsGradient`, `TestDistillLoop`.
 
+**DSpark speculative decoding.** `cmd/dspark_train` distills a small
+`model.NewDrafter` (3 blocks, context capped at 128 tokens) from a frozen,
+uncompressed backbone using the same objective as OPD. `Engine.Drafter` +
+`Engine.Speculative` then enable **exact greedy** speculative decoding in
+`inference/speculative.go`: each round the drafter proposes up to
+`DraftLength` (default 5) tokens, the target model verifies the whole block in a
+single forward, and the longest matching prefix is accepted; a mismatch or a
+full match falls back to the target's own token as the next round's first
+candidate. Output is bit-for-bit identical to greedy decoding (verified by
+`TestSpeculativeMatchesGreedy`). It is limited to single-row, greedy
+(`--temperature 0`), uncompressed models and does not run the tool-call state
+machine; other requests transparently use the normal path. `cmd/infer_bench`
+(`--drafter ... --speculative`) and `cmd/chat_cli` expose it.
+
+This feature required fixing a pre-existing smear-recurrence inconsistency:
+`smearAdd` chained the *post-smear* activation of the previous token while the
+sequential decode path and the smear backward pass both assume the *pre-smear*
+embedding, so batched (prefill) and token-by-token forwarding diverged whenever
+`smearLambda` was non-zero. `smearAdd` now visits rows in descending order and a
+multi-token forward against a partially filled cache seeds its first position
+from the cached previous embedding (`smearSeed`), making batched and sequential
+decoding agree (`TestBatchedForwardMatchesSequentialDecode`).
+
+Units: `TestDrafterConfigBounded`, `TestDraftTokensLengthAndRange`,
+`TestDraftTokensEmptyContext`, `TestDraftTokensBoundedByContext`,
+`TestBatchedForwardMatchesSequentialDecode`,
+`TestBackpropDirectionalGradientCheckSmear`, `TestSpeculativeMatchesGreedy`,
+`TestSpeculativeMatchesGreedyWithLongDraft`, `TestLoadedDrafterSpeculation`,
+`TestSpeculativeEligibility`.
+
 ---
 
 ## 8. Low-bit weights and KV were rejected
@@ -427,9 +458,13 @@ GOEXPERIMENT=simd go test -race ./...
 For completeness, the paper components that are out of scope here:
 
 - **FP4 main KV cache and FP4 indexer QAT** (see §8).
-- **MoE backbone, Engram conditional memory, DSpark speculative decoding, and
-  Single-Pass mHC.** gonano is a dense single-residual-stream model; these are
-  architectural/system components of the 552B model and do not map onto it.
+- **MoE backbone, Engram conditional memory, and Single-Pass mHC.** gonano is a
+  dense single-residual-stream model; these are architectural components of the
+  552B model and do not map onto it.
+- **DSpark confidence head, Markov draft head, and confidence-scheduled
+  verification.** gonano implements exact greedy speculative decoding only. The
+  paper's learned acceptance scheduler and semi-autoregressive draft heads are
+  decode-throughput refinements that require calibrated acceptance statistics.
 - **Latent KV cache** — the low-rank KV latent reduces compute, not cache bytes.
 - **Persistent KV tier (SSD/host DRAM), EPD disaggregation, and the GPU kernel
   fusions** (Mega-* kernels, FlashMLA): single-process CPU serving only.

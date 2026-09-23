@@ -169,7 +169,21 @@ func (model *Transformer) Forward(indexes *tensors.Int32s, cache *KVBuffer) *ten
 		if sequenceLength > 1 {
 			gate := model.smearGate.Forward(sliceChannels(activations, 1, sequenceLength, smearGateChannels))
 			gate = tensors.Scale(tensors.Sigmoid(gate), model.smearLambda.Data[0])
+			// A multi-token forward against a partially filled cache (prefix
+			// reuse, speculative verification) must smear its first position
+			// from the cached previous token, exactly as sequential decode
+			// would. Both gates are read before any modification, and the seed
+			// is applied after smearAdd so later rows still read the pre-smear
+			// embedding of the first row.
+			var seed *tensors.Tensor
+			if previousEmbedding != nil {
+				seed = model.smearGate.Forward(sliceChannels(activations, 0, 1, smearGateChannels))
+				seed = tensors.Scale(tensors.Sigmoid(seed), model.smearLambda.Data[0])
+			}
 			smearAdd(activations, gate)
+			if seed != nil {
+				smearSeed(activations, seed, previousEmbedding)
+			}
 		} else if previousEmbedding != nil {
 			gate := model.smearGate.Forward(sliceChannels(activations, 0, 1, smearGateChannels)) // [B,1,1]
 			gate = tensors.Scale(tensors.Sigmoid(gate), model.smearLambda.Data[0])

@@ -23,6 +23,9 @@ func main() {
 	decodeTokens := flag.Int("decode-tokens", 64, "tokens to generate per row")
 	batchSizes := flag.String("batch-sizes", "1,4,16", "comma-separated batch sizes")
 	prefixCache := flag.Bool("prefix-cache", false, "enable the multi-entry KV prefix cache")
+	drafterPath := flag.String("drafter", "", "path to a DSpark drafter checkpoint")
+	speculative := flag.Bool("speculative", false, "use exact greedy speculative decoding with --drafter")
+	draftLength := flag.Int("draft-length", 5, "tokens drafted per speculative round")
 	baseDir := flag.String("base-dir", "", "tokenizer directory (default ~/.cache/gonano)")
 	flag.Parse()
 
@@ -52,6 +55,16 @@ func main() {
 	if *prefixCache {
 		engine.Cache = inference.NewCacheManager(inference.CacheOptions{MaxEntries: 8})
 	}
+	if *drafterPath != "" {
+		drafterMeta, drafterParams, err := checkpoint.Load(*drafterPath)
+		if err != nil {
+			logger.Error("load drafter", "err", err)
+			os.Exit(1)
+		}
+		engine.Drafter = checkpoint.LoadModel(drafterMeta, drafterParams)
+		engine.DraftLength = *draftLength
+	}
+	engine.Speculative = *speculative
 
 	// Clamp the prompt so prompt+decode fits the model context.
 	maxPrompt := meta.ModelConfig.SequenceLen - *decodeTokens
