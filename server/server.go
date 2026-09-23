@@ -129,10 +129,13 @@ func (server *Server) generate(prompt []int, temperature float32, topK, maxToken
 
 // renderMessages converts OpenAI messages into a prompt token sequence primed
 // for the assistant to complete.
-func (server *Server) renderMessages(messages []ChatMessage, tools []ToolDef) []int {
+func (server *Server) renderMessages(messages []ChatMessage, tools []ToolDef, reasoningEffort *int) []int {
 	tokenizerImpl := server.Tokenizer
 	ids := []int{tokenizerImpl.BOSTokenID()}
 
+	if reasoningEffort != nil {
+		messages = append([]ChatMessage{{Role: "system", Content: tokenizer.ReasoningEffortInstruction(*reasoningEffort)}}, messages...)
+	}
 	messages = mergeSystemMessage(messages)
 	if len(tools) > 0 {
 		// Advise the model about the tools it may invoke.

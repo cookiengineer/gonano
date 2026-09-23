@@ -157,6 +157,13 @@ type Rows interface {
 // [keyLength, headDim]. PositionOffset is the absolute position of the first
 // query row (nonzero during KV-cache decoding). Window below zero means full
 // causal context; otherwise it is the left sliding-window width.
+//
+// SegmentIDs, when non-nil, has one entry per key position (length keyLength)
+// and masks sample-level attention: the query at absolute position
+// PositionOffset+i may attend to key j only when
+// SegmentIDs[j] == SegmentIDs[PositionOffset+i]. It keeps tokens from different
+// packed documents from attending to each other (DeepSeek-V4.1 §4.2.2). A nil
+// slice disables the mask.
 type AttentionForwardParameters struct {
 	Query          []float32
 	Key            []float32
@@ -166,6 +173,7 @@ type AttentionForwardParameters struct {
 	HeadDim        int
 	PositionOffset int
 	Window         int
+	SegmentIDs     []int32
 }
 
 // AttentionForwardResult holds the outputs of an attention forward pass.
@@ -187,6 +195,9 @@ type AttentionForwardResult struct {
 // and a local sliding-window branch) share one merged softmax: each branch is
 // backpropagated with the merged log-sum-exp and the merged correction
 // dO_i . O_i, which is exactly the gradient of the union of their keys.
+//
+// SegmentIDs carries the same sample-level mask as the forward pass (see
+// AttentionForwardParameters); it must be the same slice used in the forward.
 type AttentionBackwardParameters struct {
 	Query          []float32
 	Key            []float32
@@ -200,6 +211,7 @@ type AttentionBackwardParameters struct {
 	HeadDim        int
 	PositionOffset int
 	Window         int
+	SegmentIDs     []int32
 }
 
 // AttentionBackwardResult holds the gradients of an attention backward pass.
@@ -229,6 +241,7 @@ type AttentionSplitParameters struct {
 	Window         int
 	KeyStart       int
 	KeyEnd         int
+	SegmentIDs     []int32
 }
 
 // AttentionSplitResult is one key shard's unnormalized attention output and its

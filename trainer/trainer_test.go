@@ -122,3 +122,41 @@ func TestTrainerOverfitsTiny(tester *testing.T) {
 		tester.Fatalf("loss did not decrease: %v -> %v", first, last)
 	}
 }
+
+// TestTrainStepSegmentsFinite runs the segmented forward/backward on a
+// compressed MoE model with sample masking and the sequence-level balance loss,
+// and checks the loss stays finite and decreases.
+func TestTrainStepSegmentsFinite(tester *testing.T) {
+	config := model.Config{
+		SequenceLen: 8, VocabSize: 16, NumLayer: 2, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L",
+		CompressionRatio: 2, SparseTopK: 2, IndexerPool: 2,
+		NumExperts: 4, NumExpertsPerToken: 2, ExpertHiddenDim: 16, SharedExpertHiddenDim: 16,
+	}
+	config.ApplyMoEDefaults()
+	config.Validate()
+	transformer := model.NewTransformer(config)
+	transformer.InitWeights(tensors.NewRNG(7))
+	groups := transformer.SetupOptimizer(0.01, 0.1, 0.01, 0.0, 0.1, false)
+	trainer := NewTrainer(transformer, groups, 1)
+	trainer.WarmupSteps = 2
+	trainer.WarmdownRatio = 0.0
+
+	inputs := tensors.NewInt32sWithData([]int{2, 8}, []int32{1, 2, 3, 4, 5, 6, 7, 8, 2, 3, 4, 5, 6, 7, 8, 9})
+	targets := tensors.NewInt32sWithData([]int{2, 8}, []int32{2, 3, 4, 5, 6, 7, 8, 9, 3, 4, 5, 6, 7, 8, 9, 10})
+	segments := tensors.NewInt32sWithData([]int{2, 8}, []int32{0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1})
+
+	first := trainer.TrainStepSegments(inputs, targets, segments)
+	trainer.StepOptimizer(0, 50)
+	var last float32
+	for step := 1; step < 50; step++ {
+		last = trainer.TrainStepSegments(inputs, targets, segments)
+		trainer.StepOptimizer(step, 50)
+	}
+	if math.IsNaN(float64(last)) || math.IsInf(float64(last), 0) {
+		tester.Fatalf("segmented loss became non-finite: %v", last)
+	}
+	if last >= first {
+		tester.Fatalf("segmented loss did not decrease: %v -> %v", first, last)
+	}
+}

@@ -58,6 +58,31 @@ type compressorContext struct {
 	batchSize     int
 	sequenceLen   int
 	blockCount    int
+	// segments is the per-token sample-level id used to keep a block from
+	// mixing documents, or nil (DeepSeek-V4.1 §4.2.2).
+	segments []int32
+}
+
+// blockSegment returns the sample-level segment of a compression block: the
+// segment of its first in-range row, or 0 when no mask is supplied.
+func blockSegment(segments []int32, block, ratio, sequenceLength int) int32 {
+	if segments == nil {
+		return 0
+	}
+	position := block * ratio
+	if position < 0 || position >= sequenceLength || position >= len(segments) {
+		return 0
+	}
+	return segments[position]
+}
+
+// rowInBlockSegment reports whether a row belongs to its block's segment. With
+// no mask every row is included.
+func rowInBlockSegment(segments []int32, position, block, ratio, sequenceLength int) bool {
+	if segments == nil {
+		return true
+	}
+	return segments[position] == blockSegment(segments, block, ratio, sequenceLength)
 }
 
 // Forward compresses `value` [batch, sequence, channels] into
@@ -65,7 +90,7 @@ type compressorContext struct {
 // attention input used to derive the compression logits. A trailing partial
 // block is compressed from the rows that exist; padded positions are excluded
 // from the softmax.
-func (compressor *ChannelCompressor) Forward(hidden, value *tensors.Tensor) (*tensors.Tensor, *compressorContext) {
+func (compressor *ChannelCompressor) Forward(hidden, value *tensors.Tensor, segments []int32) (*tensors.Tensor, *compressorContext) {
 	batchSize, sequenceLength := hidden.Shape[0], hidden.Shape[1]
 	channels := compressor.Channels
 	ratio := compressor.Ratio
@@ -94,11 +119,16 @@ func (compressor *ChannelCompressor) Forward(hidden, value *tensors.Tensor) (*te
 		for block := 0; block < blockCount; block++ {
 			for channel := 0; channel < channels; channel++ {
 				// Numerically stable softmax over the rows of this block,
-				// treating out-of-range positions as -Inf.
+				// treating out-of-range positions as -Inf. Rows whose segment
+				// differs from the block's are excluded so a block never mixes
+				// documents (DeepSeek-V4.1 §4.2.2).
 				maximum := float32(math.Inf(-1))
 				for row := 0; row < ratio; row++ {
 					position := block*ratio + row
 					if position >= sequenceLength {
+						continue
+					}
+					if !rowInBlockSegment(segments, position, block, ratio, sequenceLength) {
 						continue
 					}
 					logit := logitData[(batchIndex*sequenceLength+position)*channels+channel]
@@ -110,7 +140,7 @@ func (compressor *ChannelCompressor) Forward(hidden, value *tensors.Tensor) (*te
 				for row := 0; row < ratio; row++ {
 					position := block*ratio + row
 					probability := float32(0)
-					if position < sequenceLength && maximum > float32(math.Inf(-1)) {
+					if position < sequenceLength && maximum > float32(math.Inf(-1)) && rowInBlockSegment(segments, position, block, ratio, sequenceLength) {
 						probability = float32(math.Exp(float64(logitData[(batchIndex*sequenceLength+position)*channels+channel] - maximum)))
 					}
 					probabilityData[((batchIndex*blockCount+block)*ratio+row)*channels+channel] = probability
@@ -123,7 +153,7 @@ func (compressor *ChannelCompressor) Forward(hidden, value *tensors.Tensor) (*te
 						probabilityIndex := ((batchIndex*blockCount+block)*ratio + row) * channels
 						probabilityData[probabilityIndex+channel] *= inverse
 						position := block*ratio + row
-						if position < sequenceLength {
+						if position < sequenceLength && rowInBlockSegment(segments, position, block, ratio, sequenceLength) {
 							accumulator += probabilityData[probabilityIndex+channel] * valueData[(batchIndex*sequenceLength+position)*channels+channel]
 						}
 					}
@@ -141,6 +171,7 @@ func (compressor *ChannelCompressor) Forward(hidden, value *tensors.Tensor) (*te
 		batchSize:     batchSize,
 		sequenceLen:   sequenceLength,
 		blockCount:    blockCount,
+		segments:      segments,
 	}
 	return compressed, context
 }
@@ -178,6 +209,9 @@ func (compressor *ChannelCompressor) Backward(gradientCompressed *tensors.Tensor
 					if position >= sequenceLength {
 						continue
 					}
+					if !rowInBlockSegment(context.segments, position, block, ratio, sequenceLength) {
+						continue
+					}
 					probability := probabilityData[((batchIndex*blockCount+block)*ratio+row)*channels+channel]
 					value := valueData[(batchIndex*sequenceLength+position)*channels+channel]
 					gradientLogitsData[(batchIndex*sequenceLength+position)*channels+channel] += probability * gradient * (value - compressedValue)
@@ -193,6 +227,10 @@ func (compressor *ChannelCompressor) Backward(gradientCompressed *tensors.Tensor
 	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
 		for position := 0; position < sequenceLength; position++ {
 			blockPosition := position % ratio
+			block := position / ratio
+			if !rowInBlockSegment(context.segments, position, block, ratio, sequenceLength) {
+				continue
+			}
 			for channel := 0; channel < channels; channel++ {
 				compressor.bias.Grad[blockPosition*channels+channel] += gradientLogitsData[(batchIndex*sequenceLength+position)*channels+channel]
 			}

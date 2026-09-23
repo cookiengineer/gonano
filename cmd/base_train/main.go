@@ -31,6 +31,7 @@ func main() {
 	dataFormat := flag.String("data-format", "parquet", "data format: parquet|markdown")
 	baseDir := flag.String("base-dir", "", "checkpoint/tokenizer directory (default ~/.cache/gonano)")
 	modelTag := flag.String("model-tag", "", "checkpoint directory name (default d<depth>)")
+	sampleMasking := flag.Bool("sample-masking", true, "mask attention across packed documents (DeepSeek-V4.1 §4.2.2)")
 	flag.Parse()
 
 	if *baseDir == "" {
@@ -107,8 +108,14 @@ func main() {
 
 	logger.Info("training", "depth", *depth, "dim", configuration.EmbedDim, "params", model.TotalParams(), "steps", *numIterations)
 	for step := 0; step < *numIterations; step++ {
-		inputs, targets, _ := loader.Next()
-		loss := trainer.TrainStep(inputs, targets)
+		var loss float32
+		if *sampleMasking {
+			inputs, targets, segments, _ := loader.NextSegments()
+			loss = trainer.TrainStepSegments(inputs, targets, segments)
+		} else {
+			inputs, targets, _ := loader.Next()
+			loss = trainer.TrainStep(inputs, targets)
+		}
 		trainer.StepOptimizer(step, *numIterations)
 		if step%10 == 0 || step == *numIterations-1 {
 			logger.Info("step", "step", step, "loss", fmt.Sprintf("%.4f", loss))

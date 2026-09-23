@@ -97,6 +97,48 @@ func TestPretrainLoaderCropsToFill(tests *testing.T) {
 	}
 }
 
+// TestPretrainLoaderSegmentsAlignWithBOS checks that the segment ids returned by
+// NextSegments change exactly at document boundaries (each packed document
+// starts with BOS) and that the inputs/targets match Next.
+func TestPretrainLoaderSegmentsAlignWithBOS(tests *testing.T) {
+	tok := newSimpleTokenizer()
+	bos := int32(tok.BOSTokenID())
+	provider := newCyclicProvider([]string{"hello", "world", "hi", "there", "ok"})
+	loader := NewPretrainLoader(tok, 3, 12, provider, 10)
+
+	inputs, targets, segments, _ := loader.NextSegments()
+	if segments.Shape[0] != inputs.Shape[0] || segments.Shape[1] != inputs.Shape[1] {
+		tests.Fatalf("segments shape = %v, want %v", segments.Shape, inputs.Shape)
+	}
+	for row := 0; row < inputs.Shape[0]; row++ {
+		if segments.Get2(row, 0) != 0 {
+			tests.Fatalf("row %d must start in segment 0, got %d", row, segments.Get2(row, 0))
+		}
+		for index := 1; index < inputs.Shape[1]; index++ {
+			previous := segments.Get2(row, index-1)
+			current := segments.Get2(row, index)
+			if inputs.Get2(row, index) == bos {
+				if current != previous+1 {
+					tests.Fatalf("row %d index %d: BOS should start a new segment (%d -> %d)", row, index, previous, current)
+				}
+			} else if current != previous {
+				tests.Fatalf("row %d index %d: non-BOS token changed segment (%d -> %d)", row, index, previous, current)
+			}
+		}
+	}
+
+	// The inputs/targets of Next must be identical (Next is NextSegments
+	// without the segment tensor); the same provider/loader state makes the
+	// comparison valid only across a fresh loader, so use one.
+	fresh := NewPretrainLoader(tok, 3, 12, newCyclicProvider([]string{"hello", "world", "hi", "there", "ok"}), 10)
+	plainInputs, plainTargets, _ := fresh.Next()
+	for index := range plainInputs.Data {
+		if plainInputs.Data[index] != inputs.Data[index] || plainTargets.Data[index] != targets.Data[index] {
+			tests.Fatalf("Next and NextSegments differ at %d", index)
+		}
+	}
+}
+
 func newFiniteConvProvider(convs []*tokenizer.Conversation) ConvProvider {
 	position := 0
 	return func() ([]*tokenizer.Conversation, bool) {

@@ -26,6 +26,7 @@ func main() {
 	drafterPath := flag.String("drafter", "", "path to a DSpark drafter checkpoint")
 	speculative := flag.Bool("speculative", false, "use exact greedy speculative decoding (requires --temperature 0 and --drafter)")
 	draftLength := flag.Int("draft-length", 5, "tokens drafted per speculative round")
+	effort := flag.Int("effort", 0, "reasoning-effort level 1..100 (0 disables the instruction)")
 	baseDir := flag.String("base-dir", "", "tokenizer directory (default ~/.cache/gonano)")
 	flag.Parse()
 
@@ -74,6 +75,10 @@ func main() {
 
 	respond := func(text string) {
 		conversation := []int{bos, userStart}
+		if *effort > 0 {
+			conversation = append(conversation, tokenizer.Encode(tokenizer.ReasoningEffortInstruction(*effort))...)
+			conversation = append(conversation, tokenizer.Encode("\n\n")...)
+		}
 		conversation = append(conversation, tokenizer.Encode(text)...)
 		conversation = append(conversation, userEnd, assistantStart)
 		fmt.Print("Assistant: ")

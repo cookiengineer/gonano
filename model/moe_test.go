@@ -182,7 +182,7 @@ func TestMoERouterSelectsDeterministically(t *testing.T) {
 	for index := range input.Data {
 		input.Data[index] = float32(index%7) * 0.1
 	}
-	_, context := model.blocks[0].moe.forwardTraining(input)
+	_, context := model.blocks[0].moe.forwardTraining(input, 0)
 	if len(context.experts) != 1 || context.experts[0].id != 0 {
 		t.Fatalf("expected all tokens routed to expert 0, got %d active experts", len(context.experts))
 	}
@@ -503,4 +503,128 @@ func TestMoEComposesWithMLA(t *testing.T) {
 	}
 	// A cache-less forward allocates an MLA scratch cache internally.
 	analyticGrads(model, indexes, targets)
+}
+
+// TestMoEBalanceWeightDefault checks the effective sequence-level balance weight
+// semantics: zero selects the paper default, negative disables, positive
+// overrides.
+func TestMoEBalanceWeightDefault(t *testing.T) {
+	config := moeTestConfig()
+	if config.MoEBalanceLossWeight() != 1e-4 {
+		t.Fatalf("default balance weight = %v, want 1e-4", config.MoEBalanceLossWeight())
+	}
+	config.MoEBalanceWeight = -1
+	if config.MoEBalanceLossWeight() != 0 {
+		t.Fatalf("negative balance weight should disable, got %v", config.MoEBalanceLossWeight())
+	}
+	config.MoEBalanceWeight = 0.5
+	if config.MoEBalanceLossWeight() != 0.5 {
+		t.Fatalf("explicit balance weight = %v, want 0.5", config.MoEBalanceLossWeight())
+	}
+}
+
+// TestMoEBalanceLossUniformIsWeight checks the sequence-level balance loss on a
+// purely uniform router: with equal gate probabilities the loss is exactly the
+// balance weight regardless of the top-k selection (a closed-form invariant of
+// the DeepSeek-V3 formulation).
+func TestMoEBalanceLossUniformIsWeight(t *testing.T) {
+	config := moeTestConfig()
+	model := NewTransformer(config)
+	model.InitWeights(tensors.NewRNG(3))
+	for _, block := range model.blocks {
+		if block.moe == nil {
+			continue
+		}
+		block.moe.router.weight.Weight.Set(0)
+		block.moe.router.bias.Set(0)
+		block.moe.BalanceWeight = 0.0003
+	}
+	sequenceLength := 8
+	input := tensors.New(1, sequenceLength, config.EmbedDim)
+	_, context := model.blocks[0].moe.forwardTraining(input, sequenceLength)
+	if math.Abs(float64(context.balanceLoss)-0.0003) > 1e-6 {
+		t.Fatalf("uniform balance loss = %v, want 0.0003", context.balanceLoss)
+	}
+	if len(context.balanceGradProbs) != context.rows*model.blocks[0].moe.NumExperts {
+		t.Fatalf("balance gradient length = %d", len(context.balanceGradProbs))
+	}
+}
+
+// TestMoEBalanceLossGradientFlowsToRouter verifies the balance loss contributes
+// to the router weight gradient: disabling it must change the accumulated router
+// gradient.
+func TestMoEBalanceLossGradientFlowsToRouter(t *testing.T) {
+	model := moeTestModel()
+	indexes, targets := tinyData()
+	analyticGrads(model, indexes, targets)
+	withBalance := append([]float32(nil), model.blocks[0].moe.router.weight.Weight.Grad...)
+
+	for _, block := range model.blocks {
+		if block.moe != nil {
+			block.moe.BalanceWeight = 0
+		}
+	}
+	analyticGrads(model, indexes, targets)
+	withoutBalance := model.blocks[0].moe.router.weight.Weight.Grad
+
+	changed := false
+	for index := range withBalance {
+		if math.Abs(float64(withBalance[index]-withoutBalance[index])) > 1e-9 {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		t.Fatal("balance loss should contribute to the router gradient")
+	}
+}
+
+// TestMoEBalanceLossReference recomputes the sequence-level balance loss from
+// the saved router probabilities and selection counts and compares it to the
+// value stored in the training context on a non-uniform router.
+func TestMoEBalanceLossReference(t *testing.T) {
+	config := moeTestConfig()
+	model := NewTransformer(config)
+	model.InitWeights(tensors.NewRNG(5))
+	block := model.blocks[0]
+	block.moe.BalanceWeight = 1e-3
+	sequenceLength := 4
+	input := tensors.New(2, sequenceLength, config.EmbedDim)
+	rng := tensors.NewRNG(77)
+	for index := range input.Data {
+		input.Data[index] = rng.NormFloat32()
+	}
+	_, context := block.moe.forwardTraining(input, sequenceLength)
+
+	expertCount := block.moe.NumExperts
+	topK := block.moe.TopK
+	sequences := context.rows / sequenceLength
+	tokenCount := float64(sequenceLength)
+
+	counts := make([]float64, sequences*expertCount)
+	for index := range context.experts {
+		expert := &context.experts[index]
+		for _, row := range expert.rows {
+			counts[(row/sequenceLength)*expertCount+expert.id]++
+		}
+	}
+	sums := make([]float64, sequences*expertCount)
+	for row := 0; row < context.rows; row++ {
+		sequenceBase := (row / sequenceLength) * expertCount
+		for expert := 0; expert < expertCount; expert++ {
+			sums[sequenceBase+expert] += float64(context.probs.Data[row*expertCount+expert])
+		}
+	}
+	var want float64
+	for sequence := 0; sequence < sequences; sequence++ {
+		for expert := 0; expert < expertCount; expert++ {
+			fraction := float64(expertCount) / (float64(topK) * tokenCount) * counts[sequence*expertCount+expert]
+			probability := sums[sequence*expertCount+expert] / tokenCount
+			want += fraction * probability
+		}
+	}
+	want = float64(block.moe.BalanceWeight) * want / float64(sequences)
+	if math.Abs(context.balanceLoss-want) > 1e-12 {
+		t.Fatalf("balance loss = %v, want %v", context.balanceLoss, want)
+	}
 }

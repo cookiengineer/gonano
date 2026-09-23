@@ -52,6 +52,10 @@ type ChatCompletionRequest struct {
 	Stop        []string      `json:"stop,omitempty"`
 	Tools       []ToolDef     `json:"tools,omitempty"`
 	Seed        *uint64       `json:"seed,omitempty"`
+	// ReasoningEffort optionally selects a reasoning-effort level b in [1,100]
+	// by prepending the effort instruction to the system prompt
+	// (DeepSeek-V4.1 §5.1.4).
+	ReasoningEffort *int `json:"reasoning_effort,omitempty"`
 }
 
 // Usage reports token counts.

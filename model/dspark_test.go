@@ -4,6 +4,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/cookiengineer/gonano/optimizer"
 	"github.com/cookiengineer/gonano/tensors"
 )
 
@@ -211,5 +212,82 @@ func TestDSparkRoundTrip(t *testing.T) {
 				t.Fatalf("parameter %s mismatch at %d", name, index)
 			}
 		}
+	}
+}
+
+// TestTrainForwardSuffixMatchesForward verifies that the training-capable
+// suffix forward produces the same logits as the inference suffix forward for
+// the same draft-mask embedding.
+func TestTrainForwardSuffixMatchesForward(t *testing.T) {
+	backbone := NewTransformer(testConfig())
+	dspark := NewDSpark(backbone)
+	dspark.InitWeights(tensors.NewRNG(9))
+	drafter := dspark.Drafter
+	indexes := tensors.NewInt32sWithData([]int{1, 6}, []int32{1, 5, 2, 8, 3, 7})
+	suffixStart := 4
+
+	trainLogits, _ := drafter.TrainForwardSuffix(indexes, dspark.draftMaskEmbedding, suffixStart)
+	inferLogits, _ := drafter.ForwardHiddenSuffix(indexes, nil, dspark.draftMaskEmbedding, suffixStart)
+	if len(trainLogits.Data) != len(inferLogits.Data) {
+		t.Fatalf("length mismatch %d != %d", len(trainLogits.Data), len(inferLogits.Data))
+	}
+	for index := range trainLogits.Data {
+		if math.Abs(float64(trainLogits.Data[index]-inferLogits.Data[index])) > 1e-4 {
+			t.Fatalf("logit %d differs: train=%v infer=%v", index, trainLogits.Data[index], inferLogits.Data[index])
+		}
+	}
+}
+
+// TestDraftMaskEmbeddingGetsGradient checks the joint step backpropagates into
+// the learned draft-mask embedding.
+func TestDraftMaskEmbeddingGetsGradient(t *testing.T) {
+	backbone := NewTransformer(testConfig())
+	dspark := NewDSpark(backbone)
+	dspark.InitWeights(tensors.NewRNG(11))
+	inputs := tensors.NewInt32sWithData([]int{1, 6}, []int32{1, 5, 2, 8, 3, 7})
+	targets := tensors.NewInt32sWithData([]int{1, 6}, []int32{5, 2, 8, 3, 7, 4})
+
+	dspark.TrainStep(inputs, targets, 5)
+	if dspark.draftMaskEmbedding.Grad == nil {
+		t.Fatal("draft mask embedding gradient should be allocated")
+	}
+	nonzero := false
+	for _, value := range dspark.draftMaskEmbedding.Grad {
+		if value != 0 {
+			nonzero = true
+			break
+		}
+	}
+	if !nonzero {
+		t.Fatal("draft mask embedding gradient should be nonzero")
+	}
+}
+
+// TestDSparkJointTrainStepReducesLoss trains the whole DSpark jointly and checks
+// the loss decreases and stays finite.
+func TestDSparkJointTrainStepReducesLoss(t *testing.T) {
+	backbone := NewTransformer(testConfig())
+	dspark := NewDSpark(backbone)
+	dspark.InitWeights(tensors.NewRNG(3))
+	groups := dspark.SetupTrainingOptimizer(0.01, 0.1, 0.01, 0.0, 0.1, 1e-2)
+	optim := optimizer.NewMuonAdamW(groups)
+
+	inputs := tensors.NewInt32sWithData([]int{1, 6}, []int32{1, 5, 2, 8, 3, 7})
+	targets := tensors.NewInt32sWithData([]int{1, 6}, []int32{5, 2, 8, 3, 7, 4})
+	var first, last float32
+	for step := 0; step < 40; step++ {
+		loss := dspark.TrainStep(inputs, targets, 5)
+		if step == 0 {
+			first = loss
+		}
+		last = loss
+		optim.Step()
+		optim.ZeroGrad()
+	}
+	if math.IsNaN(float64(last)) || math.IsInf(float64(last), 0) {
+		t.Fatalf("loss became non-finite: %v", last)
+	}
+	if last >= first {
+		t.Fatalf("loss did not decrease: %v -> %v", first, last)
 	}
 }

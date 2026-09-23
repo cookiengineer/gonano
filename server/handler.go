@@ -47,7 +47,7 @@ func (server *Server) handleChatCompletions(writer http.ResponseWriter, request 
 		return
 	}
 
-	prompt := server.renderMessages(chatRequest.Messages, chatRequest.Tools)
+	prompt := server.renderMessages(chatRequest.Messages, chatRequest.Tools, chatRequest.ReasoningEffort)
 	genOptions := resolveOptions(chatRequest, server.Model.Config.SequenceLen)
 
 	if chatRequest.Stream {

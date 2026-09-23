@@ -33,9 +33,22 @@ func TestRenderMessagesSystemMerge(test *testing.T) {
 	ids := srv.renderMessages([]ChatMessage{
 		{Role: "system", Content: "You are helpful"},
 		{Role: "user", Content: "hi"},
-	}, nil)
+	}, nil, nil)
 	got := srv.Tokenizer.Decode(ids)
 	want := "<|bos|><|user_start|>You are helpful\n\nhi<|user_end|><|assistant_start|>"
+	if got != want {
+		test.Fatalf("decoded = %q, want %q", got, want)
+	}
+}
+
+// TestRenderMessagesReasoningEffort checks the optional reasoning_effort field
+// is prepended to the system prompt.
+func TestRenderMessagesReasoningEffort(test *testing.T) {
+	srv := testServer(test)
+	effort := 75
+	ids := srv.renderMessages([]ChatMessage{{Role: "user", Content: "hi"}}, nil, &effort)
+	got := srv.Tokenizer.Decode(ids)
+	want := "<|bos|><|user_start|>Reasoning Effort: 75 (range 1--100; higher values request more thorough reasoning)\n\nhi<|user_end|><|assistant_start|>"
 	if got != want {
 		test.Fatalf("decoded = %q, want %q", got, want)
 	}
@@ -47,7 +60,7 @@ func TestRenderMessagesToolRoundTrip(test *testing.T) {
 		{Role: "user", Content: "what is 2+2"},
 		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_0", Type: "function", Function: FunctionCall{Name: "calculator", Arguments: "2+2"}}}},
 		{Role: "tool", Content: "4"},
-	}, nil)
+	}, nil, nil)
 	got := srv.Tokenizer.Decode(ids)
 	want := "<|bos|><|user_start|>what is 2+2<|user_end|>" +
 		"<|assistant_start|><|tool_start|>2+2<|tool_end|><|assistant_end|>" +

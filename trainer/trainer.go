@@ -41,9 +41,25 @@ func NewTrainer(transformer *model.Transformer, groups []optimizer.ParamGroup, g
 	return trainer
 }
 
-// TrainStep runs one forward/backward micro-batch and returns the mean loss.
+// TrainStep runs one forward/backward micro-batch and returns the mean loss
+// (cross-entropy plus the sequence-level MoE balance loss when enabled).
 func (trainer *Trainer) TrainStep(inputs, targets *tensors.Int32s) float32 {
-	logits, trainContext := trainer.Model.TrainForward(inputs)
+	return trainer.TrainStepSegments(inputs, targets, nil)
+}
+
+// TrainStepSegments is TrainStep with sample-level attention masking
+// (DeepSeek-V4.1 §4.2.2): segments is [B,T] with one document/conversation id
+// per token, or nil for no masking.
+func (trainer *Trainer) TrainStepSegments(inputs, targets, segments *tensors.Int32s) float32 {
+	accumulation := trainer.GradAccumSteps
+	if accumulation < 1 {
+		accumulation = 1
+	}
+	// The balance-loss gradient must be averaged over the same accumulation
+	// window as the cross-entropy gradient.
+	trainer.Model.SetAuxiliaryGradientScale(1 / float32(accumulation))
+
+	logits, trainContext := trainer.Model.TrainForwardSegments(inputs, segments)
 	flat := logits.Reshape(inputs.Numel(), trainer.Model.Config.VocabSize)
 	targetsFlat := targets.Reshape(inputs.Numel())
 
@@ -52,11 +68,11 @@ func (trainer *Trainer) TrainStep(inputs, targets *tensors.Int32s) float32 {
 	if validTokens == 0 {
 		validTokens = 1
 	}
-	scale := 1.0 / (float32(validTokens) * float32(trainer.GradAccumSteps))
+	scale := 1.0 / (float32(validTokens) * float32(accumulation))
 	gradLogits := tensors.CrossEntropyGrad(flat, targetsFlat, -1, scale)
 	gradLogits = gradLogits.Reshape(inputs.Shape[0], inputs.Shape[1], trainer.Model.Config.VocabSize)
 	trainer.Model.TrainBackward(trainContext, gradLogits)
-	return loss
+	return loss + trainer.Model.AuxiliaryLoss(trainContext)
 }
 
 // StepOptimizer applies the current schedules and steps the optimizer. step is

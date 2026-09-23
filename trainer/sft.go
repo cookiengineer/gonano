@@ -20,11 +20,11 @@ func TrainSFT(transformer *model.Transformer, groups []optimizer.ParamGroup, loa
 		if numIterations > 0 && step >= numIterations {
 			break
 		}
-		inputs, targets, ok := loader.Next()
+		inputs, targets, segments, ok := loader.NextSegments()
 		if !ok {
 			break
 		}
-		loss := trainer.TrainStep(inputs, targets)
+		loss := trainer.TrainStepSegments(inputs, targets, segments)
 		trainer.StepOptimizer(step, max(1, numIterations))
 		losses = append(losses, loss)
 		if evaluateFunc != nil {

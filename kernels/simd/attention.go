@@ -40,7 +40,7 @@ func (backend *Backend) AttentionForward(parameters kernels.AttentionForwardPara
 	accumulator := make([]float32, queryLength*headDim)
 
 	attentionForwardRange(parameters.Query, parameters.Key, parameters.Value, queryLength, headDim,
-		parameters.PositionOffset, parameters.Window, 0, parameters.KeyLength, maximum, total, accumulator)
+		parameters.PositionOffset, parameters.Window, 0, parameters.KeyLength, parameters.SegmentIDs, maximum, total, accumulator)
 
 	for row := 0; row < queryLength; row++ {
 		accumulatorRow := accumulator[row*headDim : (row+1)*headDim]
@@ -66,7 +66,7 @@ func (backend *Backend) AttentionForwardSplit(parameters kernels.AttentionSplitP
 	clear(result.Accumulator)
 	attentionForwardRange(parameters.Query, parameters.Key, parameters.Value, queryLength, headDim,
 		parameters.PositionOffset, parameters.Window, parameters.KeyStart, parameters.KeyEnd,
-		result.Maximum, result.Sum, result.Accumulator)
+		parameters.SegmentIDs, result.Maximum, result.Sum, result.Accumulator)
 }
 
 // AttentionCombine merges per-shard statistics into the normalized output and
@@ -110,7 +110,7 @@ func (backend *Backend) AttentionCombine(parameters kernels.AttentionCombinePara
 // attentionForwardRange accumulates the flash-attention statistics for the key
 // range [keyStartBound, keyEndBound) into the caller-provided maximum, sum, and
 // accumulator. maximum must be initialized to -Inf and sum/accumulator zeroed.
-func attentionForwardRange(query, key, value []float32, queryLength, headDim, positionOffset, window, keyStartBound, keyEndBound int, maximum, sum, accumulator []float32) {
+func attentionForwardRange(query, key, value []float32, queryLength, headDim, positionOffset, window, keyStartBound, keyEndBound int, segmentIDs []int32, maximum, sum, accumulator []float32) {
 	scoreTile := make([]float32, queryBlockSize*keyBlockSize)
 	// The key-transpose scratch is only needed by the rank-1 GEMM path, which
 	// requires a full query block; single-token decode uses the dot-product
@@ -126,7 +126,7 @@ func attentionForwardRange(query, key, value []float32, queryLength, headDim, po
 		for keyStart := keyStartBound; keyStart < keyEndBound; keyStart += keyBlockSize {
 			keyEnd := min(keyStart+keyBlockSize, keyEndBound)
 			blockColumns := keyEnd - keyStart
-			computeMaskedScoreTile(scoreTile, keyTranspose, query, key, queryLength, headDim, positionOffset, window, queryStart, keyStart, blockRows, blockColumns)
+			computeMaskedScoreTile(scoreTile, keyTranspose, query, key, queryLength, headDim, positionOffset, window, queryStart, keyStart, blockRows, blockColumns, segmentIDs)
 
 			for row := 0; row < blockRows; row++ {
 				globalRow := queryStart + row
@@ -176,7 +176,7 @@ func attentionForwardRange(query, key, value []float32, queryLength, headDim, po
 // only worthwhile when it is amortized across several query rows, so for the
 // single-row decode case the direct dot-product path is used instead.
 // keyTranspose is caller-provided scratch of length headDim*keyBlockSize.
-func computeMaskedScoreTile(scoreTile, keyTranspose, query, key []float32, queryLength, headDim, positionOffset, window, queryStart, keyStart, blockRows, blockColumns int) {
+func computeMaskedScoreTile(scoreTile, keyTranspose, query, key []float32, queryLength, headDim, positionOffset, window, queryStart, keyStart, blockRows, blockColumns int, segmentIDs []int32) {
 	if blockRows < scoreTileGemmMinRows {
 		for row := 0; row < blockRows; row++ {
 			queryIndex := queryStart + row
@@ -184,12 +184,13 @@ func computeMaskedScoreTile(scoreTile, keyTranspose, query, key []float32, query
 				break
 			}
 			queryPosition := positionOffset + queryIndex
+			querySegment := segmentAt(segmentIDs, queryPosition)
 			queryRow := query[queryIndex*headDim : (queryIndex+1)*headDim]
 			scoreRow := scoreTile[row*keyBlockSize : row*keyBlockSize+blockColumns]
 			for column := 0; column < blockColumns; column++ {
 				keyIndex := keyStart + column
 				score := dotProduct(queryRow, key[keyIndex*headDim:(keyIndex+1)*headDim], headDim)
-				if keyIndex > queryPosition || (window >= 0 && queryPosition-keyIndex > window) {
+				if keyIndex > queryPosition || (window >= 0 && queryPosition-keyIndex > window) || segmentMasked(segmentIDs, keyIndex, querySegment) {
 					score = maskedAttentionScore
 				}
 				scoreRow[column] = score
@@ -228,13 +229,32 @@ func computeMaskedScoreTile(scoreTile, keyTranspose, query, key []float32, query
 		}
 
 		queryPosition := positionOffset + queryIndex
+		querySegment := segmentAt(segmentIDs, queryPosition)
 		for column := 0; column < blockColumns; column++ {
 			keyIndex := keyStart + column
-			if keyIndex > queryPosition || (window >= 0 && queryPosition-keyIndex > window) {
+			if keyIndex > queryPosition || (window >= 0 && queryPosition-keyIndex > window) || segmentMasked(segmentIDs, keyIndex, querySegment) {
 				scoreRow[column] = maskedAttentionScore
 			}
 		}
 	}
+}
+
+// segmentAt returns the segment id at the given absolute position, or 0 when no
+// segment ids are supplied.
+func segmentAt(segmentIDs []int32, position int) int32 {
+	if segmentIDs == nil || position < 0 || position >= len(segmentIDs) {
+		return 0
+	}
+	return segmentIDs[position]
+}
+
+// segmentMasked reports whether the key at keyIndex belongs to a different
+// segment than the query, given the query's segment id.
+func segmentMasked(segmentIDs []int32, keyIndex int, querySegment int32) bool {
+	if segmentIDs == nil || keyIndex < 0 || keyIndex >= len(segmentIDs) {
+		return false
+	}
+	return segmentIDs[keyIndex] != querySegment
 }
 
 // AttentionBackward computes the query/key/value gradients from the saved
@@ -256,12 +276,13 @@ func (backend *Backend) AttentionBackward(parameters kernels.AttentionBackwardPa
 
 	for queryIndex := 0; queryIndex < queryLength; queryIndex++ {
 		queryPosition := parameters.PositionOffset + queryIndex
+		querySegment := segmentAt(parameters.SegmentIDs, queryPosition)
 		queryRow := parameters.Query[queryIndex*headDim : (queryIndex+1)*headDim]
 		outputGradientRow := parameters.OutputGradient[queryIndex*headDim : (queryIndex+1)*headDim]
 
 		for keyIndex := 0; keyIndex < keyLength; keyIndex++ {
 			score := dotProduct(queryRow, parameters.Key[keyIndex*headDim:(keyIndex+1)*headDim], headDim)
-			if keyIndex > queryPosition || (parameters.Window >= 0 && queryPosition-keyIndex > parameters.Window) {
+			if keyIndex > queryPosition || (parameters.Window >= 0 && queryPosition-keyIndex > parameters.Window) || segmentMasked(parameters.SegmentIDs, keyIndex, querySegment) {
 				score = maskedAttentionScore
 			}
 			scores[keyIndex] = score

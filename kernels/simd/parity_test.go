@@ -428,6 +428,94 @@ func TestAttentionParity(t *testing.T) {
 	}
 }
 
+// TestAttentionSegmentMaskParity verifies the sample-level segment mask against
+// the scalar reference for both the flash forward and the backward pass.
+func TestAttentionSegmentMaskParity(t *testing.T) {
+	simdBackend := simdbackend.New()
+	scalarBackend := scalar.New()
+	cases := []struct {
+		name           string
+		queryLength    int
+		keyLength      int
+		headDim        int
+		positionOffset int
+		window         int
+	}{
+		{"causal-segmented", 6, 6, 8, 0, -1},
+		{"sliding-segmented", 6, 6, 8, 0, 2},
+		{"decode-segmented", 1, 10, 8, 9, -1},
+		{"wide-segmented", 5, 5, 16, 0, -1},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			query := kerneltest.Data(testCase.queryLength * testCase.headDim)
+			key := kerneltest.Data(testCase.keyLength * testCase.headDim)
+			value := kerneltest.DataB(testCase.keyLength * testCase.headDim)
+			segments := make([]int32, testCase.keyLength)
+			for position := range segments {
+				segments[position] = int32(position / 3)
+			}
+
+			parameters := kernels.AttentionForwardParameters{
+				Query:          query,
+				Key:            key,
+				Value:          value,
+				QueryLength:    testCase.queryLength,
+				KeyLength:      testCase.keyLength,
+				HeadDim:        testCase.headDim,
+				PositionOffset: testCase.positionOffset,
+				Window:         testCase.window,
+				SegmentIDs:     segments,
+			}
+
+			gotOutput := make([]float32, testCase.queryLength*testCase.headDim)
+			gotLogSumExp := make([]float32, testCase.queryLength)
+			wantOutput := make([]float32, testCase.queryLength*testCase.headDim)
+			wantLogSumExp := make([]float32, testCase.queryLength)
+			simdBackend.AttentionForward(parameters, kernels.AttentionForwardResult{Output: gotOutput, LogSumExp: gotLogSumExp})
+			scalarBackend.AttentionForward(parameters, kernels.AttentionForwardResult{Output: wantOutput, LogSumExp: wantLogSumExp})
+			kerneltest.AssertSlicesClose(t, gotOutput, wantOutput, 2e-3, 1e-5)
+			kerneltest.AssertSlicesClose(t, gotLogSumExp, wantLogSumExp, 2e-3, 1e-5)
+
+			outputGradient := kerneltest.Data(testCase.queryLength * testCase.headDim)
+			gotQueryGradient := make([]float32, testCase.queryLength*testCase.headDim)
+			gotKeyGradient := make([]float32, testCase.keyLength*testCase.headDim)
+			gotValueGradient := make([]float32, testCase.keyLength*testCase.headDim)
+			wantQueryGradient := make([]float32, testCase.queryLength*testCase.headDim)
+			wantKeyGradient := make([]float32, testCase.keyLength*testCase.headDim)
+			wantValueGradient := make([]float32, testCase.keyLength*testCase.headDim)
+
+			backwardParameters := kernels.AttentionBackwardParameters{
+				Query:          query,
+				Key:            key,
+				Value:          value,
+				Output:         wantOutput,
+				OutputGradient: outputGradient,
+				LogSumExp:      wantLogSumExp,
+				QueryLength:    testCase.queryLength,
+				KeyLength:      testCase.keyLength,
+				HeadDim:        testCase.headDim,
+				PositionOffset: testCase.positionOffset,
+				Window:         testCase.window,
+				SegmentIDs:     segments,
+			}
+			simdBackend.AttentionBackward(backwardParameters, kernels.AttentionBackwardResult{
+				QueryGradient: gotQueryGradient,
+				KeyGradient:   gotKeyGradient,
+				ValueGradient: gotValueGradient,
+			})
+			scalarBackend.AttentionBackward(backwardParameters, kernels.AttentionBackwardResult{
+				QueryGradient: wantQueryGradient,
+				KeyGradient:   wantKeyGradient,
+				ValueGradient: wantValueGradient,
+			})
+			kerneltest.AssertSlicesClose(t, gotQueryGradient, wantQueryGradient, 5e-3, 1e-5)
+			kerneltest.AssertSlicesClose(t, gotKeyGradient, wantKeyGradient, 5e-3, 1e-5)
+			kerneltest.AssertSlicesClose(t, gotValueGradient, wantValueGradient, 5e-3, 1e-5)
+		})
+	}
+}
+
 // TestIndexerScoresParity verifies the lightning-indexer scoring kernel against
 // the scalar reference across non-vector-multiple shapes.
 func TestIndexerScoresParity(t *testing.T) {

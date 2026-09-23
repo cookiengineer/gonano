@@ -1,5 +1,42 @@
 package tokenizer
 
+import "fmt"
+
+// ReasoningEffortInstruction returns the system-prompt instruction that selects
+// a reasoning-effort level b in [1,100] (DeepSeek-V4.1 §5.1.4). Higher values
+// request more thorough reasoning.
+func ReasoningEffortInstruction(effort int) string {
+	return fmt.Sprintf("Reasoning Effort: %d (range 1--100; higher values request more thorough reasoning)", effort)
+}
+
+// ReasoningEffortInstruction is the method form of ReasoningEffortInstruction
+// for callers that only hold a Tokenizer value.
+func (tokenizer *Tokenizer) ReasoningEffortInstruction(effort int) string {
+	return ReasoningEffortInstruction(effort)
+}
+
+// reasoningEffort reads the optional "effort" entry from a conversation's Extra
+// metadata.
+func reasoningEffort(conv *Conversation) (int, bool) {
+	if conv == nil || conv.Extra == nil {
+		return 0, false
+	}
+	switch value := conv.Extra["effort"].(type) {
+	case int:
+		return value, true
+	case int32:
+		return int(value), true
+	case int64:
+		return int(value), true
+	case float64:
+		return int(value), true
+	case float32:
+		return int(value), true
+	default:
+		return 0, false
+	}
+}
+
 // MessagePart is one part of an assistant message: plain text, a tool call, or
 // a tool output.
 type MessagePart struct {
@@ -35,8 +72,19 @@ func (tokenizer *Tokenizer) RenderConversation(conv *Conversation, maxTokens int
 		}
 	}
 
-	messages := conv.Messages
-	if messages[0].Role == "system" {
+	messages := append([]Message(nil), conv.Messages...)
+	if effort, ok := reasoningEffort(conv); ok {
+		instruction := ReasoningEffortInstruction(effort)
+		if len(messages) > 0 && messages[0].Role == "system" {
+			messages[0] = Message{Role: "system", Content: instruction + "\n\n" + messages[0].Content}
+		} else {
+			messages = append([]Message{{Role: "system", Content: instruction}}, messages...)
+		}
+	}
+	if len(messages) == 0 {
+		return ids, mask
+	}
+	if len(messages) >= 2 && messages[0].Role == "system" {
 		merged := messages[1]
 		merged.Content = messages[0].Content + "\n\n" + messages[1].Content
 		messages = append([]Message{merged}, messages[2:]...)

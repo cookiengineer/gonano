@@ -25,6 +25,10 @@ type compressedContext struct {
 	indexerContexts []*indexerContext
 	indexerScores   []*tensors.Tensor
 	indexerTargets  []*tensors.Tensor
+	// segments is the [B,T] sample-level mask (DeepSeek-V4.1 §4.2.2), or nil,
+	// and blockSegments[b][block] is the segment of each compressed block.
+	segments      *tensors.Int32s
+	blockSegments [][]int32
 }
 
 // sparseTrainingPlan scores every compressed block with the indexer, selects
@@ -38,7 +42,7 @@ type compressedContext struct {
 // training and inference restrict deeper indexers to the same search domain
 // (DeepSeek-V4.1 §2.3.2). The returned producedPool is nil unless this layer is
 // a Full layer with the hierarchical indexer enabled.
-func sparseTrainingPlan(attention *CausalSelfAttention, input, keyCompressed, queryHeadMajor *tensors.Tensor, sharedPool [][][]int) ([][][]int, []*indexerContext, []*tensors.Tensor, []*tensors.Tensor, [][][]int) {
+func sparseTrainingPlan(attention *CausalSelfAttention, input, keyCompressed, queryHeadMajor *tensors.Tensor, sharedPool [][][]int, segments *tensors.Int32s, blockSegments [][]int32) ([][][]int, []*indexerContext, []*tensors.Tensor, []*tensors.Tensor, [][][]int) {
 	batchSize := keyCompressed.Shape[0]
 	kvHeadCount := keyCompressed.Shape[1]
 	blockCount := keyCompressed.Shape[2]
@@ -93,6 +97,17 @@ func sparseTrainingPlan(attention *CausalSelfAttention, input, keyCompressed, qu
 				}
 			}
 			targets[index] = target
+			if segments != nil {
+				segmentRow := segments.Data[batch*sequenceLength : (batch+1)*sequenceLength]
+				var blockRow []int32
+				if batch < len(blockSegments) {
+					blockRow = blockSegments[batch]
+				}
+				for token := range selection[index] {
+					selection[index][token] = filterBlocksBySegment(selection[index][token], blockRow, segmentRow[token])
+				}
+				restrictIndexerToSegments(scores, target, segmentRow, blockRow)
+			}
 		}
 	}
 	return selection, contexts, scoresByHead, targets, producedPool
@@ -215,6 +230,40 @@ func restrictIndexerToPool(scores, target *tensors.Tensor, pool [][]int) {
 	}
 }
 
+// restrictIndexerToSegments masks an indexer's scores and distillation target to
+// the compressed blocks in each token's sample-level segment: entries in other
+// segments get a -inf score and a zero target, and the target is renormalized
+// within the segment (DeepSeek-V4.1 §4.2.2).
+func restrictIndexerToSegments(scores, target *tensors.Tensor, segmentRow []int32, blockRow []int32) {
+	if segmentRow == nil || blockRow == nil {
+		return
+	}
+	blockCount := scores.Shape[1]
+	rowCount := scores.Shape[0]
+	for row := 0; row < rowCount; row++ {
+		querySegment := segmentRow[row]
+		base := row * blockCount
+		var total float64
+		for block := 0; block < blockCount; block++ {
+			if block < len(blockRow) && blockRow[block] != querySegment {
+				scores.Data[base+block] = float32(math.Inf(-1))
+				target.Data[base+block] = 0
+				continue
+			}
+			total += float64(target.Data[base+block])
+		}
+		if total <= 0 {
+			continue
+		}
+		for block := 0; block < blockCount; block++ {
+			if block < len(blockRow) && blockRow[block] != querySegment {
+				continue
+			}
+			target.Data[base+block] = float32(float64(target.Data[base+block]) / total)
+		}
+	}
+}
+
 // maskedIndexerSoftmax returns the indexer softmax restricted to each token's
 // allowed blocks (others are zero).
 func maskedIndexerSoftmax(scores *tensors.Tensor, ratio int) []float32 {
@@ -253,9 +302,25 @@ func maskedIndexerSoftmax(scores *tensors.Tensor, ratio int) []float32 {
 	return probabilities
 }
 
+// filterBlocksBySegment returns the subset of selected blocks that share the
+// query token's sample-level segment. It allocates, so the caller's selection
+// slice is never mutated.
+func filterBlocksBySegment(selected []int, blockRow []int32, querySegment int32) []int {
+	if blockRow == nil {
+		return selected
+	}
+	allowed := make([]int, 0, len(selected))
+	for _, block := range selected {
+		if block < 0 || block >= len(blockRow) || blockRow[block] == querySegment {
+			allowed = append(allowed, block)
+		}
+	}
+	return allowed
+}
+
 // compressedAttentionForwardSparse is the training/prefill attention over the
 // selected compressed blocks for every (batch, query head).
-func compressedAttentionForwardSparse(queryHeadMajor, keyCompressed, valueCompressed, outputHeadMajor, logSumExp *tensors.Tensor, selection [][][]int, headRatio, ratio int) {
+func compressedAttentionForwardSparse(queryHeadMajor, keyCompressed, valueCompressed, outputHeadMajor, logSumExp *tensors.Tensor, selection [][][]int, headRatio, ratio int, segments *tensors.Int32s, blockSegments [][]int32) {
 	batchSize := queryHeadMajor.Shape[0]
 	queryHeadCount := queryHeadMajor.Shape[1]
 	sequenceLength := queryHeadMajor.Shape[2]
@@ -264,6 +329,14 @@ func compressedAttentionForwardSparse(queryHeadMajor, keyCompressed, valueCompre
 	blockCount := keyCompressed.Shape[2]
 
 	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		var segmentRow []int32
+		var blockRow []int32
+		if segments != nil {
+			segmentRow = segments.Data[batchIndex*sequenceLength : (batchIndex+1)*sequenceLength]
+		}
+		if batchIndex < len(blockSegments) {
+			blockRow = blockSegments[batchIndex]
+		}
 		for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
 			queryIndex := batchIndex*queryHeadCount + queryHead
 			keyValueHead := queryHead / headRatio
@@ -271,6 +344,9 @@ func compressedAttentionForwardSparse(queryHeadMajor, keyCompressed, valueCompre
 			for token := 0; token < sequenceLength; token++ {
 				outputSlice := outputHeadMajor.Data[queryIndex*sequenceLength*headDimension+token*headDimension : queryIndex*sequenceLength*headDimension+(token+1)*headDimension]
 				selected := selection[batchIndex*kvHeadCount+keyValueHead][token]
+				if segmentRow != nil {
+					selected = filterBlocksBySegment(selected, blockRow, segmentRow[token])
+				}
 				if len(selected) == 0 {
 					clear(outputSlice)
 					if logSumExp != nil {
@@ -297,7 +373,7 @@ func compressedAttentionForwardSparse(queryHeadMajor, keyCompressed, valueCompre
 }
 
 // compressedAttentionBackwardSparse backpropagates through the selected blocks.
-func compressedAttentionBackwardSparse(queryHeadMajor, keyCompressed, valueCompressed, outputHeadMajor, gradientOutputHeadMajor, logSumExp, rowCorrection, gradientQueryHeadMajor, gradientKeyCompressed, gradientValueCompressed *tensors.Tensor, selection [][][]int, headRatio, ratio int) {
+func compressedAttentionBackwardSparse(queryHeadMajor, keyCompressed, valueCompressed, outputHeadMajor, gradientOutputHeadMajor, logSumExp, rowCorrection, gradientQueryHeadMajor, gradientKeyCompressed, gradientValueCompressed *tensors.Tensor, selection [][][]int, headRatio, ratio int, segments *tensors.Int32s, blockSegments [][]int32) {
 	batchSize := queryHeadMajor.Shape[0]
 	queryHeadCount := queryHeadMajor.Shape[1]
 	sequenceLength := queryHeadMajor.Shape[2]
@@ -306,12 +382,23 @@ func compressedAttentionBackwardSparse(queryHeadMajor, keyCompressed, valueCompr
 	blockCount := keyCompressed.Shape[2]
 
 	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		var segmentRow []int32
+		var blockRow []int32
+		if segments != nil {
+			segmentRow = segments.Data[batchIndex*sequenceLength : (batchIndex+1)*sequenceLength]
+		}
+		if batchIndex < len(blockSegments) {
+			blockRow = blockSegments[batchIndex]
+		}
 		for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
 			queryIndex := batchIndex*queryHeadCount + queryHead
 			keyValueHead := queryHead / headRatio
 			keyBase := (batchIndex*kvHeadCount + keyValueHead) * blockCount * headDimension
 			for token := 0; token < sequenceLength; token++ {
 				selected := selection[batchIndex*kvHeadCount+keyValueHead][token]
+				if segmentRow != nil {
+					selected = filterBlocksBySegment(selected, blockRow, segmentRow[token])
+				}
 				if len(selected) == 0 {
 					continue
 				}
@@ -398,9 +485,13 @@ func mergeAttentionRow(output, outputA, outputB []float32, logA, logB float32) {
 
 // attentionForwardWindowed runs the local sliding-window branch for every
 // (batch, query head) during training.
-func attentionForwardWindowed(queryHeadMajor, keyHeadMajor, valueHeadMajor, outputHeadMajor, logSumExp *tensors.Tensor, batchSize, queryHeadCount, kvHeadCount, sequenceLength, headDim, positionOffset, window int) {
+func attentionForwardWindowed(queryHeadMajor, keyHeadMajor, valueHeadMajor, outputHeadMajor, logSumExp *tensors.Tensor, batchSize, queryHeadCount, kvHeadCount, sequenceLength, headDim, positionOffset, window int, segments *tensors.Int32s) {
 	headRatio := queryHeadCount / kvHeadCount
 	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		var segmentRow []int32
+		if segments != nil {
+			segmentRow = segments.Data[batchIndex*sequenceLength : (batchIndex+1)*sequenceLength]
+		}
 		for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
 			keyValueHead := queryHead / headRatio
 			queryIndex := batchIndex*queryHeadCount + queryHead
@@ -409,7 +500,7 @@ func attentionForwardWindowed(queryHeadMajor, keyHeadMajor, valueHeadMajor, outp
 			value := headSlice(valueHeadMajor.Data, batchIndex*kvHeadCount+keyValueHead, sequenceLength, headDim)
 			output := headSlice(outputHeadMajor.Data, queryIndex, sequenceLength, headDim)
 			statistic := headSlice(logSumExp.Data, queryIndex, sequenceLength, 1)
-			tensors.AttentionForward(query, key, value, output, statistic, sequenceLength, sequenceLength, headDim, positionOffset, window)
+			tensors.AttentionForwardSegment(query, key, value, output, statistic, segmentRow, sequenceLength, sequenceLength, headDim, positionOffset, window)
 		}
 	}
 }
@@ -417,9 +508,13 @@ func attentionForwardWindowed(queryHeadMajor, keyHeadMajor, valueHeadMajor, outp
 // attentionBackwardWindowed backpropagates the local sliding-window branch with
 // the merged log-sum-exp and row correction shared with the global branch. Raw
 // key/value gradients accumulate across the query heads that share a KV head.
-func attentionBackwardWindowed(queryHeadMajor, keyHeadMajor, valueHeadMajor, outputHeadMajor, gradientOutputHeadMajor, logSumExp, rowCorrection, gradientQueryHeadMajor, gradientKeyHeadMajor, gradientValueHeadMajor *tensors.Tensor, batchSize, queryHeadCount, kvHeadCount, sequenceLength, headDim, positionOffset, window int) {
+func attentionBackwardWindowed(queryHeadMajor, keyHeadMajor, valueHeadMajor, outputHeadMajor, gradientOutputHeadMajor, logSumExp, rowCorrection, gradientQueryHeadMajor, gradientKeyHeadMajor, gradientValueHeadMajor *tensors.Tensor, batchSize, queryHeadCount, kvHeadCount, sequenceLength, headDim, positionOffset, window int, segments *tensors.Int32s) {
 	headRatio := queryHeadCount / kvHeadCount
 	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		var segmentRow []int32
+		if segments != nil {
+			segmentRow = segments.Data[batchIndex*sequenceLength : (batchIndex+1)*sequenceLength]
+		}
 		for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
 			keyValueHead := queryHead / headRatio
 			queryIndex := batchIndex*queryHeadCount + queryHead
@@ -436,7 +531,7 @@ func attentionBackwardWindowed(queryHeadMajor, keyHeadMajor, valueHeadMajor, out
 			gradientQuery := headSlice(gradientQueryHeadMajor.Data, queryIndex, sequenceLength, headDim)
 			gradientKey := headSlice(gradientKeyHeadMajor.Data, batchIndex*kvHeadCount+keyValueHead, sequenceLength, headDim)
 			gradientValue := headSlice(gradientValueHeadMajor.Data, batchIndex*kvHeadCount+keyValueHead, sequenceLength, headDim)
-			tensors.AttentionBackwardCorrected(query, key, value, output, gradientOutput, statistic, correction, gradientQuery, gradientKey, gradientValue, sequenceLength, sequenceLength, headDim, positionOffset, window)
+			tensors.AttentionBackwardCorrectedSegment(query, key, value, output, gradientOutput, statistic, correction, segmentRow, gradientQuery, gradientKey, gradientValue, sequenceLength, sequenceLength, headDim, positionOffset, window)
 		}
 	}
 }
@@ -464,7 +559,7 @@ func localAttentionRow(queryRow, keyPrefix, valuePrefix []float32, absolutePosit
 	tensors.AttentionForward(queryRow, keyLocal, valueLocal, output, logSumExp, 1, localCount, headDim, localCount-1, -1)
 }
 
-func compressForward(compressor *ChannelCompressor, input, key, value *tensors.Tensor, ratio int) *compressedContext {
+func compressForward(compressor *ChannelCompressor, input, key, value *tensors.Tensor, ratio int, segments *tensors.Int32s) *compressedContext {
 	batchSize := key.Shape[0]
 	kvHeadCount := key.Shape[1]
 	sequenceLength := key.Shape[2]
@@ -477,15 +572,31 @@ func compressForward(compressor *ChannelCompressor, input, key, value *tensors.T
 	keyContexts := make([]*compressorContext, batchSize*kvHeadCount)
 	valueContexts := make([]*compressorContext, batchSize*kvHeadCount)
 
+	var blockSegments [][]int32
+	if segments != nil {
+		blockSegments = make([][]int32, batchSize)
+		for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+			segmentRow := segments.Data[batchIndex*sequenceLength : (batchIndex+1)*sequenceLength]
+			blockSegments[batchIndex] = make([]int32, blocks)
+			for block := 0; block < blocks; block++ {
+				blockSegments[batchIndex][block] = blockSegment(segmentRow, block, ratio, sequenceLength)
+			}
+		}
+	}
+
 	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
 		hidden := tensors.NewWithData([]int{1, sequenceLength, embeddingDimension},
 			input.Data[batchIndex*sequenceLength*embeddingDimension:(batchIndex+1)*sequenceLength*embeddingDimension])
+		var segmentRow []int32
+		if segments != nil {
+			segmentRow = segments.Data[batchIndex*sequenceLength : (batchIndex+1)*sequenceLength]
+		}
 		for head := 0; head < kvHeadCount; head++ {
 			index := batchIndex*kvHeadCount + head
 			keyHead := tensors.NewWithData([]int{1, sequenceLength, headDimension}, headSlice(key.Data, index, sequenceLength, headDimension))
 			valueHead := tensors.NewWithData([]int{1, sequenceLength, headDimension}, headSlice(value.Data, index, sequenceLength, headDimension))
-			compressedKey, keyContext := compressor.Forward(hidden, keyHead)
-			compressedValue, valueContext := compressor.Forward(hidden, valueHead)
+			compressedKey, keyContext := compressor.Forward(hidden, keyHead, segmentRow)
+			compressedValue, valueContext := compressor.Forward(hidden, valueHead, segmentRow)
 			copy(keyCompressed.Data[index*blocks*headDimension:], compressedKey.Data)
 			copy(valueCompressed.Data[index*blocks*headDimension:], compressedValue.Data)
 			keyContexts[index] = keyContext
@@ -501,6 +612,8 @@ func compressForward(compressor *ChannelCompressor, input, key, value *tensors.T
 		valueContexts:   valueContexts,
 		blocks:          blocks,
 		ratio:           ratio,
+		segments:        segments,
+		blockSegments:   blockSegments,
 	}
 }
 
@@ -508,13 +621,18 @@ func compressForward(compressor *ChannelCompressor, input, key, value *tensors.T
 // against the compressed key/value blocks that strictly precede the query's own
 // compression block. Queries in block 0 have no preceding block and produce
 // zero output.
-func compressedAttentionForward(queryHeadMajor, keyCompressed, valueCompressed, outputHeadMajor, logSumExp *tensors.Tensor, headRatio, ratio int) {
+func compressedAttentionForward(queryHeadMajor, keyCompressed, valueCompressed, outputHeadMajor, logSumExp *tensors.Tensor, headRatio, ratio int, segments *tensors.Int32s, blockSegments [][]int32) {
 	batchSize := queryHeadMajor.Shape[0]
 	queryHeadCount := queryHeadMajor.Shape[1]
 	sequenceLength := queryHeadMajor.Shape[2]
 	headDimension := queryHeadMajor.Shape[3]
 	kvHeadCount := keyCompressed.Shape[1]
 	blocks := keyCompressed.Shape[2]
+
+	if segments != nil {
+		compressedAttentionForwardMasked(queryHeadMajor, keyCompressed, valueCompressed, outputHeadMajor, logSumExp, headRatio, ratio, segments, blockSegments)
+		return
+	}
 
 	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
 		for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
@@ -554,15 +672,80 @@ func compressedAttentionForward(queryHeadMajor, keyCompressed, valueCompressed, 
 	}
 }
 
-// compressedAttentionBackward accumulates the query, compressed-key, and
-// compressed-value gradients for every (batch, query head) and block.
-func compressedAttentionBackward(queryHeadMajor, keyCompressed, valueCompressed, outputHeadMajor, gradientOutputHeadMajor, logSumExp, rowCorrection, gradientQueryHeadMajor, gradientKeyCompressed, gradientValueCompressed *tensors.Tensor, headRatio, ratio int) {
+// compressedAttentionForwardMasked is the sample-masked counterpart of
+// compressedAttentionForward. It processes one query token at a time so that
+// each query attends only to the strictly preceding compressed blocks that
+// share its sample-level segment (DeepSeek-V4.1 §4.2.2).
+func compressedAttentionForwardMasked(queryHeadMajor, keyCompressed, valueCompressed, outputHeadMajor, logSumExp *tensors.Tensor, headRatio, ratio int, segments *tensors.Int32s, blockSegments [][]int32) {
 	batchSize := queryHeadMajor.Shape[0]
 	queryHeadCount := queryHeadMajor.Shape[1]
 	sequenceLength := queryHeadMajor.Shape[2]
 	headDimension := queryHeadMajor.Shape[3]
 	kvHeadCount := keyCompressed.Shape[1]
 	blocks := keyCompressed.Shape[2]
+
+	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		segmentRow := segments.Data[batchIndex*sequenceLength : (batchIndex+1)*sequenceLength]
+		var blockRow []int32
+		if batchIndex < len(blockSegments) {
+			blockRow = blockSegments[batchIndex]
+		}
+		for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
+			queryIndex := batchIndex*queryHeadCount + queryHead
+			keyValueHead := queryHead / headRatio
+			keyBase := (batchIndex*kvHeadCount + keyValueHead) * blocks * headDimension
+			for token := 0; token < sequenceLength; token++ {
+				outputSlice := outputHeadMajor.Data[queryIndex*sequenceLength*headDimension+token*headDimension : queryIndex*sequenceLength*headDimension+(token+1)*headDimension]
+				limit := token / ratio
+				if limit > blocks {
+					limit = blocks
+				}
+				querySegment := segmentRow[token]
+				allowed := make([]int, 0, limit)
+				for block := 0; block < limit; block++ {
+					if blockRow != nil && block < len(blockRow) && blockRow[block] != querySegment {
+						continue
+					}
+					allowed = append(allowed, block)
+				}
+				if len(allowed) == 0 {
+					clear(outputSlice)
+					if logSumExp != nil {
+						logSumExp.Data[queryIndex*sequenceLength+token] = float32(math.Inf(-1))
+					}
+					continue
+				}
+				keySlice := make([]float32, len(allowed)*headDimension)
+				valueSlice := make([]float32, len(allowed)*headDimension)
+				for index, block := range allowed {
+					copy(keySlice[index*headDimension:(index+1)*headDimension], keyCompressed.Data[keyBase+block*headDimension:keyBase+(block+1)*headDimension])
+					copy(valueSlice[index*headDimension:(index+1)*headDimension], valueCompressed.Data[keyBase+block*headDimension:keyBase+(block+1)*headDimension])
+				}
+				querySlice := queryHeadMajor.Data[queryIndex*sequenceLength*headDimension+token*headDimension : queryIndex*sequenceLength*headDimension+(token+1)*headDimension]
+				var logSumExpSlice []float32
+				if logSumExp != nil {
+					logSumExpSlice = logSumExp.Data[queryIndex*sequenceLength+token : queryIndex*sequenceLength+token+1]
+				}
+				tensors.AttentionForward(querySlice, keySlice, valueSlice, outputSlice, logSumExpSlice, 1, len(allowed), headDimension, len(allowed), -1)
+			}
+		}
+	}
+}
+
+// compressedAttentionBackward accumulates the query, compressed-key, and
+// compressed-value gradients for every (batch, query head) and block.
+func compressedAttentionBackward(queryHeadMajor, keyCompressed, valueCompressed, outputHeadMajor, gradientOutputHeadMajor, logSumExp, rowCorrection, gradientQueryHeadMajor, gradientKeyCompressed, gradientValueCompressed *tensors.Tensor, headRatio, ratio int, segments *tensors.Int32s, blockSegments [][]int32) {
+	batchSize := queryHeadMajor.Shape[0]
+	queryHeadCount := queryHeadMajor.Shape[1]
+	sequenceLength := queryHeadMajor.Shape[2]
+	headDimension := queryHeadMajor.Shape[3]
+	kvHeadCount := keyCompressed.Shape[1]
+	blocks := keyCompressed.Shape[2]
+
+	if segments != nil {
+		compressedAttentionBackwardMasked(queryHeadMajor, keyCompressed, valueCompressed, outputHeadMajor, gradientOutputHeadMajor, logSumExp, rowCorrection, gradientQueryHeadMajor, gradientKeyCompressed, gradientValueCompressed, headRatio, ratio, segments, blockSegments)
+		return
+	}
 
 	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
 		for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
@@ -594,6 +777,73 @@ func compressedAttentionBackward(queryHeadMajor, keyCompressed, valueCompressed,
 	}
 }
 
+// compressedAttentionBackwardMasked is the sample-masked counterpart of
+// compressedAttentionBackward: each query token only contributes gradients to
+// the strictly preceding compressed blocks in its own segment.
+func compressedAttentionBackwardMasked(queryHeadMajor, keyCompressed, valueCompressed, outputHeadMajor, gradientOutputHeadMajor, logSumExp, rowCorrection, gradientQueryHeadMajor, gradientKeyCompressed, gradientValueCompressed *tensors.Tensor, headRatio, ratio int, segments *tensors.Int32s, blockSegments [][]int32) {
+	batchSize := queryHeadMajor.Shape[0]
+	queryHeadCount := queryHeadMajor.Shape[1]
+	sequenceLength := queryHeadMajor.Shape[2]
+	headDimension := queryHeadMajor.Shape[3]
+	kvHeadCount := keyCompressed.Shape[1]
+	blocks := keyCompressed.Shape[2]
+
+	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		segmentRow := segments.Data[batchIndex*sequenceLength : (batchIndex+1)*sequenceLength]
+		var blockRow []int32
+		if batchIndex < len(blockSegments) {
+			blockRow = blockSegments[batchIndex]
+		}
+		for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
+			queryIndex := batchIndex*queryHeadCount + queryHead
+			keyValueHead := queryHead / headRatio
+			keyBase := (batchIndex*kvHeadCount + keyValueHead) * blocks * headDimension
+			for token := 0; token < sequenceLength; token++ {
+				limit := token / ratio
+				if limit > blocks {
+					limit = blocks
+				}
+				querySegment := segmentRow[token]
+				allowed := make([]int, 0, limit)
+				for block := 0; block < limit; block++ {
+					if blockRow != nil && block < len(blockRow) && blockRow[block] != querySegment {
+						continue
+					}
+					allowed = append(allowed, block)
+				}
+				if len(allowed) == 0 {
+					continue
+				}
+				keySlice := make([]float32, len(allowed)*headDimension)
+				valueSlice := make([]float32, len(allowed)*headDimension)
+				gradientKeySlice := make([]float32, len(allowed)*headDimension)
+				gradientValueSlice := make([]float32, len(allowed)*headDimension)
+				for index, block := range allowed {
+					copy(keySlice[index*headDimension:(index+1)*headDimension], keyCompressed.Data[keyBase+block*headDimension:keyBase+(block+1)*headDimension])
+					copy(valueSlice[index*headDimension:(index+1)*headDimension], valueCompressed.Data[keyBase+block*headDimension:keyBase+(block+1)*headDimension])
+				}
+				querySlice := queryHeadMajor.Data[queryIndex*sequenceLength*headDimension+token*headDimension : queryIndex*sequenceLength*headDimension+(token+1)*headDimension]
+				outputSlice := outputHeadMajor.Data[queryIndex*sequenceLength*headDimension+token*headDimension : queryIndex*sequenceLength*headDimension+(token+1)*headDimension]
+				gradientOutputSlice := gradientOutputHeadMajor.Data[queryIndex*sequenceLength*headDimension+token*headDimension : queryIndex*sequenceLength*headDimension+(token+1)*headDimension]
+				gradientQuerySlice := gradientQueryHeadMajor.Data[queryIndex*sequenceLength*headDimension+token*headDimension : queryIndex*sequenceLength*headDimension+(token+1)*headDimension]
+				logSumExpSlice := logSumExp.Data[queryIndex*sequenceLength+token : queryIndex*sequenceLength+token+1]
+				var correctionSlice []float32
+				if rowCorrection != nil {
+					correctionSlice = rowCorrection.Data[queryIndex*sequenceLength+token : queryIndex*sequenceLength+token+1]
+				}
+				tensors.AttentionBackwardCorrected(querySlice, keySlice, valueSlice, outputSlice, gradientOutputSlice, logSumExpSlice, correctionSlice,
+					gradientQuerySlice, gradientKeySlice, gradientValueSlice, 1, len(allowed), headDimension, len(allowed), -1)
+				for index, block := range allowed {
+					for element := 0; element < headDimension; element++ {
+						gradientKeyCompressed.Data[keyBase+block*headDimension+element] += gradientKeySlice[index*headDimension+element]
+						gradientValueCompressed.Data[keyBase+block*headDimension+element] += gradientValueSlice[index*headDimension+element]
+					}
+				}
+			}
+		}
+	}
+}
+
 // compressTail compresses every row's completed tail block into the cache.
 func (attention *CausalSelfAttention) compressTail(cache *KVBuffer, layer, batchSize, embeddingDimension, headDimension int) {
 	ratio := attention.compressionRatio
@@ -604,8 +854,8 @@ func (attention *CausalSelfAttention) compressTail(cache *KVBuffer, layer, batch
 			index := batch*kvHeadCount + head
 			keyHead := tensors.NewWithData([]int{1, ratio, headDimension}, cache.TailKey(layer, index))
 			valueHead := tensors.NewWithData([]int{1, ratio, headDimension}, cache.TailValue(layer, index))
-			compressedKey, _ := attention.compressor.Forward(hidden, keyHead)
-			compressedValue, _ := attention.compressor.Forward(hidden, valueHead)
+			compressedKey, _ := attention.compressor.Forward(hidden, keyHead, nil)
+			compressedValue, _ := attention.compressor.Forward(hidden, valueHead, nil)
 			cache.AppendCompressed(layer, batch, head, compressedKey.Data, compressedValue.Data)
 			if attention.indexer != nil {
 				projected := attention.indexer.key.Forward(compressedKey)

@@ -23,6 +23,9 @@ type PretrainLoader struct {
 	docBuffer [][]int32
 	state     State
 	scratch   []int32
+	// segmentScratch holds the per-token document index used for sample-level
+	// attention masking (DeepSeek-V4.1 §4.2.2).
+	segmentScratch []int32
 }
 
 // NewPretrainLoader builds a pretraining dataloader. provider yields batches
@@ -32,12 +35,13 @@ func NewPretrainLoader(tok *tokenizer.Tokenizer, batchSize, sequenceLength int, 
 		bufferSize = 1000
 	}
 	return &PretrainLoader{
-		tok:        tok,
-		B:          batchSize,
-		T:          sequenceLength,
-		bufferSize: bufferSize,
-		provider:   provider,
-		scratch:    make([]int32, sequenceLength+1),
+		tok:            tok,
+		B:              batchSize,
+		T:              sequenceLength,
+		bufferSize:     bufferSize,
+		provider:       provider,
+		scratch:        make([]int32, sequenceLength+1),
+		segmentScratch: make([]int32, sequenceLength+1),
 	}
 }
 
@@ -69,12 +73,30 @@ func toInt32(ids []int) []int32 {
 // shape [B,T] (inputs shifted by one). It also returns the dataset position
 // for checkpointing.
 func (loader *PretrainLoader) Next() (*tensors.Int32s, *tensors.Int32s, State) {
+	inputs, targets, _, state := loader.next(false)
+	return inputs, targets, state
+}
+
+// NextSegments is Next plus a per-token segment id of shape [B,T]. A new
+// segment begins at every packed document (each starts with BOS), so callers
+// can apply sample-level attention masking and keep tokens from different
+// documents from attending to each other (DeepSeek-V4.1 §4.2.2).
+func (loader *PretrainLoader) NextSegments() (*tensors.Int32s, *tensors.Int32s, *tensors.Int32s, State) {
+	return loader.next(true)
+}
+
+func (loader *PretrainLoader) next(withSegments bool) (*tensors.Int32s, *tensors.Int32s, *tensors.Int32s, State) {
 	rowCapacity := loader.T + 1
 	inputs := tensors.NewInt32s(loader.B, loader.T)
 	targets := tensors.NewInt32s(loader.B, loader.T)
+	var segments *tensors.Int32s
+	if withSegments {
+		segments = tensors.NewInt32s(loader.B, loader.T)
+	}
 
 	for row := 0; row < loader.B; row++ {
 		pos := 0
+		segment := int32(0)
 		for pos < rowCapacity {
 			for len(loader.docBuffer) < loader.bufferSize {
 				loader.refill()
@@ -92,6 +114,11 @@ func (loader *PretrainLoader) Next() (*tensors.Int32s, *tensors.Int32s, State) {
 				document := loader.docBuffer[bestIdx]
 				loader.docBuffer = append(loader.docBuffer[:bestIdx], loader.docBuffer[bestIdx+1:]...)
 				copy(loader.scratch[pos:], document)
+				if withSegments {
+					for fill := pos; fill < pos+len(document); fill++ {
+						loader.segmentScratch[fill] = segment
+					}
+				}
 				pos += len(document)
 			} else {
 				shortest := 0
@@ -103,13 +130,22 @@ func (loader *PretrainLoader) Next() (*tensors.Int32s, *tensors.Int32s, State) {
 				document := loader.docBuffer[shortest]
 				loader.docBuffer = append(loader.docBuffer[:shortest], loader.docBuffer[shortest+1:]...)
 				copy(loader.scratch[pos:], document[:remaining])
+				if withSegments {
+					for fill := pos; fill < pos+remaining; fill++ {
+						loader.segmentScratch[fill] = segment
+					}
+				}
 				pos += remaining
 			}
+			segment++
 		}
 		copy(inputs.Data[row*loader.T:], loader.scratch[:loader.T])
 		copy(targets.Data[row*loader.T:], loader.scratch[1:loader.T+1])
+		if withSegments {
+			copy(segments.Data[row*loader.T:], loader.segmentScratch[:loader.T])
+		}
 	}
-	return inputs, targets, loader.state
+	return inputs, targets, segments, loader.state
 }
 
 // ConvProvider yields the next batch of conversations for SFT.
@@ -134,6 +170,9 @@ type SFTLoader struct {
 	done        bool
 	scratch     []int32
 	maskScratch []int32
+	// segmentScratch holds the per-token conversation index used for
+	// sample-level attention masking (DeepSeek-V4.1 §4.2.2).
+	segmentScratch []int32
 }
 
 // NewSFTLoader builds an SFT dataloader over the given conversation provider.
@@ -142,13 +181,14 @@ func NewSFTLoader(tok *tokenizer.Tokenizer, batchSize, sequenceLength int, provi
 		bufferSize = 100
 	}
 	return &SFTLoader{
-		tok:         tok,
-		B:           batchSize,
-		T:           sequenceLength,
-		bufferSize:  bufferSize,
-		provider:    provider,
-		scratch:     make([]int32, sequenceLength+1),
-		maskScratch: make([]int32, sequenceLength+1),
+		tok:            tok,
+		B:              batchSize,
+		T:              sequenceLength,
+		bufferSize:     bufferSize,
+		provider:       provider,
+		scratch:        make([]int32, sequenceLength+1),
+		maskScratch:    make([]int32, sequenceLength+1),
+		segmentScratch: make([]int32, sequenceLength+1),
 	}
 }
 
@@ -171,13 +211,30 @@ func (loader *SFTLoader) refill() {
 // (non-assistant) and padded positions. ok is false when the provider is
 // exhausted and the buffer is empty.
 func (loader *SFTLoader) Next() (*tensors.Int32s, *tensors.Int32s, bool) {
+	inputs, targets, _, ok := loader.next(false)
+	return inputs, targets, ok
+}
+
+// NextSegments is Next plus a per-token segment id of shape [B,T]. Each packed
+// conversation is its own segment and the padded tail is a final segment, so
+// callers can keep tokens from different conversations from attending to each
+// other (DeepSeek-V4.1 §4.2.2).
+func (loader *SFTLoader) NextSegments() (*tensors.Int32s, *tensors.Int32s, *tensors.Int32s, bool) {
+	return loader.next(true)
+}
+
+func (loader *SFTLoader) next(withSegments bool) (*tensors.Int32s, *tensors.Int32s, *tensors.Int32s, bool) {
 	if loader.done && len(loader.convBuffer) == 0 {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	rowCapacity := loader.T + 1
 	bos := int32(loader.tok.BOSTokenID())
 	inputs := tensors.NewInt32s(loader.B, loader.T)
 	targets := tensors.NewInt32s(loader.B, loader.T)
+	var segments *tensors.Int32s
+	if withSegments {
+		segments = tensors.NewInt32s(loader.B, loader.T)
+	}
 
 	for row := 0; row < loader.B; row++ {
 		loader.refill()
@@ -186,6 +243,7 @@ func (loader *SFTLoader) Next() (*tensors.Int32s, *tensors.Int32s, bool) {
 			break
 		}
 		pos := 0
+		segment := int32(0)
 
 		for pos < rowCapacity {
 			if len(loader.convBuffer) == 0 {
@@ -209,16 +267,26 @@ func (loader *SFTLoader) Next() (*tensors.Int32s, *tensors.Int32s, bool) {
 				loader.convBuffer = append(loader.convBuffer[:bestIdx], loader.convBuffer[bestIdx+1:]...)
 				copy(loader.scratch[pos:], conversation.ids)
 				copy(loader.maskScratch[pos:], conversation.mask)
+				if withSegments {
+					for fill := pos; fill < pos+len(conversation.ids); fill++ {
+						loader.segmentScratch[fill] = segment
+					}
+				}
 				pos += len(conversation.ids)
 			} else {
 
 				break
 			}
+			segment++
 		}
-		// Pad the remainder with BOS and mask 0.
+		// Pad the remainder with BOS and mask 0. Padding is its own segment so
+		// real tokens never attend to it.
 		for index := pos; index < rowCapacity; index++ {
 			loader.scratch[index] = bos
 			loader.maskScratch[index] = 0
+			if withSegments {
+				loader.segmentScratch[index] = segment
+			}
 		}
 
 		copy(inputs.Data[row*loader.T:], loader.scratch[:loader.T])
@@ -229,6 +297,9 @@ func (loader *SFTLoader) Next() (*tensors.Int32s, *tensors.Int32s, bool) {
 				targets.Data[row*loader.T+index] = -1
 			}
 		}
+		if withSegments {
+			copy(segments.Data[row*loader.T:], loader.segmentScratch[:loader.T])
+		}
 	}
-	return inputs, targets, true
+	return inputs, targets, segments, true
 }

@@ -37,6 +37,10 @@ preset (or runtime API) that turns each concept on.
 | Mixture-of-Experts (DeepSeekMoE) | 2.1, 4.2.1 | `model/moe.go`, `model/mlp.go` | `flash` / `latent` |
 | Clamped SwiGLU experts | 4.2.1 | `kernels/backend.go` (`SwiGLU`), `tensors.SwiGLU` | MoE (default on) |
 | Auxiliary-loss-free load balancing | 2.1.1, 4.2.2 | `MoE.updateRouterBias`, `Transformer.UpdateRouterBias` | MoE (default on) |
+| Sequence-level balance loss | 4.2.2 | `MoE.sequenceBalance`, `Config.MoEBalanceWeight` | MoE (default 1e-4) |
+| Sample-level attention masking | 4.2.2 | `data` `NextSegments`, `model.TrainForwardSegments`, `kernels` `SegmentIDs` | `--sample-masking` (pretrain/SFT) |
+| Reasoning-effort control | 5.1.4 | `tokenizer.ReasoningEffortInstruction`, `trainer.ExponentialTokenPenalty`, `cmd/chat_rl` | `--efforts` |
+| Model merging for RL re-init | 5.1.2 | `model/checkpoint` `MergeParameters`/`MergeFiles`, `cmd/model_merge` | `--models`/`--weights` |
 | Head-wise Muon for Q/K | 2.5 | `model/optimizer.go` `headWiseViews` | `flash` |
 | Sinkhorn-balanced embeddings / lm_head | 2.5 | `optimizer/sinkhorn.go`, `model/optimizer.go` `sinkhornGroup` | all presets except `dense` |
 | Full-vocabulary on-policy distillation (OPD) | 5.2.4 | `tensors/loss.go` (`DistillationLossPerPosition`), `trainer/distill.go` | `cmd/chat_opd` |
@@ -220,8 +224,12 @@ enabled with `--moe`:
 - **Load balancing.** After each optimizer step,
   `Transformer.UpdateRouterBias` applies the auxiliary-loss-free update
   `bias_e += u·sign(mean_load − load_e)` with `u = Config.RouterBiasUpdate`
-  (default 0.001). Overloaded experts get a lower selection bias. The sequence-
-  level balance loss is not implemented.
+  (default 0.001). Overloaded experts get a lower selection bias. On top of
+  that, a small **sequence-level balance loss** (`Config.MoEBalanceWeight`,
+  default 1e-4) keeps a single packed sequence from collapsing onto a few
+  experts: `MoE.sequenceBalance` computes the DeepSeek-V3 objective
+  `α·Σ_e f_{s,e}·P_{s,e}` per sequence (selection treated as straight-through)
+  and adds its gradient to the router weight. A negative weight disables it.
 - **Accounting.** `MatmulParams` counts every expert (total parameters), while
   `ActiveMatmulParams` counts only the top-`k` experts plus shared/router; the
   decode FLOPs and `WeightReadBytes` (and therefore `cmd/infer_bench`) use the
@@ -235,10 +243,9 @@ enabled with `--moe`:
   `ScalingParamsForConfig` for the target-token count (all experts) and
   `EstimateFlopsPerTokenForConfig` for the per-token FLOPs (active experts), so
   a MoE config gets a horizon that reflects its total parameter count.
-- **Deliberately omitted.** The paper's small sequence-level balance loss
-  (§4.2.2, weight 0.0001) is not implemented; load balancing is purely the
-  auxiliary-loss-free bias update. The grouped GEMM is fused for the forward
-  pass only; the backward keeps the per-expert linear-layer path.
+- **Deliberately omitted.** The grouped GEMM is fused for the forward pass
+  only; the backward keeps the per-expert linear-layer path. (The paper's small
+  sequence-level balance loss is implemented; see below.)
 - **Speculative decoding.** DSpark (and the plain drafter) compose with a MoE
   backbone: `DrafterConfig` keeps only the vocabulary and head geometry, so the
   DSpark trunk is a dense small transformer regardless of the target, while
@@ -511,10 +518,14 @@ does not run the tool-call state machine; other requests transparently use the
 normal path. `cmd/infer_bench` (`--drafter ... --speculative`) and `cmd/chat_cli`
 expose it, and a DSpark checkpoint is detected via `checkpoint.IsDSpark`.
 
-The draft-mask embedding is a checkpointed but fixed input representation: the
-Markov and confidence heads are trained under the same placeholder forward they
-see at inference, but fully training the mask embedding/trunk for semi-AR
-generation is left as future work.
+`cmd/dspark_train` first distills the trunk from the frozen backbone, then
+**jointly trains the trunk, the draft-mask embedding, and both heads** under the
+same semi-autoregressive placeholder forward it sees at inference
+(`DSpark.TrainStep` + `DSpark.SetupTrainingOptimizer`), so the mask embedding is
+a learned parameter rather than a fixed input. `TrainForwardSuffix` /
+`DSpark.SetupTrainingOptimizer` are covered by
+`TestTrainForwardSuffixMatchesForward`, `TestDraftMaskEmbeddingGetsGradient`, and
+`TestDSparkJointTrainStepReducesLoss`.
 
 This feature required fixing a pre-existing smear-recurrence inconsistency:
 `smearAdd` chained the *post-smear* activation of the previous token while the
@@ -534,6 +545,61 @@ Units: `TestDrafterConfigBounded`, `TestDraftTokensLengthAndRange`,
 `TestDraftFirstTokenMatchesTrunk`, `TestDSparkDraftBoundedByContext`,
 `TestDSparkTrainHeadsStepFinite`, `TestDSparkRoundTrip`,
 `TestSpeculativeWithDSparkMatchesGreedy`, `TestScheduledLength`.
+
+**Sample-level attention masking.** The paper masks attention across packed
+documents during pre-training (paper §4.2.2). `data.PretrainLoader.NextSegments`
+and `data.SFTLoader.NextSegments` emit a per-token segment id (a new segment at
+every packed document/conversation, and a final segment for SFT padding), which
+`Transformer.TrainForwardSegments` threads into the attention kernels through
+the optional `SegmentIDs` field of `kernels.AttentionForwardParameters`,
+`AttentionBackwardParameters`, and `AttentionSplitParameters`. A query may
+attend only to keys with the same segment id; a nil slice disables the mask and
+keeps the historical path. `cmd/base_train` / `cmd/trainer` enable it with
+`--sample-masking` (default on) and `Trainer.TrainStepSegments` carries the ids
+through training.
+
+The compressed (HCA/CSA) path masks compressed blocks by their block segment.
+Because a compression block would otherwise mix two documents, the
+`ChannelCompressor` excludes rows whose segment differs from the block's first
+row, and the dense/sparse compressed attention filters out cross-segment blocks,
+including the sparse indexer selection and its distillation target. Tokens that
+fall after a boundary inside a straddling block are therefore represented only
+by the local sliding-window branch, not the global compressed cache — no
+cross-document information ever leaks.
+
+Units: `kernels/simd` `TestAttentionSegmentMaskParity`; `model`
+`TestSampleMaskingBlocksCrossDocumentAttention`,
+`TestCompressedSampleMaskingBlocksCrossDocumentAttention` (compression, sparse,
+SWA); `data` `TestPretrainLoaderSegmentsAlignWithBOS`; `trainer`
+`TestTrainStepSegmentsFinite`.
+
+**Reasoning-effort control.** The paper conditions RL on a scalar effort level
+b∈[1,100] with an exponential reasoning-length penalty (paper §5.1.4).
+`tokenizer.ReasoningEffortInstruction` renders the system-prompt instruction,
+and a conversation's `Extra["effort"]` (or the server's `reasoning_effort`
+field) injects it into any render. `trainer.ExponentialTokenPenalty` implements
+`-min(C_max, k(b)·ℓ/L_norm)` with `k(b) = k0·exp(-(b-b_min)/τ)`,
+`τ = λ·meanΔb`. `cmd/chat_rl` samples each effort level as its own GRPO subgroup
+(`--efforts`, `--samples-per-effort`, `--penalty-k0/lambda/cap/norm`), adds the
+length penalty to the task reward, and mean-centers advantages within each
+`(prompt, effort)` subgroup. `cmd/chat_cli --effort` and the server's
+`reasoning_effort` expose the level at deployment.
+
+Units: `tokenizer.TestReasoningEffortInstruction`,
+`trainer.TestEffortPenaltyCoefficientDecreasesWithEffort`,
+`TestExponentialTokenPenalty`, `server.TestRenderMessagesReasoningEffort`.
+
+**Model merging for RL re-initialization.** Successive RL runs can be
+reinitialized by merging checkpoints from different runs (paper §5.1.2).
+`checkpoint.MergeParameters` validates matching names/shapes and returns a
+weighted average (uniform by default, normalized to sum one), and
+`checkpoint.MergeFiles` loads, verifies the model configs match, merges, and
+records the source paths in `UserConfig["merged_from"]`. `cmd/model_merge`
+exposes it (`--models a.gn,b.gn --weights 0.5,0.5 --out merged.gn`).
+
+Units: `model/checkpoint.TestMergeParametersUniform`,
+`TestMergeParametersWeighted`, `TestMergeParametersShapeMismatch`,
+`TestMergeParametersMissing`, `TestMergeFilesRoundTrip`.
 
 ---
 
@@ -663,11 +729,6 @@ For completeness, the paper components that are out of scope here:
 - **Engram conditional memory and Single-Pass mHC.** gonano is a
   single-residual-stream model; these are architectural components of the 552B
   model and do not map onto it. The MoE backbone *is* implemented (§2.7).
-- **End-to-end semi-autoregressive DSpark training.** The single-pass parallel
-  draft and the survival scheduler are implemented, and the Markov/confidence
-  heads are trained under the same placeholder forward as inference, but the
-  draft-mask embedding is a fixed checkpointed input rather than being optimized
-  jointly with the trunk.
 - **EPD disaggregation and the GPU kernel fusions** (Mega-* kernels, FlashMLA):
   single-process CPU serving only.
 

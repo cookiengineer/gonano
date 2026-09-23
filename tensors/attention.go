@@ -9,6 +9,14 @@ import "github.com/cookiengineer/gonano/kernels"
 // decoding) and a Window below zero means full causal context. LogSumExp is
 // optional; when supplied it receives the per-query log-sum-exp for backward.
 func AttentionForward(query, key, value, output, logSumExp []float32, queryLength, keyLength, headDim, positionOffset, window int) {
+	AttentionForwardSegment(query, key, value, output, logSumExp, nil, queryLength, keyLength, headDim, positionOffset, window)
+}
+
+// AttentionForwardSegment is AttentionForward with sample-level attention
+// masking: segmentIDs has one entry per key position and a query may attend
+// only to keys in its own segment (DeepSeek-V4.1 §4.2.2). A nil slice disables
+// the mask.
+func AttentionForwardSegment(query, key, value, output, logSumExp []float32, segmentIDs []int32, queryLength, keyLength, headDim, positionOffset, window int) {
 	KernelBackend().AttentionForward(
 		kernels.AttentionForwardParameters{
 			Query:          query,
@@ -19,6 +27,7 @@ func AttentionForward(query, key, value, output, logSumExp []float32, queryLengt
 			HeadDim:        headDim,
 			PositionOffset: positionOffset,
 			Window:         window,
+			SegmentIDs:     segmentIDs,
 		},
 		kernels.AttentionForwardResult{Output: output, LogSumExp: logSumExp},
 	)
@@ -30,6 +39,12 @@ func AttentionForward(query, key, value, output, logSumExp []float32, queryLengt
 // Value are the full [keyLength, headDim] arrays. Accumulator is
 // [queryLength, headDim], Maximum and Sum are [queryLength].
 func AttentionForwardSplit(query, key, value, accumulator, maximum, sum []float32, queryLength, keyLength, headDim, positionOffset, window, keyStart, keyEnd int) {
+	AttentionForwardSplitSegment(query, key, value, accumulator, maximum, sum, nil, queryLength, keyLength, headDim, positionOffset, window, keyStart, keyEnd)
+}
+
+// AttentionForwardSplitSegment is AttentionForwardSplit with sample-level
+// attention masking (see AttentionForwardSegment).
+func AttentionForwardSplitSegment(query, key, value, accumulator, maximum, sum []float32, segmentIDs []int32, queryLength, keyLength, headDim, positionOffset, window, keyStart, keyEnd int) {
 	KernelBackend().AttentionForwardSplit(
 		kernels.AttentionSplitParameters{
 			Query:          query,
@@ -42,6 +57,7 @@ func AttentionForwardSplit(query, key, value, accumulator, maximum, sum []float3
 			Window:         window,
 			KeyStart:       keyStart,
 			KeyEnd:         keyEnd,
+			SegmentIDs:     segmentIDs,
 		},
 		kernels.AttentionSplitResult{Accumulator: accumulator, Maximum: maximum, Sum: sum},
 	)
@@ -61,6 +77,13 @@ func AttentionCombine(partials []kernels.AttentionSplitResult, output, logSumExp
 // accumulated (not overwritten), so grouped-query attention may invoke this
 // once per query head while sharing one key/value gradient buffer.
 func AttentionBackward(query, key, value, output, outputGradient, logSumExp, queryGradient, keyGradient, valueGradient []float32, queryLength, keyLength, headDim, positionOffset, window int) {
+	AttentionBackwardSegment(query, key, value, output, outputGradient, logSumExp, nil, queryGradient, keyGradient, valueGradient, queryLength, keyLength, headDim, positionOffset, window)
+}
+
+// AttentionBackwardSegment is AttentionBackward with the sample-level attention
+// mask (see AttentionForwardSegment). segmentIDs must be the same slice used in
+// the forward pass.
+func AttentionBackwardSegment(query, key, value, output, outputGradient, logSumExp []float32, segmentIDs []int32, queryGradient, keyGradient, valueGradient []float32, queryLength, keyLength, headDim, positionOffset, window int) {
 	KernelBackend().AttentionBackward(
 		kernels.AttentionBackwardParameters{
 			Query:          query,
@@ -74,6 +97,7 @@ func AttentionBackward(query, key, value, output, outputGradient, logSumExp, que
 			HeadDim:        headDim,
 			PositionOffset: positionOffset,
 			Window:         window,
+			SegmentIDs:     segmentIDs,
 		},
 		kernels.AttentionBackwardResult{
 			QueryGradient: queryGradient,
@@ -89,6 +113,12 @@ func AttentionBackward(query, key, value, output, outputGradient, logSumExp, que
 // that share one softmax: every branch is backpropagated with the merged
 // log-sum-exp and the merged correction dO_i . O_i.
 func AttentionBackwardCorrected(query, key, value, output, outputGradient, logSumExp, rowCorrection, queryGradient, keyGradient, valueGradient []float32, queryLength, keyLength, headDim, positionOffset, window int) {
+	AttentionBackwardCorrectedSegment(query, key, value, output, outputGradient, logSumExp, rowCorrection, nil, queryGradient, keyGradient, valueGradient, queryLength, keyLength, headDim, positionOffset, window)
+}
+
+// AttentionBackwardCorrectedSegment is AttentionBackwardCorrected with the
+// sample-level attention mask (see AttentionForwardSegment).
+func AttentionBackwardCorrectedSegment(query, key, value, output, outputGradient, logSumExp, rowCorrection []float32, segmentIDs []int32, queryGradient, keyGradient, valueGradient []float32, queryLength, keyLength, headDim, positionOffset, window int) {
 	KernelBackend().AttentionBackward(
 		kernels.AttentionBackwardParameters{
 			Query:          query,
@@ -103,6 +133,7 @@ func AttentionBackwardCorrected(query, key, value, output, outputGradient, logSu
 			HeadDim:        headDim,
 			PositionOffset: positionOffset,
 			Window:         window,
+			SegmentIDs:     segmentIDs,
 		},
 		kernels.AttentionBackwardResult{
 			QueryGradient: queryGradient,

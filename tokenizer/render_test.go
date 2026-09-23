@@ -32,6 +32,52 @@ func TestRenderConversation(tests *testing.T) {
 	}
 }
 
+// TestReasoningEffortInstruction checks the effort conditioning instruction is
+// prepended to the system prompt and affects the rendered tokens.
+func TestReasoningEffortInstruction(t *testing.T) {
+	if got := ReasoningEffortInstruction(75); got != "Reasoning Effort: 75 (range 1--100; higher values request more thorough reasoning)" {
+		t.Fatalf("instruction = %q", got)
+	}
+	ranks := TrainBPE([]string{"hello world"}, 10)
+	tok := NewTokenizer(ranks, SpecialTokens)
+	base := &Conversation{Messages: []Message{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "world"},
+	}}
+	withEffort := &Conversation{
+		Messages: base.Messages,
+		Extra:    map[string]any{"effort": 100},
+	}
+	baseIDs, _ := tok.RenderConversation(base, 2048)
+	effortIDs, _ := tok.RenderConversation(withEffort, 2048)
+	if len(effortIDs) <= len(baseIDs) {
+		t.Fatalf("effort prompt should be longer: %d vs %d", len(effortIDs), len(baseIDs))
+	}
+	instructionTokens := tok.Encode(ReasoningEffortInstruction(100))
+	found := false
+	for start := 0; start+len(instructionTokens) <= len(effortIDs); start++ {
+		match := true
+		for offset := range instructionTokens {
+			if effortIDs[start+offset] != instructionTokens[offset] {
+				match = false
+				break
+			}
+		}
+		if match {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("effort instruction tokens not found in the rendered prompt")
+	}
+	// The prompt must not be mutated for subsequent renders.
+	again, _ := tok.RenderConversation(base, 2048)
+	if len(again) != len(baseIDs) {
+		t.Fatalf("base render changed after effort render: %d vs %d", len(again), len(baseIDs))
+	}
+}
+
 func TestRenderConversationAssistantMasked(tests *testing.T) {
 	ranks := TrainBPE([]string{"hello"}, 5)
 	tok := NewTokenizer(ranks, SpecialTokens)

@@ -19,6 +19,94 @@ func testConfig() Config {
 	}
 }
 
+// TestSampleMaskingBlocksCrossDocumentAttention verifies that a token in one
+// segment cannot attend to tokens in a previous segment: perturbing a
+// segment-0 token must not change the logits of segment-1 positions when
+// segments are supplied, but must change them without the mask.
+func TestSampleMaskingBlocksCrossDocumentAttention(t *testing.T) {
+	model := perturbModel(NewTransformer(testConfig()))
+	// Disable the smear recurrence so only attention can move information
+	// across positions.
+	model.smearLambda.Data[0] = 0
+
+	segments := tensors.NewInt32sWithData([]int{1, 6}, []int32{0, 0, 0, 1, 1, 1})
+	base := []int32{1, 5, 2, 8, 3, 7}
+	changed := []int32{4, 5, 2, 8, 3, 7}
+	vocab := model.Config.VocabSize
+
+	logitsBase, _ := model.TrainForwardSegments(tensors.NewInt32sWithData([]int{1, 6}, base), segments)
+	logitsChanged, _ := model.TrainForwardSegments(tensors.NewInt32sWithData([]int{1, 6}, changed), segments)
+	for position := 3; position < 6; position++ {
+		for vocabIndex := 0; vocabIndex < vocab; vocabIndex++ {
+			index := position*vocab + vocabIndex
+			if math.Abs(float64(logitsBase.Data[index]-logitsChanged.Data[index])) > 1e-5 {
+				t.Fatalf("masked logit at position %d/%d changed across segments: %v vs %v", position, vocabIndex, logitsBase.Data[index], logitsChanged.Data[index])
+			}
+		}
+	}
+
+	// Without the mask the same perturbation must reach later positions.
+	unmaskedBase, _ := model.TrainForward(tensors.NewInt32sWithData([]int{1, 6}, base))
+	unmaskedChanged, _ := model.TrainForward(tensors.NewInt32sWithData([]int{1, 6}, changed))
+	propagated := false
+	var maxDiff float64
+	for position := 3; position < 6 && !propagated; position++ {
+		for vocabIndex := 0; vocabIndex < vocab; vocabIndex++ {
+			index := position*vocab + vocabIndex
+			diff := math.Abs(float64(unmaskedBase.Data[index] - unmaskedChanged.Data[index]))
+			if diff > maxDiff {
+				maxDiff = diff
+			}
+			if diff > 1e-5 {
+				propagated = true
+				break
+			}
+		}
+	}
+	if !propagated {
+		t.Fatalf("without a segment mask the perturbation should propagate to later positions (max diff %v)", maxDiff)
+	}
+}
+
+// TestCompressedSampleMaskingBlocksCrossDocumentAttention is the compressed /
+// sparse / SWA counterpart of the dense sample-masking test: perturbing a
+// segment-0 token must not change segment-1 logits.
+func TestCompressedSampleMaskingBlocksCrossDocumentAttention(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"compression", func(c *Config) { c.CompressionRatio = 2 }},
+		{"sparse", func(c *Config) { c.CompressionRatio = 2; c.SparseTopK = 2; c.IndexerPool = 2 }},
+		{"swa", func(c *Config) { c.CompressionRatio = 2; c.SWAWindow = 3 }},
+		{"sparse+swa", func(c *Config) { c.CompressionRatio = 2; c.SparseTopK = 2; c.IndexerPool = 2; c.SWAWindow = 3 }},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			config := testConfig()
+			testCase.mutate(&config)
+			config.Validate()
+			model := perturbModel(NewTransformer(config))
+			model.smearLambda.Data[0] = 0
+
+			segments := tensors.NewInt32sWithData([]int{1, 6}, []int32{0, 0, 0, 1, 1, 1})
+			base := []int32{1, 5, 2, 8, 3, 7}
+			changed := []int32{4, 5, 2, 8, 3, 7}
+			vocab := config.VocabSize
+			logitsBase, _ := model.TrainForwardSegments(tensors.NewInt32sWithData([]int{1, 6}, base), segments)
+			logitsChanged, _ := model.TrainForwardSegments(tensors.NewInt32sWithData([]int{1, 6}, changed), segments)
+			for position := 3; position < 6; position++ {
+				for vocabIndex := 0; vocabIndex < vocab; vocabIndex++ {
+					index := position*vocab + vocabIndex
+					if math.Abs(float64(logitsBase.Data[index]-logitsChanged.Data[index])) > 1e-4 {
+						t.Fatalf("masked logit at position %d/%d changed across segments: %v vs %v", position, vocabIndex, logitsBase.Data[index], logitsChanged.Data[index])
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestConfigForDepth(t *testing.T) {
 	config := ConfigForDepth(12, 32000, 64, 128, 2048, "SSSL")
 	if config.EmbedDim != 12*64 {

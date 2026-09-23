@@ -108,14 +108,19 @@ func main() {
 		}
 	})
 
-	// Phase 2: train the Markov and confidence heads with the trunk frozen.
-	headOptimizer := optimizer.NewMuonAdamW(dspark.SetupHeadOptimizer(float32(*headLR), 0))
+	// Phase 2: jointly train the drafter trunk, the draft-mask embedding, and
+	// both heads under the semi-autoregressive placeholder forward
+	// (DeepSeek-V4.1 §2.4.3), so the mask embedding is optimized rather than
+	// held fixed.
+	jointGroups := dspark.SetupTrainingOptimizer(0.008, 0.2, 0.02, 0.0, 0.5, float32(*headLR))
+	jointOptimizer := optimizer.NewMuonAdamW(jointGroups)
 	for step := 0; step < *headSteps; step++ {
 		inputs, targets, _ := loader.Next()
-		loss := dspark.TrainHeadsStep(inputs, targets, *draftPositions)
-		headOptimizer.Step()
+		loss := dspark.TrainStep(inputs, targets, *draftPositions)
+		jointOptimizer.Step()
+		jointOptimizer.ZeroGrad()
 		if step%20 == 0 {
-			logger.Info("dspark-heads", "step", step, "loss", fmt.Sprintf("%.4f", loss))
+			logger.Info("dspark-joint", "step", step, "loss", fmt.Sprintf("%.4f", loss))
 		}
 	}
 

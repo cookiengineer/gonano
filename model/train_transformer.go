@@ -22,17 +22,60 @@ type trainCtx struct {
 	finalNorm          *tensors.Tensor // input to lm_head
 	logits             *tensors.Tensor // softcapped logits [B,T,vocab]
 	valueEmbeddings    map[int]*tensors.Tensor
+
+	// auxLoss accumulates the sequence-level MoE balance loss over the blocks
+	// for this micro-batch (DeepSeek-V4.1 §4.2.2).
+	auxLoss float64
+
+	// segments is the [B,T] sample-level attention mask, or nil (DeepSeek-V4.1
+	// §4.2.2).
+	segments *tensors.Int32s
+
+	// suffixEmbedding and suffixStart describe the DSpark draft-mask suffix
+	// replacement for TrainForwardSuffix (nil disables it).
+	suffixEmbedding *tensors.Tensor
+	suffixStart     int
 }
 
 // TrainForward runs the model forward, saving activations for backprop. It
 // returns the softcapped logits and the training context.
 func (model *Transformer) TrainForward(indexes *tensors.Int32s) (*tensors.Tensor, *trainCtx) {
+	return model.TrainForwardSegments(indexes, nil)
+}
+
+// TrainForwardSegments is TrainForward with sample-level attention masking
+// (DeepSeek-V4.1 §4.2.2): segments is [B,T] with one document/conversation id
+// per token, so a token never attends across a packed-document boundary. A nil
+// segments slice disables the mask.
+func (model *Transformer) TrainForwardSegments(indexes *tensors.Int32s, segments *tensors.Int32s) (*tensors.Tensor, *trainCtx) {
+	return model.trainForward(indexes, segments, nil, 0)
+}
+
+// TrainForwardSuffix is TrainForward with the normalized embeddings of positions
+// [suffixStart, T) replaced by a single learned suffixEmbedding [1, EmbedDim]
+// before the trunk. DSpark's semi-autoregressive training uses it so the
+// draft-mask embedding is optimized under the same placeholder forward it sees
+// at inference (DeepSeek-V4.1 §2.4.3). The gradient flows into suffixEmbedding.
+func (model *Transformer) TrainForwardSuffix(indexes *tensors.Int32s, suffixEmbedding *tensors.Tensor, suffixStart int) (*tensors.Tensor, *trainCtx) {
+	return model.trainForward(indexes, nil, suffixEmbedding, suffixStart)
+}
+
+func (model *Transformer) trainForward(indexes *tensors.Int32s, segments *tensors.Int32s, suffixEmbedding *tensors.Tensor, suffixStart int) (*tensors.Tensor, *trainCtx) {
 	batchSize, sequenceLength := indexes.Shape[0], indexes.Shape[1]
-	context := &trainCtx{indexes: indexes, valueEmbeddings: make(map[int]*tensors.Tensor)}
+	context := &trainCtx{
+		indexes:         indexes,
+		segments:        segments,
+		suffixEmbedding: suffixEmbedding,
+		suffixStart:     suffixStart,
+		valueEmbeddings: make(map[int]*tensors.Tensor),
+	}
 
 	activations := model.tokenEmbedding.Forward(indexes)
 	context.rawEmbedding = activations
 	activations = normalizeLastDim(activations)
+	if suffixEmbedding != nil && suffixStart < sequenceLength {
+		applySuffixEmbedding(activations, suffixEmbedding, suffixStart)
+	}
 	context.embeddedNormalized = activations
 
 	smearSlice := sliceChannels(activations, 1, sequenceLength, smearGateChannels)
@@ -73,8 +116,11 @@ func (model *Transformer) TrainForward(indexes *tensors.Int32s) (*tensors.Tensor
 			}
 		}
 		var blockCtx *blockContext
-		activations, blockCtx = block.forwardTraining(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, 0, model.windowSizes[layerIndex], currentShare)
+		activations, blockCtx = block.forwardTraining(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, 0, model.windowSizes[layerIndex], currentShare, segments)
 		context.blockContexts = append(context.blockContexts, blockCtx)
+		if blockCtx.moeContext != nil {
+			context.auxLoss += blockCtx.moeContext.balanceLoss
+		}
 		if layerIndex == backoutLayerIndex {
 			backoutActivations = activations.Clone()
 		}
@@ -124,6 +170,17 @@ func (model *Transformer) TrainBackward(context *trainCtx, gradLogits *tensors.T
 
 	numLayers := model.Config.NumLayer
 	backoutLayerIndex := numLayers / 2
+	// Match the balance-loss gradient to the cross-entropy gradient's
+	// gradient-accumulation scaling (DeepSeek-V4.1 §4.2.2).
+	if auxScale := model.auxiliaryGradientScale(); auxScale != 1 {
+		for _, blockCtx := range context.blockContexts {
+			if blockCtx != nil && blockCtx.moeContext != nil && blockCtx.moeContext.balanceGradProbs != nil {
+				for index := range blockCtx.moeContext.balanceGradProbs {
+					blockCtx.moeContext.balanceGradProbs[index] *= float64(auxScale)
+				}
+			}
+		}
+	}
 	gradInitialResidual := tensors.New(batchSize, sequenceLength, embeddingDimension)
 	for layerIndex := numLayers - 1; layerIndex >= 0; layerIndex-- {
 		layerGradient := gradActivations
@@ -168,6 +225,21 @@ func (model *Transformer) TrainBackward(context *trainCtx, gradLogits *tensors.T
 
 	// Norm between the embedding and the trunk.
 	gradRaw := normalizeLastDimBackward(context.rawEmbedding, gradEmbedded)
+	// The DSpark suffix positions did not use the token embedding, so route
+	// their gradient into the learned suffix embedding and zero it for the
+	// embedding table.
+	if context.suffixEmbedding != nil {
+		context.suffixEmbedding.EnsureGrad()
+		for batch := 0; batch < batchSize; batch++ {
+			for position := context.suffixStart; position < sequenceLength; position++ {
+				base := (batch*sequenceLength + position) * embeddingDimension
+				for dimension := 0; dimension < embeddingDimension; dimension++ {
+					context.suffixEmbedding.Grad[dimension] += gradRaw.Data[base+dimension]
+					gradRaw.Data[base+dimension] = 0
+				}
+			}
+		}
+	}
 	model.tokenEmbedding.Backward(context.indexes, gradRaw)
 }
 

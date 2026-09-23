@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/cookiengineer/gonano/data"
 	"github.com/cookiengineer/gonano/evaluator/tasks"
@@ -23,6 +25,12 @@ func main() {
 	modelPath := flag.String("model", "", "path to a .gn checkpoint (required)")
 	numSteps := flag.Int("num-steps", 10, "optimization steps")
 	numSamples := flag.Int("num-samples", 4, "rollouts per example")
+	effortLevels := flag.String("efforts", "50,75,100", "comma-separated reasoning-effort levels b in [1,100] (empty disables effort conditioning)")
+	samplesPerEffort := flag.Int("samples-per-effort", 4, "rollouts per effort level per example")
+	penaltyK0 := flag.Float64("penalty-k0", 0.1, "basic length-penalty coefficient at the minimum effort")
+	penaltyLambda := flag.Float64("penalty-lambda", 1.0, "rate of exponential penalty decay")
+	penaltyCap := flag.Float64("penalty-cap", 0.5, "maximum length deduction per trajectory")
+	penaltyNorm := flag.Float64("penalty-norm", 256, "reference reasoning length for the penalty")
 	outPath := flag.String("out", "", "output checkpoint path")
 	baseDir := flag.String("base-dir", "", "tokenizer directory")
 	flag.Parse()
@@ -59,24 +67,74 @@ func main() {
 	}
 	optimizer := optimizer.NewMuonAdamW(groups)
 
+	efforts := parseEfforts(*effortLevels)
+	penaltyConfig := trainer.EffortPenaltyConfig{
+		K0: float32(*penaltyK0), Lambda: float32(*penaltyLambda),
+		Cap: float32(*penaltyCap), Norm: float32(*penaltyNorm),
+		MinEffort: 50, MeanDeltaEffort: 25,
+	}
+	if len(efforts) > 0 {
+		penaltyConfig.MinEffort = efforts[0]
+		if len(efforts) > 1 {
+			penaltyConfig.MeanDeltaEffort = float32(efforts[len(efforts)-1]-efforts[0]) / float32(len(efforts)-1)
+		}
+	}
+
 	for step := 0; step < *numSteps; step++ {
 		conversation := gsm8k.GetExample(step % gsm8k.NumExamples())
-		prompt := tokenizer.RenderForCompletion(conversation)
-		results, _ := engine.GenerateBatch(prompt, *numSamples, 32, 1.0, 50, uint64(step))
 
-		rewards := make([]float32, len(results))
-		for sampleIndex, rollout := range results {
-			completion := tokenizer.Decode(rollout[len(prompt):])
-			rewards[sampleIndex] = gsm8k.Reward(conversation, completion)
+		var results [][]int
+		var promptLengths []int
+		var rewards []float32
+		var groupSizes []int
+		if len(efforts) == 0 {
+			prompt := tokenizer.RenderForCompletion(conversation)
+			rollouts, _ := engine.GenerateBatch(prompt, *numSamples, 32, 1.0, 50, uint64(step))
+			for _, rollout := range rollouts {
+				completion := tokenizer.Decode(rollout[len(prompt):])
+				rewards = append(rewards, gsm8k.Reward(conversation, completion))
+				results = append(results, rollout)
+				promptLengths = append(promptLengths, len(prompt))
+			}
+			groupSizes = append(groupSizes, len(rollouts))
+		} else {
+			for groupIndex, effort := range efforts {
+				convCopy := *conversation
+				convCopy.Extra = map[string]any{"effort": effort}
+				prompt := tokenizer.RenderForCompletion(&convCopy)
+				rollouts, _ := engine.GenerateBatch(prompt, *samplesPerEffort, 32, 1.0, 50, uint64(step*1000+groupIndex))
+				for _, rollout := range rollouts {
+					completion := tokenizer.Decode(rollout[len(prompt):])
+					reward := gsm8k.Reward(conversation, completion)
+					reward += trainer.ExponentialTokenPenalty(effort, len(rollout)-len(prompt), penaltyConfig)
+					rewards = append(rewards, reward)
+					results = append(results, rollout)
+					promptLengths = append(promptLengths, len(prompt))
+				}
+				groupSizes = append(groupSizes, len(rollouts))
+			}
 		}
-		var mean float32
-		for _, reward := range rewards {
-			mean += reward
+		if len(results) == 0 {
+			continue
 		}
-		mean /= float32(len(rewards))
+
+		// Group-relative advantages: mean-center within each (example, effort)
+		// subgroup (DeepSeek-V4.1 §5.1.4).
 		advantages := make([]float32, len(rewards))
-		for sampleIndex, reward := range rewards {
-			advantages[sampleIndex] = reward - mean
+		offset := 0
+		for _, size := range groupSizes {
+			if size == 0 {
+				continue
+			}
+			var groupMean float32
+			for index := 0; index < size; index++ {
+				groupMean += rewards[offset+index]
+			}
+			groupMean /= float32(size)
+			for index := 0; index < size; index++ {
+				advantages[offset+index] = rewards[offset+index] - groupMean
+			}
+			offset += size
 		}
 
 		// Build a padded batch of rollouts.
@@ -97,7 +155,7 @@ func main() {
 			inputs[sampleIndex] = padded[:len(padded)-1]
 			targets[sampleIndex] = padded[1:]
 			// Mask forced/prompt tokens: only train on sampled tokens.
-			promptLength := len(prompt)
+			promptLength := promptLengths[sampleIndex]
 			for targetIndex := range targets[sampleIndex] {
 				if targetIndex < promptLength {
 					targets[sampleIndex][targetIndex] = -1
@@ -107,7 +165,7 @@ func main() {
 		inputTensor := int32sFrom(inputs)
 		targetTensor := int32sFrom(targets)
 		loss := trainer.RLStep(model, optimizer, inputTensor, targetTensor, advantages, float32(maxLen))
-		logger.Info("rl", "step", step, "loss", fmt.Sprintf("%.4f", loss), "mean_reward", fmt.Sprintf("%.2f", mean))
+		logger.Info("rl", "step", step, "loss", fmt.Sprintf("%.4f", loss), "rollouts", len(results))
 	}
 
 	if *outPath != "" {
@@ -117,6 +175,23 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+// parseEfforts parses a comma-separated list of effort levels. It returns nil
+// when the spec is empty, disabling effort conditioning.
+func parseEfforts(spec string) []int {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil
+	}
+	efforts := make([]int, 0)
+	for _, field := range strings.Split(spec, ",") {
+		value, err := strconv.Atoi(strings.TrimSpace(field))
+		if err == nil {
+			efforts = append(efforts, value)
+		}
+	}
+	return efforts
 }
 
 func int32sFrom(rows [][]int) *tensors.Int32s {

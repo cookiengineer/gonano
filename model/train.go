@@ -44,15 +44,18 @@ type attentionContext struct {
 	// MLA latent activations saved for the projection backward.
 	mlaQueryLatent *tensors.Tensor // [B,T,queryRank]
 	mlaKVLatent    *tensors.Tensor // [B,T,latent]
+
+	// segments is the [B,T] sample-level mask (DeepSeek-V4.1 §4.2.2), or nil.
+	segments *tensors.Int32s
 }
 
 // forwardTraining runs the attention forward while saving activations. The
 // attention itself is computed by the flash-attention kernel, which returns the
 // per-query log-sum-exp instead of the full probability matrix.
-func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, share *compressionShare) (*tensors.Tensor, *attentionContext) {
+func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, share *compressionShare, segments *tensors.Int32s) (*tensors.Tensor, *attentionContext) {
 	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
 	var query, key, value *tensors.Tensor
-	context := &attentionContext{window: window[0]}
+	context := &attentionContext{window: window[0], segments: segments}
 	if attention.mla != nil {
 		query, key, value, context.mlaQueryLatent, context.mlaKVLatent = attention.mlaProjectHeads(input)
 	} else {
@@ -106,7 +109,7 @@ func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cos
 			compressorInput = share.encoderHidden
 		}
 		if attention.reuseMode == ReuseFull {
-			context.compression = compressForward(attention.compressor, compressorInput, globalKeyHeadMajor, globalValueHeadMajor, attention.compressionRatio)
+			context.compression = compressForward(attention.compressor, compressorInput, globalKeyHeadMajor, globalValueHeadMajor, attention.compressionRatio, segments)
 			share.keyCompressed = context.compression.keyCompressed
 			share.valueCompressed = context.compression.valueCompressed
 			// Allocate the group's gradient accumulators up front so reuse
@@ -136,7 +139,7 @@ func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cos
 				}
 				var producedPool [][][]int
 				context.compression.selection, context.compression.indexerContexts, context.compression.indexerScores, context.compression.indexerTargets, producedPool =
-					sparseTrainingPlan(attention, input, context.compression.keyCompressed, queryHeadMajor, sharedPool)
+					sparseTrainingPlan(attention, input, context.compression.keyCompressed, queryHeadMajor, sharedPool, context.compression.segments, context.compression.blockSegments)
 				share.selection = context.compression.selection
 				if attention.reuseMode == ReuseFull {
 					share.candidatePool = producedPool
@@ -153,19 +156,23 @@ func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cos
 			globalLogSumExp = tensors.New(batchSize, attention.queryHeadCount, sequenceLength)
 		}
 		if attention.sparseTopK > 0 {
-			compressedAttentionForwardSparse(queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed, globalOutput, globalLogSumExp, context.compression.selection, headRatio, attention.compressionRatio)
+			compressedAttentionForwardSparse(queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed, globalOutput, globalLogSumExp, context.compression.selection, headRatio, attention.compressionRatio, context.compression.segments, context.compression.blockSegments)
 		} else {
-			compressedAttentionForward(queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed, globalOutput, globalLogSumExp, headRatio, attention.compressionRatio)
+			compressedAttentionForward(queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed, globalOutput, globalLogSumExp, headRatio, attention.compressionRatio, context.compression.segments, context.compression.blockSegments)
 		}
 
 		if attention.swaWindow > 0 {
 			localOutput := tensors.New(batchSize, attention.queryHeadCount, sequenceLength, headDimension)
 			localLogSumExp := tensors.New(batchSize, attention.queryHeadCount, sequenceLength)
-			attentionForwardWindowed(queryHeadMajor, keyHeadMajor, valueHeadMajor, localOutput, localLogSumExp, batchSize, attention.queryHeadCount, attention.keyValueHeadCount, sequenceLength, headDimension, positionOffset, attention.swaWindow)
+			attentionForwardWindowed(queryHeadMajor, keyHeadMajor, valueHeadMajor, localOutput, localLogSumExp, batchSize, attention.queryHeadCount, attention.keyValueHeadCount, sequenceLength, headDimension, positionOffset, attention.swaWindow, segments)
 			mergeAttentionBranches(outputHeadMajor, logSumExp, globalOutput, globalLogSumExp, localOutput, localLogSumExp, headDimension)
 		}
 	} else {
 		for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+			var segmentRow []int32
+			if segments != nil {
+				segmentRow = segments.Data[batchIndex*sequenceLength : (batchIndex+1)*sequenceLength]
+			}
 			for queryHead := 0; queryHead < attention.queryHeadCount; queryHead++ {
 				keyValueHead := queryHead / headRatio
 				queryHeadData := headSlice(queryHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
@@ -173,7 +180,7 @@ func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cos
 				valueHeadData := headSlice(valueHeadMajor.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
 				outputHeadData := headSlice(outputHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
 				logSumExpHead := headSlice(logSumExp.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, 1)
-				tensors.AttentionForward(queryHeadData, keyHeadData, valueHeadData, outputHeadData, logSumExpHead, sequenceLength, sequenceLength, headDimension, positionOffset, window[0])
+				tensors.AttentionForwardSegment(queryHeadData, keyHeadData, valueHeadData, outputHeadData, logSumExpHead, segmentRow, sequenceLength, sequenceLength, headDimension, positionOffset, window[0])
 			}
 		}
 	}
@@ -233,7 +240,7 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 			if attention.sparseTopK > 0 {
 				compressedAttentionBackwardSparse(context.queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed,
 					context.outputHeadMajor, gradientOutputHeadMajor, context.logSumExp, rowCorrection,
-					gradientQuery, gradientKeyCompressed, gradientValueCompressed, context.compression.selection, headRatio, attention.compressionRatio)
+					gradientQuery, gradientKeyCompressed, gradientValueCompressed, context.compression.selection, headRatio, attention.compressionRatio, context.compression.segments, context.compression.blockSegments)
 				var indexerKeyGradient *tensors.Tensor
 				indexerInputGradient, indexerKeyGradient = attention.indexerDistillationGradient(context.compression)
 				for element := range gradientKeyCompressed.Data {
@@ -242,7 +249,7 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 			} else {
 				compressedAttentionBackward(context.queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed,
 					context.outputHeadMajor, gradientOutputHeadMajor, context.logSumExp, rowCorrection,
-					gradientQuery, gradientKeyCompressed, gradientValueCompressed, headRatio, attention.compressionRatio)
+					gradientQuery, gradientKeyCompressed, gradientValueCompressed, headRatio, attention.compressionRatio, context.compression.segments, context.compression.blockSegments)
 			}
 			gradientInputFromCompressor, gradientKey, gradientValue = compressBackward(attention.compressor, context.compression, gradientKeyCompressed, gradientValueCompressed)
 			if attention.ced {
@@ -268,7 +275,7 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 			if attention.sparseTopK > 0 {
 				compressedAttentionBackwardSparse(context.queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed,
 					context.outputHeadMajor, gradientOutputHeadMajor, context.logSumExp, rowCorrection,
-					gradientQuery, share.gradientKey, share.gradientValue, context.compression.selection, headRatio, attention.compressionRatio)
+					gradientQuery, share.gradientKey, share.gradientValue, context.compression.selection, headRatio, attention.compressionRatio, context.compression.segments, context.compression.blockSegments)
 				if attention.reuseMode == ReuseReindex {
 					indexerInputGradient, indexerKeyGradient := attention.indexerDistillationGradient(context.compression)
 					for element := range share.gradientKey.Data {
@@ -279,7 +286,7 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 			} else {
 				compressedAttentionBackward(context.queryHeadMajor, context.compression.keyCompressed, context.compression.valueCompressed,
 					context.outputHeadMajor, gradientOutputHeadMajor, context.logSumExp, rowCorrection,
-					gradientQuery, share.gradientKey, share.gradientValue, headRatio, attention.compressionRatio)
+					gradientQuery, share.gradientKey, share.gradientValue, headRatio, attention.compressionRatio, context.compression.segments, context.compression.blockSegments)
 			}
 			gradientKey = tensors.New(batchSize, attention.keyValueHeadCount, sequenceLength, headDimension)
 			gradientValue = tensors.New(batchSize, attention.keyValueHeadCount, sequenceLength, headDimension)
@@ -290,7 +297,7 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 			attentionBackwardWindowed(context.queryHeadMajor, context.keyHeadMajor, context.valueHeadMajor,
 				context.outputHeadMajor, gradientOutputHeadMajor, context.logSumExp, rowCorrection,
 				gradientQuery, localKeyGradient, localValueGradient,
-				batchSize, attention.queryHeadCount, attention.keyValueHeadCount, sequenceLength, headDimension, positionOffset, attention.swaWindow)
+				batchSize, attention.queryHeadCount, attention.keyValueHeadCount, sequenceLength, headDimension, positionOffset, attention.swaWindow, context.segments)
 			gradientKey = tensors.Add(gradientKey, localKeyGradient)
 			gradientValue = tensors.Add(gradientValue, localValueGradient)
 		}
@@ -298,6 +305,10 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 		gradientKey = tensors.New(batchSize, attention.keyValueHeadCount, sequenceLength, headDimension)
 		gradientValue = tensors.New(batchSize, attention.keyValueHeadCount, sequenceLength, headDimension)
 		for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+			var segmentRow []int32
+			if context.segments != nil {
+				segmentRow = context.segments.Data[batchIndex*sequenceLength : (batchIndex+1)*sequenceLength]
+			}
 			for queryHead := 0; queryHead < attention.queryHeadCount; queryHead++ {
 				keyValueHead := queryHead / headRatio
 				queryHeadData := headSlice(context.queryHeadMajor.Data, batchIndex*attention.queryHeadCount+queryHead, sequenceLength, headDimension)
@@ -310,7 +321,7 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 				keyGradientHead := headSlice(gradientKey.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
 				valueGradientHead := headSlice(gradientValue.Data, batchIndex*attention.keyValueHeadCount+keyValueHead, sequenceLength, headDimension)
 
-				tensors.AttentionBackward(queryHeadData, keyHeadData, valueHeadData, outputHeadData, outputGradientHeadData, logSumExpHead, queryGradientHead, keyGradientHead, valueGradientHead, sequenceLength, sequenceLength, headDimension, positionOffset, context.window)
+				tensors.AttentionBackwardSegment(queryHeadData, keyHeadData, valueHeadData, outputHeadData, outputGradientHeadData, logSumExpHead, segmentRow, queryGradientHead, keyGradientHead, valueGradientHead, sequenceLength, sequenceLength, headDimension, positionOffset, context.window)
 			}
 		}
 	}
@@ -514,11 +525,11 @@ type blockContext struct {
 	moeContext         *moeContext // routed experts; nil for the dense MLP
 }
 
-func (block *Block) forwardTraining(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, share *compressionShare) (*tensors.Tensor, *blockContext) {
+func (block *Block) forwardTraining(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, share *compressionShare, segments *tensors.Int32s) (*tensors.Tensor, *blockContext) {
 	context := &blockContext{input: input}
 	attentionInput := normalizeLastDim(input)
 	context.attentionNormInput = attentionInput
-	attentionOutput, attentionCtx := block.attention.forwardTraining(attentionInput, valueEmbedding, cosine, sine, positionOffset, window, share)
+	attentionOutput, attentionCtx := block.attention.forwardTraining(attentionInput, valueEmbedding, cosine, sine, positionOffset, window, share, segments)
 	context.attentionOutput = attentionOutput
 	context.attentionContext = attentionCtx
 	mid := tensors.Add(input, attentionOutput)
@@ -529,7 +540,11 @@ func (block *Block) forwardTraining(input, valueEmbedding, cosine, sine *tensors
 	context.mlpContext = mlpContext
 	ffnOutput := mlpOutput
 	if block.moe != nil {
-		moeOutput, moeContext := block.moe.forwardTraining(ffnInput)
+		moeSequenceLength := 0
+		if len(ffnInput.Shape) >= 2 {
+			moeSequenceLength = ffnInput.Shape[1]
+		}
+		moeOutput, moeContext := block.moe.forwardTraining(ffnInput, moeSequenceLength)
 		context.moeContext = moeContext
 		ffnOutput = tensors.Add(mlpOutput, moeOutput)
 	}

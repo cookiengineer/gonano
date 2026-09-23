@@ -35,6 +35,7 @@ func main() {
 		batchSize     int
 		modelTag      string
 		baseDir       string
+		sampleMasking bool
 	)
 	flag.StringVar(&dataDir, "data-dir", "", "directory of training data (.parquet or .md) (required)")
 	flag.StringVar(&format, "format", "parquet", "data format: parquet|markdown")
@@ -49,6 +50,7 @@ func main() {
 	flag.IntVar(&batchSize, "device-batch-size", 1, "sequences per step")
 	flag.StringVar(&modelTag, "model-tag", "", "checkpoint directory name (default d<depth>)")
 	flag.StringVar(&baseDir, "base-dir", "", "checkpoint/tokenizer directory (default ~/.cache/gonano)")
+	flag.BoolVar(&sampleMasking, "sample-masking", true, "mask attention across packed documents (DeepSeek-V4.1 §4.2.2)")
 	flag.Parse()
 
 	logger := logging.Default(slog.LevelInfo)
@@ -95,8 +97,14 @@ func main() {
 	logger.Info("training", "depth", depth, "dim", configuration.EmbedDim, "vocab", tokenizer.VocabSize(),
 		"format", format, "params", model.TotalParams(), "steps", numIterations)
 	for step := 0; step < numIterations; step++ {
-		inputs, targets, _ := loader.Next()
-		loss := trainer.TrainStep(inputs, targets)
+		var loss float32
+		if sampleMasking {
+			inputs, targets, segments, _ := loader.NextSegments()
+			loss = trainer.TrainStepSegments(inputs, targets, segments)
+		} else {
+			inputs, targets, _ := loader.Next()
+			loss = trainer.TrainStep(inputs, targets)
+		}
 		trainer.StepOptimizer(step, numIterations)
 		if step%10 == 0 || step == numIterations-1 {
 			logger.Info("step", "step", step, "loss", fmt.Sprintf("%.4f", loss))

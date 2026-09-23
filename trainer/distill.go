@@ -14,6 +14,12 @@ func (trainer *Trainer) DistillStep(teacher *model.Transformer, inputs, mask *te
 	vocabSize := trainer.Model.Config.VocabSize
 	flatRows := inputs.Numel()
 
+	accumulation := trainer.GradAccumSteps
+	if accumulation < 1 {
+		accumulation = 1
+	}
+	trainer.Model.SetAuxiliaryGradientScale(1 / float32(accumulation))
+
 	teacherLogits := teacher.Forward(inputs, nil) // [B,T,vocab], no gradient
 	logits, trainContext := trainer.Model.TrainForward(inputs)
 	studentFlat := logits.Reshape(flatRows, vocabSize)

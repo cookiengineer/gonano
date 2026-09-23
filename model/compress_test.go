@@ -13,7 +13,7 @@ func TestChannelCompressorForwardMeansBlocks(t *testing.T) {
 	compressor := NewChannelCompressor(1, 1, 2)
 	hidden := tensors.New(1, 3, 1)
 	value := tensors.NewWithData([]int{1, 3, 1}, []float32{2, 4, 6})
-	compressed, _ := compressor.Forward(hidden, value)
+	compressed, _ := compressor.Forward(hidden, value, nil)
 	if compressed.Shape[0] != 1 || compressed.Shape[1] != 2 || compressed.Shape[2] != 1 {
 		t.Fatalf("compressed shape = %v, want [1 2 1]", compressed.Shape)
 	}
@@ -47,7 +47,7 @@ func TestChannelCompressorGradient(t *testing.T) {
 	}
 
 	compressor.ZeroGrad()
-	_, context := compressor.Forward(hidden, value)
+	_, context := compressor.Forward(hidden, value, nil)
 	gradHidden, gradValue := compressor.Backward(gradCompressed, context)
 
 	// Random directions for every input and parameter.
@@ -75,7 +75,7 @@ func TestChannelCompressorGradient(t *testing.T) {
 	}
 
 	loss := func() float32 {
-		compressed, _ := compressor.Forward(hidden, value)
+		compressed, _ := compressor.Forward(hidden, value, nil)
 		var total float32
 		for index, value := range compressed.Data {
 			total += value * gradCompressed.Data[index]

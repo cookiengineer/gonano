@@ -92,10 +92,10 @@ func tinyData() (*tensors.Int32s, *tensors.Int32s) {
 }
 
 func meanLoss(model *Transformer, indexes, targets *tensors.Int32s) float32 {
-	logits, _ := model.TrainForward(indexes)
+	logits, context := model.TrainForward(indexes)
 	flattened := logits.Reshape(indexes.Numel(), model.Config.VocabSize)
 	targetFlat := targets.Reshape(indexes.Numel())
-	return tensors.CrossEntropy(flattened, targetFlat, -1)
+	return tensors.CrossEntropy(flattened, targetFlat, -1) + model.AuxiliaryLoss(context)
 }
 
 func analyticGrads(model *Transformer, indexes, targets *tensors.Int32s) {

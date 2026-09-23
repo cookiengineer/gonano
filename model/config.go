@@ -115,6 +115,12 @@ type Config struct {
 	// RouterBiasUpdate is the auxiliary-loss-free load-balancing bias update
 	// speed (DeepSeek-V4.1 §2.1.1, §4.2.2). Zero defaults to 0.001.
 	RouterBiasUpdate float32 `json:"router_bias_update,omitempty"`
+	// MoEBalanceWeight is the weight of the small sequence-level load-balancing
+	// auxiliary loss (DeepSeek-V4.1 §4.2.2, weight 1e-4) that prevents extreme
+	// expert imbalance within a single training sequence. Zero uses the paper's
+	// default of 1e-4; a negative value disables the loss, leaving only the
+	// auxiliary-loss-free bias update.
+	MoEBalanceWeight float32 `json:"moe_balance_weight,omitempty"`
 }
 
 // defaultMoEClamp is the SwiGLU clamp threshold from DeepSeek-V4.1 §4.2.1.
@@ -123,6 +129,10 @@ const defaultMoEClamp = 10.0
 // defaultRouterBiasUpdate is the auxiliary-loss-free bias update speed from
 // DeepSeek-V4.1 §4.2.2.
 const defaultRouterBiasUpdate = 0.001
+
+// defaultMoEBalanceWeight is the sequence-level load-balancing auxiliary loss
+// weight from DeepSeek-V4.1 §4.2.2.
+const defaultMoEBalanceWeight = 1e-4
 
 // MoEEnabled reports whether the mixture-of-experts feed-forward is active.
 func (config Config) MoEEnabled() bool { return config.NumExperts > 0 }
@@ -160,6 +170,19 @@ func (config Config) MoERouterBiasUpdate() float32 {
 		return defaultRouterBiasUpdate
 	}
 	return config.RouterBiasUpdate
+}
+
+// MoEBalanceLossWeight returns the effective sequence-level balance loss weight:
+// negative disables it, zero selects the paper's default (1e-4), and a positive
+// value overrides it.
+func (config Config) MoEBalanceLossWeight() float32 {
+	if config.MoEBalanceWeight < 0 {
+		return 0
+	}
+	if config.MoEBalanceWeight == 0 {
+		return defaultMoEBalanceWeight
+	}
+	return config.MoEBalanceWeight
 }
 
 // MoEExpertHidden returns the routed expert intermediate width, applying the

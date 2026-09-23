@@ -261,6 +261,11 @@ attention design and the DeepSeek-V4.1-Flash optimizations (CED, CSA2 reuse, the
 hierarchical sparse indexer, low-rank query/KV, the KV prefix cache, the persistent
 multi-entry KV cache tier, head-wise Muon, Sinkhorn-balanced embeddings, on-policy
 distillation, DSpark semi-autoregressive drafting with a prefix-survival scheduler, and an absorbed MLA latent KV cache) are documented in `guides/05-deepseek-v4.1-optimizations.md`.
+The same guide covers the training-side features: the sequence-level MoE
+balance loss (paper §4.2.2), sample-level attention masking for packed
+documents (`--sample-masking`, on by default), joint semi-autoregressive DSpark
+training, reasoning-effort conditioning (`--effort` / `reasoning_effort`), and
+checkpoint merging for RL re-initialization (`cmd/model_merge`).
 
 ## Packages
 

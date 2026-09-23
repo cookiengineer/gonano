@@ -38,6 +38,11 @@ type Transformer struct {
 	valueEmbeds map[int]*layers.Embedding // layer -> embedding (ResFormer)
 
 	rotaryCosine, rotarySine *tensors.Tensor // [rotarySeqLen, rotaryDim/2]
+
+	// auxGradientScale scales the sequence-level balance-loss gradient so it is
+	// averaged over the same gradient-accumulation window as the main loss. It
+	// is set by the trainer; zero means 1.
+	auxGradientScale float32
 }
 
 // NewTransformer builds a Transformer with all parameters zero-initialized.
@@ -79,6 +84,35 @@ func (model *Transformer) NumLayers() int { return model.Config.NumLayer }
 
 // PaddedVocab returns the padded vocabulary size.
 func (model *Transformer) PaddedVocab() int { return model.paddedVocab }
+
+// SetAuxiliaryGradientScale sets the scale applied to the sequence-level
+// balance-loss gradient so it is averaged over the same gradient-accumulation
+// window as the main cross-entropy loss. A scale <= 0 resets to 1.
+func (model *Transformer) SetAuxiliaryGradientScale(scale float32) {
+	if scale <= 0 {
+		scale = 1
+	}
+	model.auxGradientScale = scale
+}
+
+// auxiliaryGradientScale returns the configured auxiliary-loss gradient scale,
+// defaulting to 1.
+func (model *Transformer) auxiliaryGradientScale() float32 {
+	if model.auxGradientScale <= 0 {
+		return 1
+	}
+	return model.auxGradientScale
+}
+
+// AuxiliaryLoss returns the sequence-level balance loss accumulated by the last
+// TrainForward. Its gradient is already applied by TrainBackward; this is for
+// logging only.
+func (model *Transformer) AuxiliaryLoss(context *trainCtx) float32 {
+	if context == nil {
+		return 0
+	}
+	return float32(context.auxLoss)
+}
 
 // UpdateRouterBias applies the auxiliary-loss-free load-balancing update to
 // every MoE router and resets the accumulated load statistics. It must be

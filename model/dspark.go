@@ -231,6 +231,159 @@ func (d *DSpark) SetupHeadOptimizer(learningRate, weightDecay float32) []optimiz
 	}}
 }
 
+// SetupTrainingOptimizer builds the parameter groups for joint
+// semi-autoregressive training: the drafter trunk (Muon/AdamW/Sinkhorn, as for
+// a normal transformer) plus an AdamW group for the Markov head, the confidence
+// head, and the draft-mask embedding.
+func (d *DSpark) SetupTrainingOptimizer(unembeddingLR, embeddingLR, matrixLR, weightDecay, scalarLR, headLR float32) []optimizer.ParamGroup {
+	groups := d.Drafter.SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, weightDecay, scalarLR, true)
+	groups = append(groups, optimizer.ParamGroup{
+		Kind: optimizer.KindAdamW,
+		Params: []*tensors.Tensor{
+			d.markovDown.Weight, d.markovUp.Weight, d.confHidden.Weight, d.confOut.Weight, d.draftMaskEmbedding,
+		},
+		LR: headLR, Beta1: 0.9, Beta2: 0.999, Eps: 1e-8, WeightDecay: 0,
+	})
+	return groups
+}
+
+// TrainStep trains the drafter trunk, the draft-mask embedding, and both heads
+// jointly under the same semi-autoregressive placeholder forward used at
+// inference (DeepSeek-V4.1 §2.4.3), so the draft-mask embedding is optimized
+// rather than held fixed. inputs/targets are shifted next-token pairs of shape
+// [B,T]; targets of -1 are ignored. It returns the mean cross-entropy plus the
+// confidence binary cross-entropy, and accumulates gradients for an optimizer
+// step.
+func (d *DSpark) TrainStep(inputs, targets *tensors.Int32s, count int) float32 {
+	if count < 1 {
+		count = 1
+	}
+	config := d.Drafter.Config
+	vocab := config.VocabSize
+	dim := config.EmbedDim
+	batchSize := inputs.Shape[0]
+	sequenceLength := inputs.Shape[1]
+	if count > sequenceLength {
+		count = sequenceLength
+	}
+	placeholderCount := count - 1
+	prefixLength := sequenceLength - placeholderCount
+	if prefixLength < 1 {
+		prefixLength = 1
+	}
+	supervised := batchSize * count
+
+	masked := make([]int32, batchSize*sequenceLength)
+	for batch := 0; batch < batchSize; batch++ {
+		for position := 0; position < sequenceLength; position++ {
+			index := batch*sequenceLength + position
+			if position >= prefixLength {
+				masked[index] = dsparkPlaceholderToken
+			} else {
+				masked[index] = inputs.Data[index]
+			}
+		}
+	}
+	maskedInputs := tensors.NewInt32sWithData([]int{batchSize, sequenceLength}, masked)
+
+	d.ZeroGrad()
+	// The whole trunk is trained here, so the semi-autoregressive suffix
+	// forward builds a gradient context and backprops into the mask embedding.
+	logits, context := d.Drafter.TrainForwardSuffix(maskedInputs, d.draftMaskEmbedding, prefixLength)
+	hidden := context.finalNorm
+	flatLogits := logits.Reshape(batchSize*sequenceLength, vocab)
+	flatHidden := hidden.Reshape(batchSize*sequenceLength, dim)
+
+	total := tensors.New(supervised, vocab)
+	confidenceInput := tensors.New(supervised, dim)
+	previousEmbeddings := tensors.New(supervised, dim)
+	flatTargets := make([]int32, supervised)
+	rowIndex := 0
+	for batch := 0; batch < batchSize; batch++ {
+		for index := 0; index < count; index++ {
+			source := batch*sequenceLength + prefixLength - 1 + index
+			target := targets.Data[source]
+			flatTargets[rowIndex] = target
+			copy(total.Data[rowIndex*vocab:(rowIndex+1)*vocab], flatLogits.Data[source*vocab:(source+1)*vocab])
+			copy(confidenceInput.Data[rowIndex*dim:(rowIndex+1)*dim], flatHidden.Data[source*dim:(source+1)*dim])
+			previous := inputs.Data[batch*sequenceLength+prefixLength-1]
+			if index > 0 {
+				previous = targets.Data[source-1]
+			}
+			embedded := d.Drafter.tokenEmbedding.Forward(tensors.NewInt32sWithData([]int{1, 1}, []int32{previous}))
+			copy(previousEmbeddings.Data[rowIndex*dim:(rowIndex+1)*dim], embedded.Data)
+			rowIndex++
+		}
+	}
+	targetTensor := tensors.NewInt32sWithData([]int{supervised}, flatTargets)
+
+	markovHidden := d.markovDown.Forward(previousEmbeddings)
+	markovBias := d.markovUp.Forward(markovHidden).Reshape(supervised, vocab)
+	for index := range total.Data {
+		total.Data[index] += markovBias.Data[index]
+	}
+
+	loss := tensors.CrossEntropy(total, targetTensor, -1)
+	probabilities := tensors.SoftmaxLastDim(total)
+	gradTotal := tensors.New(supervised, vocab)
+	for row := 0; row < supervised; row++ {
+		target := flatTargets[row]
+		if target == -1 {
+			continue
+		}
+		for index := 0; index < vocab; index++ {
+			gradient := probabilities.Data[row*vocab+index]
+			if int32(index) == target {
+				gradient -= 1
+			}
+			gradTotal.Data[row*vocab+index] = gradient / float32(supervised)
+		}
+	}
+	gradMarkovHidden := d.markovUp.Backward(markovHidden, gradTotal)
+	d.markovDown.Backward(previousEmbeddings, gradMarkovHidden)
+
+	// Confidence head: label a position as accepted when the biased argmax
+	// matches the target.
+	scores := d.confHidden.Forward(confidenceInput)
+	confidenceLogit := d.confOut.Forward(scores).Reshape(supervised, 1)
+	gradConfidence := tensors.New(supervised, 1)
+	var binaryCrossEntropy float64
+	for row := 0; row < supervised; row++ {
+		target := flatTargets[row]
+		if target == -1 {
+			continue
+		}
+		label := float32(0)
+		if int32(argmaxValues(total.Data[row*vocab:(row+1)*vocab])) == target {
+			label = 1
+		}
+		probability := sigmoidFloat(confidenceLogit.Data[row])
+		if label == 1 {
+			binaryCrossEntropy += -math.Log(float64(probability) + 1e-9)
+		} else {
+			binaryCrossEntropy += -math.Log(1 - float64(probability) + 1e-9)
+		}
+		gradConfidence.Data[row] = (probability - label) / float32(supervised)
+	}
+	gradConfidenceInput := d.confOut.Backward(scores, gradConfidence)
+	d.confHidden.Backward(confidenceInput, gradConfidenceInput)
+
+	// Backprop into the trunk and the mask embedding: scatter the supervised
+	// row gradients back to their positions in the full sequence.
+	gradLogits := tensors.New(batchSize, sequenceLength, vocab)
+	rowIndex = 0
+	for batch := 0; batch < batchSize; batch++ {
+		for index := 0; index < count; index++ {
+			source := batch*sequenceLength + prefixLength - 1 + index
+			copy(gradLogits.Data[source*vocab:(source+1)*vocab], gradTotal.Data[rowIndex*vocab:(rowIndex+1)*vocab])
+			rowIndex++
+		}
+	}
+	d.Drafter.TrainBackward(context, gradLogits)
+
+	return loss + float32(binaryCrossEntropy)/float32(supervised)
+}
+
 // Draft proposes up to count tokens after the context and returns a confidence
 // for each, using the trunk, the Markov head, and the confidence head. It runs
 // a single semi-autoregressive trunk forward over the context followed by

@@ -21,7 +21,7 @@ func (backend *Backend) AttentionForward(parameters kernels.AttentionForwardPara
 	scores := make([]float32, queryLength*keyLength)
 	probabilities := make([]float32, queryLength*keyLength)
 	backend.MatMulTransposed(scores, parameters.Query, parameters.Key, queryLength, keyLength, headDim)
-	applyAttentionMask(scores, queryLength, keyLength, parameters.PositionOffset, parameters.Window)
+	applyAttentionMask(scores, queryLength, keyLength, parameters.PositionOffset, parameters.Window, parameters.SegmentIDs)
 
 	for queryIndex := 0; queryIndex < queryLength; queryIndex++ {
 		rowScores := scores[queryIndex*keyLength : (queryIndex+1)*keyLength]
@@ -75,7 +75,11 @@ func (backend *Backend) AttentionForwardSplit(parameters kernels.AttentionSplitP
 		for column := 0; column < rangeLength; column++ {
 			keyIndex := keyStart + column
 			score := backend.DotProduct(queryRow, parameters.Key[keyIndex*headDim:(keyIndex+1)*headDim])
-			if keyIndex > queryPosition || (parameters.Window >= 0 && queryPosition-keyIndex > parameters.Window) {
+			masked := keyIndex > queryPosition || (parameters.Window >= 0 && queryPosition-keyIndex > parameters.Window)
+			if !masked && parameters.SegmentIDs != nil && keyIndex < len(parameters.SegmentIDs) && queryPosition < len(parameters.SegmentIDs) && parameters.SegmentIDs[keyIndex] != parameters.SegmentIDs[queryPosition] {
+				masked = true
+			}
+			if masked {
 				score = maskedAttentionScore
 			}
 			scores[column] = score
@@ -146,7 +150,7 @@ func (backend *Backend) AttentionBackward(parameters kernels.AttentionBackwardPa
 	scores := make([]float32, queryLength*keyLength)
 	probabilities := make([]float32, queryLength*keyLength)
 	backend.MatMulTransposed(scores, parameters.Query, parameters.Key, queryLength, keyLength, headDim)
-	applyAttentionMask(scores, queryLength, keyLength, parameters.PositionOffset, parameters.Window)
+	applyAttentionMask(scores, queryLength, keyLength, parameters.PositionOffset, parameters.Window, parameters.SegmentIDs)
 
 	for queryIndex := 0; queryIndex < queryLength; queryIndex++ {
 		logSumExp := parameters.LogSumExp[queryIndex]
@@ -200,13 +204,23 @@ func (backend *Backend) AttentionBackward(parameters kernels.AttentionBackwardPa
 	accumulate(result.KeyGradient, keyGradient)
 }
 
-// applyAttentionMask marks disallowed positions with maskedAttentionScore.
-func applyAttentionMask(scores []float32, queryLength, keyLength, positionOffset, window int) {
+// applyAttentionMask marks disallowed positions with maskedAttentionScore. When
+// segmentIDs is non-nil, a key is also disallowed when its segment differs from
+// the query row's segment (sample-level masking, DeepSeek-V4.1 §4.2.2).
+func applyAttentionMask(scores []float32, queryLength, keyLength, positionOffset, window int, segmentIDs []int32) {
+	querySegment := int32(0)
 	for queryIndex := 0; queryIndex < queryLength; queryIndex++ {
 		queryPosition := positionOffset + queryIndex
+		if segmentIDs != nil && queryPosition < len(segmentIDs) {
+			querySegment = segmentIDs[queryPosition]
+		}
 		rowScores := scores[queryIndex*keyLength : (queryIndex+1)*keyLength]
 		for keyIndex := range rowScores {
-			if keyIndex > queryPosition || (window >= 0 && queryPosition-keyIndex > window) {
+			masked := keyIndex > queryPosition || (window >= 0 && queryPosition-keyIndex > window)
+			if !masked && segmentIDs != nil && keyIndex < len(segmentIDs) && segmentIDs[keyIndex] != querySegment {
+				masked = true
+			}
+			if masked {
 				rowScores[keyIndex] = maskedAttentionScore
 			}
 		}

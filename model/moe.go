@@ -29,6 +29,9 @@ type MoE struct {
 	Dim        int
 	Hidden     int
 	Clamp      float32
+	// BalanceWeight is the sequence-level load-balancing auxiliary loss weight
+	// (DeepSeek-V4.1 §4.2.2). Zero disables it.
+	BalanceWeight float32
 
 	router     *Router
 	gateWeight *tensors.Tensor // [E, Hidden, Dim]
@@ -47,12 +50,13 @@ func NewMoE(configuration Config) *MoE {
 	experts := configuration.NumExperts
 	hidden := configuration.MoEExpertHidden()
 	return &MoE{
-		NumExperts: experts,
-		TopK:       configuration.MoEActiveExperts(),
-		Scale:      configuration.MoEEffectiveScale(),
-		Dim:        configuration.EmbedDim,
-		Hidden:     hidden,
-		Clamp:      configuration.MoEEffectiveClamp(),
+		NumExperts:    experts,
+		TopK:          configuration.MoEActiveExperts(),
+		Scale:         configuration.MoEEffectiveScale(),
+		Dim:           configuration.EmbedDim,
+		Hidden:        hidden,
+		Clamp:         configuration.MoEEffectiveClamp(),
+		BalanceWeight: configuration.MoEBalanceLossWeight(),
 		router: &Router{
 			weight: layers.NewLinear(configuration.EmbedDim, experts),
 			bias:   tensors.New(experts),
@@ -84,23 +88,34 @@ type moeContext struct {
 	input   *tensors.Tensor // [rows, Dim]
 	probs   *tensors.Tensor // [rows, E]
 	experts []expertForward
+
+	// sequenceLength is the per-sequence token count used to group rows for the
+	// sequence-level balance loss (0 disables the loss).
+	sequenceLength int
+	// balanceLoss is the scalar balance loss for this micro-batch, and
+	// balanceGradProbs is its gradient with respect to the router softmax
+	// probabilities (nil when the loss is disabled).
+	balanceLoss      float64
+	balanceGradProbs []float64
 }
 
 // Forward computes the routed expert contribution for input of shape
 // [..., Dim] and returns the same shape. The shared expert is added by the
 // caller.
 func (moe *MoE) Forward(input *tensors.Tensor) *tensors.Tensor {
-	output, _ := moe.forward(input, false)
+	output, _ := moe.forward(input, false, 0)
 	return output
 }
 
 // forwardTraining computes the routed contribution while saving the routing
-// and expert activations for backprop.
-func (moe *MoE) forwardTraining(input *tensors.Tensor) (*tensors.Tensor, *moeContext) {
-	return moe.forward(input, true)
+// and expert activations for backprop. sequenceLength is the per-sequence token
+// count used to group rows for the sequence-level balance loss; zero disables
+// that loss for this call.
+func (moe *MoE) forwardTraining(input *tensors.Tensor, sequenceLength int) (*tensors.Tensor, *moeContext) {
+	return moe.forward(input, true, sequenceLength)
 }
 
-func (moe *MoE) forward(input *tensors.Tensor, training bool) (*tensors.Tensor, *moeContext) {
+func (moe *MoE) forward(input *tensors.Tensor, training bool, sequenceLength int) (*tensors.Tensor, *moeContext) {
 	shape := append([]int(nil), input.Shape...)
 	rows := input.Numel() / moe.Dim
 	flat := input.Reshape(rows, moe.Dim)
@@ -177,7 +192,8 @@ func (moe *MoE) forward(input *tensors.Tensor, training bool) (*tensors.Tensor, 
 		moe.loadCounts[expert] += float64(count)
 		moe.loadTotal += float64(count)
 	}
-	context := &moeContext{shape: shape, rows: rows, input: flat, probs: probs, experts: experts}
+	context := &moeContext{shape: shape, rows: rows, input: flat, probs: probs, experts: experts, sequenceLength: sequenceLength}
+	context.balanceLoss, context.balanceGradProbs = moe.sequenceBalance(probs, experts, rows, sequenceLength)
 	return output.Reshape(shape...), context
 }
 
@@ -223,6 +239,15 @@ func (moe *MoE) backwardTraining(outputGradient *tensors.Tensor, context *moeCon
 		}
 	}
 
+	// The sequence-level balance loss depends only on the router softmax, so
+	// its probability gradient is added here and flows through the same
+	// softmax backward into the router weight.
+	if context.balanceGradProbs != nil {
+		for index := range context.balanceGradProbs {
+			gradProbs[index] += context.balanceGradProbs[index]
+		}
+	}
+
 	// Router softmax backward: dLogits = probs * (dProbs - <dProbs, probs>).
 	gradLogits := tensors.New(rows, moe.NumExperts)
 	for row := 0; row < rows; row++ {
@@ -239,6 +264,65 @@ func (moe *MoE) backwardTraining(outputGradient *tensors.Tensor, context *moeCon
 	gradRouterInput := moe.router.weight.Backward(context.input, gradLogits)
 	gradInput = tensors.Add(gradInput, gradRouterInput)
 	return gradInput.Reshape(context.shape...)
+}
+
+// sequenceBalance computes the sequence-level auxiliary load-balancing loss
+// (DeepSeek-V4.1 §4.2.2) and its gradient with respect to the router softmax
+// probabilities. Following DeepSeek-V3, for each sequence s the selection
+// fraction f_{s,e} = E/(K*T_s) * count_{s,e} and the mean gate probability
+// P_{s,e} = (1/T_s) * sum_t p_{t,e} give L_s = sum_e f_{s,e} * P_{s,e}; the
+// loss is the sequence mean scaled by BalanceWeight. The top-k selection is
+// treated as constant (straight-through) for the gradient.
+func (moe *MoE) sequenceBalance(probs *tensors.Tensor, experts []expertForward, rows, sequenceLength int) (float64, []float64) {
+	if moe.BalanceWeight <= 0 || sequenceLength <= 0 || rows <= 0 || rows%sequenceLength != 0 {
+		return 0, nil
+	}
+	expertCount := moe.NumExperts
+	sequences := rows / sequenceLength
+	tokenCount := float64(sequenceLength)
+
+	// count_{s,e}: how many tokens in sequence s selected expert e.
+	counts := make([]float64, sequences*expertCount)
+	for index := range experts {
+		expert := &experts[index]
+		for _, row := range expert.rows {
+			counts[(row/sequenceLength)*expertCount+expert.id]++
+		}
+	}
+
+	// sum_{s,e}: sum of the softmax gate probabilities over the sequence.
+	sums := make([]float64, sequences*expertCount)
+	for row := 0; row < rows; row++ {
+		base := row * expertCount
+		sequenceBase := (row / sequenceLength) * expertCount
+		for expert := 0; expert < expertCount; expert++ {
+			sums[sequenceBase+expert] += float64(probs.Data[base+expert])
+		}
+	}
+
+	selectionScale := float64(expertCount) / (float64(moe.TopK) * tokenCount)
+	var loss float64
+	for sequence := 0; sequence < sequences; sequence++ {
+		base := sequence * expertCount
+		for expert := 0; expert < expertCount; expert++ {
+			fraction := selectionScale * counts[base+expert]
+			probability := sums[base+expert] / tokenCount
+			loss += fraction * probability
+		}
+	}
+	loss = float64(moe.BalanceWeight) * loss / float64(sequences)
+
+	// Gradient wrt the probabilities: dL/dp_{t,e} = weight/(S*T) * f_{s(t),e}.
+	gradProbs := make([]float64, rows*expertCount)
+	coefficient := float64(moe.BalanceWeight) / (float64(sequences) * tokenCount)
+	for row := 0; row < rows; row++ {
+		base := row * expertCount
+		sequenceBase := (row / sequenceLength) * expertCount
+		for expert := 0; expert < expertCount; expert++ {
+			gradProbs[base+expert] = coefficient * selectionScale * counts[sequenceBase+expert]
+		}
+	}
+	return loss, gradProbs
 }
 
 // updateRouterBias applies the auxiliary-loss-free load-balancing update and
