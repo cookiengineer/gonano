@@ -37,6 +37,60 @@ func TestElementwise(t *testing.T) {
 	kerneltest.AssertSlicesClose(t, destination, []float32{0, 4, 0}, 1e-6, 1e-6)
 }
 
+func TestSwiGLU(t *testing.T) {
+	backend := scalar.New()
+	destination := make([]float32, 4)
+
+	// clamp <= 0: plain SwiGLU = silu(gate) * up.
+	backend.SwiGLU(destination,
+		[]float32{0, 1, -1, 2},
+		[]float32{1, 1, 2, -3},
+		0)
+	silu := func(x float32) float32 { return x / (1 + float32(math.Exp(float64(-x)))) }
+	expected := []float32{
+		silu(0) * 1,
+		silu(1) * 1,
+		silu(-1) * 2,
+		silu(2) * -3,
+	}
+	kerneltest.AssertSlicesClose(t, destination, expected, 1e-5, 1e-6)
+
+	// clamp = 10: gate clamped above, up clamped into [-10, 10].
+	backend.SwiGLU(destination,
+		[]float32{20, 1, 1, 2},
+		[]float32{1, 20, -20, 1},
+		10)
+	expected = []float32{
+		silu(10) * 1,
+		silu(1) * 10,
+		silu(1) * -10,
+		silu(2) * 1,
+	}
+	kerneltest.AssertSlicesClose(t, destination, expected, 1e-5, 1e-6)
+
+	// Backward at the unclamped interior equals the analytic derivative.
+	gate := []float32{0.5, 1.5}
+	up := []float32{2.0, -1.0}
+	outputGradient := []float32{1.0, 2.0}
+	gateGradient := make([]float32, 2)
+	upGradient := make([]float32, 2)
+	backend.SwiGLUBackward(gateGradient, upGradient, gate, up, outputGradient, 10)
+
+	for index := range gate {
+		g, u, d := gate[index], up[index], outputGradient[index]
+		s := float32(1.0 / (1.0 + math.Exp(float64(-g))))
+		siluGradient := s * (1 + g*(1-s))
+		wantGate := d * u * siluGradient
+		wantUp := d * g * s
+		if !kerneltest.Close(gateGradient[index], wantGate, 1e-5, 1e-6) {
+			t.Fatalf("gate gradient %d: got %v want %v", index, gateGradient[index], wantGate)
+		}
+		if !kerneltest.Close(upGradient[index], wantUp, 1e-5, 1e-6) {
+			t.Fatalf("up gradient %d: got %v want %v", index, upGradient[index], wantUp)
+		}
+	}
+}
+
 func TestTranscendentals(t *testing.T) {
 	backend := scalar.New()
 	destination := make([]float32, 1)
@@ -129,4 +183,53 @@ func TestAttentionReference(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestMoEGateTopK(t *testing.T) {
+	backend := scalar.New()
+	// Equal logits: the correction bias decides selection, while the returned
+	// weights stay the uniform softmax probabilities.
+	logits := []float32{0, 0, 0}
+	bias := []float32{0, 1, 2}
+	probs := make([]float32, 3)
+	selected := make([]int32, 2)
+	weights := make([]float32, 2)
+	backend.MoEGateTopK(logits, bias, probs, selected, weights, 1, 3, 2)
+
+	kerneltest.AssertSlicesClose(t, probs, []float32{1.0 / 3, 1.0 / 3, 1.0 / 3}, 1e-6, 1e-6)
+	if selected[0] != 2 || selected[1] != 1 {
+		t.Fatalf("selection = %v, want [2 1]", selected)
+	}
+	kerneltest.AssertSlicesClose(t, weights, []float32{1.0 / 3, 1.0 / 3}, 1e-6, 1e-6)
+}
+
+func TestTopKIndices(t *testing.T) {
+	backend := scalar.New()
+	// Row 0 has distinct scores; row 1 ties 0.5 between expert 0 and 2 and
+	// 0.2 between expert 1 and 3, so the tie-break must pick smaller indices.
+	scores := []float32{
+		0.1, 0.9, 0.3, 0.7,
+		0.5, 0.2, 0.5, 0.2,
+	}
+	got := make([]int32, 2*3)
+	backend.TopKIndices(got, scores, 2, 4, 3)
+	want := []int32{1, 3, 2, 0, 2, 1}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("top-k[%d] = %d, want %d (got %v)", index, got[index], want[index], got)
+		}
+	}
+}
+
+func TestGroupedMatMulTransposed(t *testing.T) {
+	backend := scalar.New()
+	counts := []int32{2, 1}
+	input := []float32{1, 2, 3, 4, 5, 6}
+	weight := []float32{
+		1, 0, 0, 1, // expert 0
+		2, 0, 0, 3, // expert 1
+	}
+	destination := make([]float32, 3*2)
+	backend.GroupedMatMulTransposed(destination, input, weight, counts, 2, 2, 2)
+	kerneltest.AssertSlicesClose(t, destination, []float32{1, 2, 3, 4, 10, 18}, 1e-6, 1e-6)
 }

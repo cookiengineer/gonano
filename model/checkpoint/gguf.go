@@ -50,7 +50,7 @@ func ExportGGUF(path string, meta Meta, params map[string]*tensors.Tensor) error
 	header = binary.LittleEndian.AppendUint32(header, ggufMagic)
 	header = binary.LittleEndian.AppendUint32(header, ggufVersion)
 	header = binary.LittleEndian.AppendUint64(header, uint64(len(names)))
-	header = binary.LittleEndian.AppendUint64(header, uint64(15)) // metadata KV count
+	header = binary.LittleEndian.AppendUint64(header, uint64(21)) // metadata KV count
 
 	// Metadata.
 	header = appendGGUFStringKV(header, "general.architecture", "nanochat")
@@ -68,6 +68,12 @@ func ExportGGUF(path string, meta Meta, params map[string]*tensors.Tensor) error
 	header = appendGGUFUint32KV(header, "tokenizer.ggml.bos_token_id", uint32(config.VocabSize-len(tokenizer.SpecialTokens)))
 	header = appendGGUFStringArrayKV(header, "nanochat.special_tokens", tokenizer.SpecialTokens)
 	header = appendGGUFUint32KV(header, "nanochat.value_embedding_layers", uint32((config.NumLayer+1)/2))
+	header = appendGGUFUint32KV(header, "nanochat.num_experts", uint32(config.NumExperts))
+	header = appendGGUFUint32KV(header, "nanochat.num_experts_per_token", uint32(config.NumExpertsPerToken))
+	header = appendGGUFUint32KV(header, "nanochat.expert_hidden_dim", uint32(config.ExpertHiddenDim))
+	header = appendGGUFUint32KV(header, "nanochat.shared_expert_hidden_dim", uint32(config.SharedExpertHiddenDim))
+	header = appendGGUFUint32KV(header, "nanochat.moe_clamp_bits", math.Float32bits(config.MoEClamp))
+	header = appendGGUFUint32KV(header, "nanochat.moe_scale_bits", math.Float32bits(config.MoEScale))
 
 	// Tensor infos (offsets are patched after the aligned header length is
 	// known).

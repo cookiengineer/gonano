@@ -81,5 +81,6 @@ func (trainer *Trainer) StepOptimizer(step, numIterations int) {
 		}
 	}
 	trainer.Optim.Step()
+	trainer.Model.UpdateRouterBias()
 	trainer.Optim.ZeroGrad()
 }

@@ -28,6 +28,9 @@ func (model *Transformer) SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, w
 			matrixParameters = append(matrixParameters,
 				block.attention.outputProjection.Weight,
 				block.mlp.inputProjection.Weight, block.mlp.outputProjection.Weight)
+			if block.mlp.gateProjection != nil {
+				matrixParameters = append(matrixParameters, block.mlp.gateProjection.Weight)
+			}
 			if block.attention.valueEmbeddingGate != nil {
 				matrixParameters = append(matrixParameters, block.attention.valueEmbeddingGate.Weight)
 			}
@@ -49,6 +52,9 @@ func (model *Transformer) SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, w
 			block.attention.valueProjection.Weight, block.attention.outputProjection.Weight,
 			block.mlp.inputProjection.Weight, block.mlp.outputProjection.Weight,
 		)
+		if block.mlp.gateProjection != nil {
+			matrixParameters = append(matrixParameters, block.mlp.gateProjection.Weight)
+		}
 		if block.attention.queryDown != nil {
 			matrixParameters = append(matrixParameters, block.attention.queryDown.Weight)
 		}
@@ -65,6 +71,22 @@ func (model *Transformer) SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, w
 			matrixParameters = append(matrixParameters,
 				block.attention.indexer.query.Weight, block.attention.indexer.key.Weight)
 		}
+	}
+
+	// Routed experts: the router is a matrix (Muon) and each packed expert
+	// weight is exposed as per-expert rank-2 views sharing the parent storage.
+	// The router correction bias is not optimized (it is updated by load).
+	for _, block := range model.blocks {
+		if block.moe == nil {
+			continue
+		}
+		matrixParameters = append(matrixParameters, block.moe.router.weight.Weight)
+		matrixParameters = append(matrixParameters,
+			expertViews(block.moe.gateWeight, block.moe.NumExperts, block.moe.Hidden, block.moe.Dim)...)
+		matrixParameters = append(matrixParameters,
+			expertViews(block.moe.upWeight, block.moe.NumExperts, block.moe.Hidden, block.moe.Dim)...)
+		matrixParameters = append(matrixParameters,
+			expertViews(block.moe.downWeight, block.moe.NumExperts, block.moe.Dim, block.moe.Hidden)...)
 	}
 
 	var valueEmbeddingParameters []*tensors.Tensor

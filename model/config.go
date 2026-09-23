@@ -89,6 +89,117 @@ type Config struct {
 	// MLARotaryDims is the decoupled rotary width of the MLA key/query. Zero
 	// uses RotaryDimension.
 	MLARotaryDims int `json:"mla_rotary_dims,omitempty"`
+	// NumExperts > 0 enables the DeepSeekMoE feed-forward in every block
+	// (DeepSeek-V4.1 §2.1, §4.2.1): one shared expert plus NumExperts routed
+	// experts, of which NumExpertsPerToken are active per token. Zero keeps the
+	// historical dense ReLU² MLP. It is orthogonal to the attention design and
+	// composes with GQA, compression, SWA, CED, and MLA.
+	NumExperts int `json:"num_experts,omitempty"`
+	// NumExpertsPerToken is the number of routed experts activated per token
+	// (top-k). It must be in [1, NumExperts].
+	NumExpertsPerToken int `json:"num_experts_per_token,omitempty"`
+	// ExpertHiddenDim is the intermediate width of every routed expert
+	// (DeepSeek's fine-grained experts are much narrower than the 4x dense
+	// MLP). Zero defaults to one attention width (Config.EmbedDim).
+	ExpertHiddenDim int `json:"expert_hidden_dim,omitempty"`
+	// SharedExpertHiddenDim is the intermediate width of the always-active
+	// shared expert. Zero defaults to ExpertHiddenDim.
+	SharedExpertHiddenDim int `json:"shared_expert_hidden_dim,omitempty"`
+	// MoEClamp is the SwiGLU clamp threshold; gate is clamped above it and up
+	// into [-MoEClamp, MoEClamp]. Zero uses the paper's default of 10; a
+	// negative value disables clamping.
+	MoEClamp float32 `json:"moe_clamp,omitempty"`
+	// MoEScale multiplies the routed expert output before the shared expert is
+	// added. Zero defaults to 1.
+	MoEScale float32 `json:"moe_scale,omitempty"`
+	// RouterBiasUpdate is the auxiliary-loss-free load-balancing bias update
+	// speed (DeepSeek-V4.1 §2.1.1, §4.2.2). Zero defaults to 0.001.
+	RouterBiasUpdate float32 `json:"router_bias_update,omitempty"`
+}
+
+// defaultMoEClamp is the SwiGLU clamp threshold from DeepSeek-V4.1 §4.2.1.
+const defaultMoEClamp = 10.0
+
+// defaultRouterBiasUpdate is the auxiliary-loss-free bias update speed from
+// DeepSeek-V4.1 §4.2.2.
+const defaultRouterBiasUpdate = 0.001
+
+// MoEEnabled reports whether the mixture-of-experts feed-forward is active.
+func (config Config) MoEEnabled() bool { return config.NumExperts > 0 }
+
+// MoEActiveExperts returns the number of routed experts selected per token.
+func (config Config) MoEActiveExperts() int {
+	if config.NumExpertsPerToken <= 0 {
+		return 0
+	}
+	if config.NumExpertsPerToken > config.NumExperts {
+		return config.NumExperts
+	}
+	return config.NumExpertsPerToken
+}
+
+// MoEEffectiveClamp returns the SwiGLU clamp threshold (default 10).
+func (config Config) MoEEffectiveClamp() float32 {
+	if config.MoEClamp == 0 {
+		return defaultMoEClamp
+	}
+	return config.MoEClamp
+}
+
+// MoEEffectiveScale returns the routed output scale (default 1).
+func (config Config) MoEEffectiveScale() float32 {
+	if config.MoEScale == 0 {
+		return 1
+	}
+	return config.MoEScale
+}
+
+// MoERouterBiasUpdate returns the bias update speed (default 0.001).
+func (config Config) MoERouterBiasUpdate() float32 {
+	if config.RouterBiasUpdate <= 0 {
+		return defaultRouterBiasUpdate
+	}
+	return config.RouterBiasUpdate
+}
+
+// MoEExpertHidden returns the routed expert intermediate width, applying the
+// default.
+func (config Config) MoEExpertHidden() int {
+	if config.ExpertHiddenDim > 0 {
+		return config.ExpertHiddenDim
+	}
+	return config.EmbedDim
+}
+
+// MoESharedHidden returns the shared expert intermediate width, applying the
+// default.
+func (config Config) MoESharedHidden() int {
+	if config.SharedExpertHiddenDim > 0 {
+		return config.SharedExpertHiddenDim
+	}
+	return config.MoEExpertHidden()
+}
+
+// ApplyMoEDefaults fills the derived MoE hyperparameters from the depth
+// (Config.NumLayer) and width when they are left unset. It mutates the config;
+// callers that persist a config should call it before NewTransformer so the
+// derived values are checkpointed.
+func (config *Config) ApplyMoEDefaults() {
+	if !config.MoEEnabled() {
+		return
+	}
+	if config.ExpertHiddenDim <= 0 {
+		config.ExpertHiddenDim = config.EmbedDim
+	}
+	if config.SharedExpertHiddenDim <= 0 {
+		config.SharedExpertHiddenDim = config.ExpertHiddenDim
+	}
+	if config.NumExpertsPerToken <= 0 {
+		config.NumExpertsPerToken = 2
+	}
+	if config.NumExpertsPerToken > config.NumExperts {
+		config.NumExpertsPerToken = config.NumExperts
+	}
 }
 
 // CEDEnabled reports whether the causal encoder-decoder split is active.
@@ -398,6 +509,28 @@ func (config Config) Validate() {
 			panic(fmt.Sprintf("model: CED reuse pattern %q must start each half with F", config.ReusePattern))
 		}
 	}
+	if config.NumExperts < 0 {
+		panic(fmt.Sprintf("model: NumExperts %d must be >= 0", config.NumExperts))
+	}
+	if config.NumExperts > 0 {
+		if config.NumExpertsPerToken < 0 || config.NumExpertsPerToken > config.NumExperts {
+			panic(fmt.Sprintf("model: NumExpertsPerToken %d must be in [0, NumExperts=%d]", config.NumExpertsPerToken, config.NumExperts))
+		}
+		if config.ExpertHiddenDim < 0 {
+			panic(fmt.Sprintf("model: ExpertHiddenDim %d must be >= 0", config.ExpertHiddenDim))
+		}
+		if config.SharedExpertHiddenDim < 0 {
+			panic(fmt.Sprintf("model: SharedExpertHiddenDim %d must be >= 0", config.SharedExpertHiddenDim))
+		}
+		if config.MoEScale < 0 {
+			panic(fmt.Sprintf("model: MoEScale %v must be >= 0", config.MoEScale))
+		}
+		if config.RouterBiasUpdate < 0 {
+			panic(fmt.Sprintf("model: RouterBiasUpdate %v must be >= 0", config.RouterBiasUpdate))
+		}
+	} else if config.NumExpertsPerToken != 0 || config.ExpertHiddenDim != 0 || config.SharedExpertHiddenDim != 0 {
+		panic("model: MoE hyperparameters set without NumExperts > 0")
+	}
 }
 
 // ConfigForDepth derives a compute-optimal config from a single dial: the
@@ -445,6 +578,17 @@ func ConfigForDepthRatio(depth, vocabSize, aspectRatio, headDim, seqLen int, win
 	}
 	config.Validate()
 	return config
+}
+
+// MoEExpertsForDepth derives the routed expert count from the depth dial. Two
+// experts per layer (floored at 8) keeps the routed-parameter growth
+// proportional to depth, in the spirit of nanochat's single-dial scaling.
+func MoEExpertsForDepth(depth int) int {
+	experts := 2 * depth
+	if experts < 8 {
+		experts = 8
+	}
+	return experts
 }
 
 // vocabPaddingTo is the multiple to which the vocabulary is padded for

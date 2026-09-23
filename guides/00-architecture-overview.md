@@ -112,7 +112,8 @@ model's forward pass needs to write to it, and `model` may not import `inference
 
 1. `kernels` declares the `Backend` interface. It groups five contracts:
    `Elementwise` (`Add`, `Subtract`, `Multiply`, `Divide`, `Scale`, `AddScaled`,
-   `Negate`, `Abs`, `Square`, `ReluSquared`, `Exp`, `Sigmoid`, `Tanh`, `Rsqrt`),
+   `Negate`, `Abs`, `Square`, `ReluSquared`, `SwiGLU`, `Exp`, `Sigmoid`, `Tanh`,
+   `Rsqrt`),
    `Reductions` (`Sum`, `Max`, `ArgMax`), `LinearAlgebra` (`MatMul`,
    `MatMulTransposed`, `DotProduct`), `Rows` (`SoftmaxLastDim`,
    `RMSNormLastDim`), and `Attention` (`AttentionForward`,
@@ -189,9 +190,11 @@ model's forward pass needs to write to it, and `model` may not import `inference
    `SetupOptimizer`, and `checkpoint`.
 
 4. `Forward(idx, cache)` runs the whole stack: embedding, RMSNorm, the "smear"
-   step, the per-layer residual trunk (attention + ReLU² MLP, with
+   step, the per-layer residual trunk (attention + feed-forward, with
    `resid_lambdas`/`x0_lambdas` and value embeddings), the backout step, final
-   norm, `lm_head`, and the logit softcap.
+   norm, `lm_head`, and the logit softcap. The feed-forward is a dense ReLU² MLP
+   by default, or an always-active SwiGLU shared expert plus a routed
+   DeepSeekMoE (`model/moe.go`) when `Config.NumExperts > 0`.
 
 5. `TrainForward`/`TrainBackward` are the training pair. `TrainForward` saves a
    context of intermediate activations; `TrainBackward` walks it in reverse
@@ -420,6 +423,7 @@ shows higher tokens-per-second at larger batch sizes.
 |---|---|
 | The model architecture | `model/config.go`, `model/transformer.go` |
 | A single layer | `model/block.go`, `model/attention.go`, `model/mlp.go` |
+| Mixture-of-Experts | `model/moe.go`, `model/mlp.go` |
 | The backprop math | `model/train.go`, `model/train_transformer.go` |
 | The optimizers | `optimizer/optimizer.go` (AdamW), `optimizer/muon.go` (Muon) |
 | The kernel contract | `kernels/backend.go` |

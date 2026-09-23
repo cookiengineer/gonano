@@ -5,7 +5,8 @@ package model
 
 // MatmulParams returns the number of parameters participating in matrix
 // multiplications with the token stream (every layers.Linear weight). Embeddings
-// and scalar parameters are excluded.
+// and scalar parameters are excluded. For MoE this counts every routed expert;
+// ActiveMatmulParams counts only the experts activated per token.
 func (model *Transformer) MatmulParams() int {
 	total := 0
 	for _, block := range model.blocks {
@@ -16,7 +17,11 @@ func (model *Transformer) MatmulParams() int {
 				total += block.attention.valueEmbeddingGate.Weight.Numel()
 			}
 			total += block.mlp.inputProjection.Weight.Numel()
+			if block.mlp.gateProjection != nil {
+				total += block.mlp.gateProjection.Weight.Numel()
+			}
 			total += block.mlp.outputProjection.Weight.Numel()
+			total += block.moeParamCount()
 			continue
 		}
 		total += block.attention.queryProjection.Weight.Numel()
@@ -33,11 +38,42 @@ func (model *Transformer) MatmulParams() int {
 			total += block.attention.valueEmbeddingGate.Weight.Numel()
 		}
 		total += block.mlp.inputProjection.Weight.Numel()
+		if block.mlp.gateProjection != nil {
+			total += block.mlp.gateProjection.Weight.Numel()
+		}
 		total += block.mlp.outputProjection.Weight.Numel()
+		total += block.moeParamCount()
 	}
 	total += model.lmHead.Weight.Numel()
 	total += model.smearGate.Weight.Numel()
 	return total
+}
+
+// ActiveMatmulParams returns the number of matrix parameters actually touched
+// by one token: for MoE, only the top-k routed experts (plus the shared expert
+// and router) rather than every expert.
+func (model *Transformer) ActiveMatmulParams() int {
+	total := model.MatmulParams()
+	for _, block := range model.blocks {
+		if block.moe == nil {
+			continue
+		}
+		allExperts := block.moe.gateWeight.Numel() + block.moe.upWeight.Numel() + block.moe.downWeight.Numel()
+		perExpert := allExperts / block.moe.NumExperts
+		total -= allExperts
+		total += block.moe.TopK * perExpert
+	}
+	return total
+}
+
+// moeParamCount returns the total matrix parameters of a block's routed MoE
+// (router plus every expert); zero for the dense MLP.
+func (block *Block) moeParamCount() int {
+	if block.moe == nil {
+		return 0
+	}
+	return block.moe.router.weight.Weight.Numel() +
+		block.moe.gateWeight.Numel() + block.moe.upWeight.Numel() + block.moe.downWeight.Numel()
 }
 
 // attentionLengths returns the global and local (sliding-window) attention
@@ -77,7 +113,7 @@ func (model *Transformer) EstimateFlopsPerToken() float64 {
 		global, local := model.attentionLengths(layer, sequenceLength)
 		attentionFlops += 12 * float64(headCount) * float64(headDimension) * float64(global+local)
 	}
-	return 6*float64(model.MatmulParams()) + attentionFlops
+	return 6*float64(model.ActiveMatmulParams()) + attentionFlops
 }
 
 // EstimateDecodeFlops returns the forward FLOPs to decode one token at the
@@ -90,7 +126,7 @@ func (model *Transformer) EstimateDecodeFlops(contextLength int) float64 {
 		global, local := model.attentionLengths(layer, contextLength)
 		attentionFlops += 4 * float64(headCount) * float64(headDimension) * float64(global+local)
 	}
-	return 2*float64(model.MatmulParams()) + attentionFlops
+	return 2*float64(model.ActiveMatmulParams()) + attentionFlops
 }
 
 // EstimatePrefillFlops returns the forward FLOPs to prefill numTokens tokens.
@@ -120,7 +156,7 @@ func (model *Transformer) EstimatePrefillFlops(numTokens int) float64 {
 		}
 		attentionFlops += 4 * float64(headCount) * float64(headDimension) * (globalPairs + localPairs)
 	}
-	return 2*float64(model.MatmulParams())*float64(numTokens) + attentionFlops
+	return 2*float64(model.ActiveMatmulParams())*float64(numTokens) + attentionFlops
 }
 
 // estimatePrefillFlopsCED accounts for the causal encoder-decoder split: the
@@ -149,6 +185,14 @@ func (model *Transformer) estimatePrefillFlopsCED(numTokens int) float64 {
 			block.attention.outputProjection.Weight.Numel() +
 			block.mlp.inputProjection.Weight.Numel() +
 			block.mlp.outputProjection.Weight.Numel()
+		if block.mlp.gateProjection != nil {
+			blockParams += block.mlp.gateProjection.Weight.Numel()
+		}
+		if block.moe != nil {
+			allExperts := block.moe.gateWeight.Numel() + block.moe.upWeight.Numel() + block.moe.downWeight.Numel()
+			perExpert := allExperts / block.moe.NumExperts
+			blockParams += block.moe.router.weight.Weight.Numel() + block.moe.TopK*perExpert
+		}
 		if block.attention.queryDown != nil {
 			blockParams += block.attention.queryDown.Weight.Numel()
 		}
@@ -198,7 +242,7 @@ func (model *Transformer) estimatePrefillFlopsCED(numTokens int) float64 {
 // Decode re-reads every matmul parameter once per step; embeddings and scalar
 // parameters are negligible and excluded, matching MatmulParams.
 func (model *Transformer) WeightReadBytes() int {
-	return model.MatmulParams() * 4
+	return model.ActiveMatmulParams() * 4
 }
 
 // KVBytesPerToken returns the bytes to store one token of KV cache across all
@@ -253,13 +297,32 @@ type ScalingParams struct {
 	Total               int
 }
 
+// moeFFNParamsForConfig returns the feed-forward matrix parameters of one
+// block for a config (shared expert + all routed experts + router) and the
+// per-token active subset (shared + top-k routed + router). For a dense config
+// both are the historical 8*EmbedDim^2 ReLU² MLP.
+func moeFFNParamsForConfig(config Config) (total, active int) {
+	embeddingDimension := config.EmbedDim
+	if !config.MoEEnabled() {
+		dense := 8 * embeddingDimension * embeddingDimension
+		return dense, dense
+	}
+	shared := 3 * embeddingDimension * config.MoESharedHidden()
+	perExpert := 3 * embeddingDimension * config.MoEExpertHidden()
+	router := embeddingDimension * config.NumExperts
+	total = shared + config.NumExperts*perExpert + router
+	active = shared + config.MoEActiveExperts()*perExpert + router
+	return total, active
+}
+
 // ScalingParamsForConfig returns the number of scaling parameters
 // (transformer matrices + lm_head) for a config, computed without building a
 // model. This is the count nanochat uses for its scaling-law fits.
 func ScalingParamsForConfig(config Config) int64 {
+	config.ApplyMoEDefaults()
 	config.Validate()
 	embeddingDimension := config.EmbedDim
-	// cq, ck, cv, cproj (4*E*E) + c_fc, c_proj (8*E*E), with the query and KV
+	// cq, ck, cv, cproj (4*E*E) + the feed-forward, with the query and KV
 	// blocks replaced by their low-rank factorizations when configured.
 	queryParams := embeddingDimension * embeddingDimension
 	if rank := config.QueryRank(); rank > 0 {
@@ -269,9 +332,10 @@ func ScalingParamsForConfig(config Config) int64 {
 	if rank := config.KVRank(); rank > 0 {
 		kvParams = 3 * embeddingDimension * rank
 	}
-	perBlock := queryParams + kvParams + embeddingDimension*embeddingDimension + 8*embeddingDimension*embeddingDimension
+	ffnParams, _ := moeFFNParamsForConfig(config)
+	perBlock := queryParams + kvParams + embeddingDimension*embeddingDimension + ffnParams
 	if config.MLAEnabled() {
-		perBlock = mlaParamsForConfig(config) + embeddingDimension*embeddingDimension + 8*embeddingDimension*embeddingDimension
+		perBlock = mlaParamsForConfig(config) + embeddingDimension*embeddingDimension + ffnParams
 	}
 	numValueEmbeddings := (config.NumLayer + 1) / 2
 	transformerMatrices := int64(config.NumLayer)*int64(perBlock) + int64(numValueEmbeddings)*int64(12*config.NumKVHead)
@@ -280,8 +344,10 @@ func ScalingParamsForConfig(config Config) int64 {
 }
 
 // EstimateFlopsPerTokenForConfig returns the FLOPs per token for a config,
-// computed formulaically without building a model.
+// computed formulaically without building a model. It uses the active MoE
+// expert count, since each token only evaluates its top-k experts.
 func EstimateFlopsPerTokenForConfig(config Config) float64 {
+	config.ApplyMoEDefaults()
 	config.Validate()
 	embeddingDimension := config.EmbedDim
 	queryParams := embeddingDimension * embeddingDimension
@@ -292,9 +358,10 @@ func EstimateFlopsPerTokenForConfig(config Config) float64 {
 	if rank := config.KVRank(); rank > 0 {
 		kvParams = 3 * embeddingDimension * rank
 	}
-	perBlock := queryParams + kvParams + embeddingDimension*embeddingDimension + 8*embeddingDimension*embeddingDimension
+	_, ffnActive := moeFFNParamsForConfig(config)
+	perBlock := queryParams + kvParams + embeddingDimension*embeddingDimension + ffnActive
 	if config.MLAEnabled() {
-		perBlock = mlaParamsForConfig(config) + embeddingDimension*embeddingDimension + 8*embeddingDimension*embeddingDimension
+		perBlock = mlaParamsForConfig(config) + embeddingDimension*embeddingDimension + ffnActive
 	}
 	numValueEmbeddings := (config.NumLayer + 1) / 2
 	matmulParameters := int64(config.NumLayer)*int64(perBlock) +
@@ -332,7 +399,11 @@ func (model *Transformer) NumScalingParams() ScalingParams {
 				scalingParams.TransformerMatrices += block.attention.valueEmbeddingGate.Weight.Numel()
 			}
 			scalingParams.TransformerMatrices += block.mlp.inputProjection.Weight.Numel()
+			if block.mlp.gateProjection != nil {
+				scalingParams.TransformerMatrices += block.mlp.gateProjection.Weight.Numel()
+			}
 			scalingParams.TransformerMatrices += block.mlp.outputProjection.Weight.Numel()
+			scalingParams.TransformerMatrices += block.moeParamCount()
 			continue
 		}
 		scalingParams.TransformerMatrices += block.attention.queryProjection.Weight.Numel()
@@ -349,7 +420,11 @@ func (model *Transformer) NumScalingParams() ScalingParams {
 			scalingParams.TransformerMatrices += block.attention.valueEmbeddingGate.Weight.Numel()
 		}
 		scalingParams.TransformerMatrices += block.mlp.inputProjection.Weight.Numel()
+		if block.mlp.gateProjection != nil {
+			scalingParams.TransformerMatrices += block.mlp.gateProjection.Weight.Numel()
+		}
 		scalingParams.TransformerMatrices += block.mlp.outputProjection.Weight.Numel()
+		scalingParams.TransformerMatrices += block.moeParamCount()
 	}
 	scalingParams.Scalars = model.residLambdas.Numel() + model.x0Lambdas.Numel() +
 		model.smearGate.Weight.Numel() + model.smearLambda.Numel() + model.backoutLambda.Numel()

@@ -138,3 +138,28 @@ func TestDistillWithMLATeacher(t *testing.T) {
 		t.Fatalf("MLA-teacher distillation loss = %v, want finite", loss)
 	}
 }
+
+// TestDistillWithMoETeacher verifies that a MoE model works as a frozen
+// distillation teacher, which is what dspark_train does when distilling a
+// dense DSpark trunk from a MoE backbone.
+func TestDistillWithMoETeacher(t *testing.T) {
+	student, _ := newDistillPair()
+
+	teacherConfig := model.Config{
+		SequenceLen: 16, VocabSize: 16, NumLayer: 1, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L",
+		NumExperts: 4, NumExpertsPerToken: 2, ExpertHiddenDim: 16, SharedExpertHiddenDim: 16,
+	}
+	teacherConfig.ApplyMoEDefaults()
+	teacher := model.NewTransformer(teacherConfig)
+	teacher.InitWeights(tensors.NewRNG(5))
+	breakZeroProjections(teacher, 6)
+
+	groups := student.SetupOptimizer(0.01, 0.1, 0.01, 0.0, 0.1, false)
+	trainer := NewTrainer(student, groups, 1)
+	inputs, mask := distillBatch()
+	loss := trainer.DistillStep(teacher, inputs, mask, 1)
+	if math.IsNaN(float64(loss)) || math.IsInf(float64(loss), 0) {
+		t.Fatalf("MoE-teacher distillation loss = %v, want finite", loss)
+	}
+}

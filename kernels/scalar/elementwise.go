@@ -79,6 +79,60 @@ func (backend *Backend) ReluSquared(destination, source []float32) {
 	}
 }
 
+// SwiGLU computes the clamped SwiGLU activation. gate is clamped above at
+// `clamp` (no lower clamp) and up is clamped into [-clamp, clamp]; a clamp <= 0
+// disables clamping.
+func (backend *Backend) SwiGLU(destination, gate, up []float32, clamp float32) {
+	for index := range gate {
+		destination[index] = swigluValue(gate[index], up[index], clamp)
+	}
+}
+
+// SwiGLUBackward computes the gate and up gradients of the clamped SwiGLU.
+func (backend *Backend) SwiGLUBackward(gateGradient, upGradient, gate, up, outputGradient []float32, clamp float32) {
+	for index := range gate {
+		gateValue, gateMask := clampGate(gate[index], clamp)
+		upValue, upMask := clampUp(up[index], clamp)
+		sigmoid := float32(1.0 / (1.0 + math.Exp(float64(-gateValue))))
+		silu := gateValue * sigmoid
+		// d(silu)/dg = sigmoid + g*sigmoid*(1-sigmoid) = sigmoid*(1 + g*(1-sigmoid)).
+		siluGradient := sigmoid * (1 + gateValue*(1-sigmoid))
+		gateGradient[index] = outputGradient[index] * upValue * siluGradient * gateMask
+		upGradient[index] = outputGradient[index] * silu * upMask
+	}
+}
+
+// clampGate clamps a gate pre-activation above at clamp and reports whether the
+// gate was unclamped (so its gradient flows).
+func clampGate(value, clamp float32) (float32, float32) {
+	if clamp > 0 && value >= clamp {
+		return clamp, 0
+	}
+	return value, 1
+}
+
+// clampUp clamps an up pre-activation into [-clamp, clamp] and reports whether
+// the up value was unclamped.
+func clampUp(value, clamp float32) (float32, float32) {
+	if clamp > 0 {
+		if value > clamp {
+			return clamp, 0
+		}
+		if value < -clamp {
+			return -clamp, 0
+		}
+	}
+	return value, 1
+}
+
+// swigluValue evaluates the clamped SwiGLU for one element.
+func swigluValue(gate, up, clamp float32) float32 {
+	gateValue, _ := clampGate(gate, clamp)
+	upValue, _ := clampUp(up, clamp)
+	sigmoid := float32(1.0 / (1.0 + math.Exp(float64(-gateValue))))
+	return gateValue * sigmoid * upValue
+}
+
 // Exp computes destination[i] = exp(source[i]).
 func (backend *Backend) Exp(destination, source []float32) {
 	for index, value := range source {

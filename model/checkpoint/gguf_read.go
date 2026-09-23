@@ -144,6 +144,25 @@ func parseConfigFromGGUF(metadata map[string]any) (model.Config, error) {
 	if config.WindowPattern, err = getString("nanochat.window_pattern"); err != nil {
 		return config, err
 	}
+	// MoE metadata is optional so older GGUF files without it still load.
+	optionalUint32 := func(key string) int {
+		if value, ok := metadata[key].(uint32); ok {
+			return int(value)
+		}
+		return 0
+	}
+	optionalFloat32 := func(key string) float32 {
+		if value, ok := metadata[key].(uint32); ok {
+			return math.Float32frombits(value)
+		}
+		return 0
+	}
+	config.NumExperts = optionalUint32("nanochat.num_experts")
+	config.NumExpertsPerToken = optionalUint32("nanochat.num_experts_per_token")
+	config.ExpertHiddenDim = optionalUint32("nanochat.expert_hidden_dim")
+	config.SharedExpertHiddenDim = optionalUint32("nanochat.shared_expert_hidden_dim")
+	config.MoEClamp = optionalFloat32("nanochat.moe_clamp_bits")
+	config.MoEScale = optionalFloat32("nanochat.moe_scale_bits")
 	config.Validate()
 	return config, nil
 }

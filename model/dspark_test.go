@@ -164,6 +164,33 @@ func TestDSparkTrainHeadsStepFinite(t *testing.T) {
 	}
 }
 
+// TestDSparkOnMoEBackbone builds a DSpark whose backbone is a MoE model. The
+// trunk is dense (derived from the backbone geometry), and drafting plus head
+// training must stay finite.
+func TestDSparkOnMoEBackbone(t *testing.T) {
+	backbone := NewTransformer(moeTestConfig())
+	if !backbone.Config.MoEEnabled() {
+		t.Fatal("expected a MoE backbone")
+	}
+	dspark := NewDSpark(backbone)
+	if dspark.Drafter.Config.MoEEnabled() {
+		t.Fatal("DSpark trunk should be dense")
+	}
+	dspark.InitWeights(tensors.NewRNG(5))
+
+	context := []int{1, 5, 2, 8, 3, 7, 4, 6}
+	tokens, confidences := dspark.Draft(context, 5)
+	if len(tokens) != 5 || len(confidences) != 5 {
+		t.Fatalf("draft = %d/%d, want 5/5", len(tokens), len(confidences))
+	}
+
+	inputs := tensors.NewInt32sWithData([]int{1, 8}, []int32{1, 2, 3, 4, 5, 6, 7, 8})
+	targets := tensors.NewInt32sWithData([]int{1, 8}, []int32{2, 3, 4, 5, 6, 7, 8, 9})
+	if loss := dspark.TrainHeadsStep(inputs, targets, 5); math.IsNaN(float64(loss)) || math.IsInf(float64(loss), 0) {
+		t.Fatalf("head loss = %v, want finite", loss)
+	}
+}
+
 func TestDSparkRoundTrip(t *testing.T) {
 	backbone := NewTransformer(testConfig())
 	dspark := NewDSpark(backbone)

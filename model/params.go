@@ -50,7 +50,17 @@ func (model *Transformer) NamedParameters() map[string]*tensors.Tensor {
 			parameters[fmt.Sprintf("transformer.h.%d.attn.indexer_heads", layerIndex)] = block.attention.indexer.headWeights
 		}
 		parameters[fmt.Sprintf("transformer.h.%d.mlp.c_fc.weight", layerIndex)] = block.mlp.inputProjection.Weight
+		if block.mlp.gateProjection != nil {
+			parameters[fmt.Sprintf("transformer.h.%d.mlp.c_gate.weight", layerIndex)] = block.mlp.gateProjection.Weight
+		}
 		parameters[fmt.Sprintf("transformer.h.%d.mlp.c_proj.weight", layerIndex)] = block.mlp.outputProjection.Weight
+		if block.moe != nil {
+			parameters[fmt.Sprintf("transformer.h.%d.moe.router.weight", layerIndex)] = block.moe.router.weight.Weight
+			parameters[fmt.Sprintf("transformer.h.%d.moe.router_bias", layerIndex)] = block.moe.router.bias
+			parameters[fmt.Sprintf("transformer.h.%d.moe.experts.gate.weight", layerIndex)] = block.moe.gateWeight
+			parameters[fmt.Sprintf("transformer.h.%d.moe.experts.up.weight", layerIndex)] = block.moe.upWeight
+			parameters[fmt.Sprintf("transformer.h.%d.moe.experts.down.weight", layerIndex)] = block.moe.downWeight
+		}
 	}
 	for layerIndex, valueEmbedding := range model.valueEmbeds {
 		parameters[fmt.Sprintf("value_embeds.%d.weight", layerIndex)] = valueEmbedding.Weight

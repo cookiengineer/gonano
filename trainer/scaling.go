@@ -31,6 +31,16 @@ type Hyperparams struct {
 //   - weight decay follows the T_epoch framework (arxiv 2405.13698)
 func DeriveHyperparams(depth, vocabSize, targetParamDataRatio int, baseWeightDecay float32) Hyperparams {
 	config := model.ConfigForDepth(depth, vocabSize, 64, 128, 2048, "SSSL")
+	return DeriveHyperparamsForConfig(config, targetParamDataRatio, baseWeightDecay)
+}
+
+// DeriveHyperparamsForConfig is DeriveHyperparams for an explicit model config,
+// so derived horizons track the actual parameter count of architectural
+// variants. In particular a Mixture-of-Experts config reports every routed
+// expert in ScalingParamsForConfig, so its target token count and batch size
+// scale with the larger model rather than the dense baseline.
+func DeriveHyperparamsForConfig(config model.Config, targetParamDataRatio int, baseWeightDecay float32) Hyperparams {
+	vocabSize := config.VocabSize
 	scalingParams := model.ScalingParamsForConfig(config)
 	targetTokens := int64(targetParamDataRatio) * scalingParams
 

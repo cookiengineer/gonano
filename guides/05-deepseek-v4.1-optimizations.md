@@ -30,6 +30,9 @@ layout.
 | Local sliding-window branch (SWA) | 2.2 | `model/compress_attention.go` `mergeAttentionBranches` | `--swa-window W` |
 | Grouped-query attention | 2.1 | `model/attention.go`, `Config.NumKVHead` | `--kv-head-ratio R` |
 | Partial rotary embedding | 2.1 | `model/rotary.go`, `Config.RotaryDims` | `Config.RotaryDims` (default 64) |
+| Mixture-of-Experts (DeepSeekMoE) | 2.1, 4.2.1 | `model/moe.go`, `model/mlp.go` | `--moe` |
+| Clamped SwiGLU experts | 4.2.1 | `kernels/backend.go` (`SwiGLU`), `tensors.SwiGLU` | implied by `--moe` |
+| Auxiliary-loss-free load balancing | 2.1.1, 4.2.2 | `MoE.updateRouterBias`, `Transformer.UpdateRouterBias` | implied by `--moe` |
 | Head-wise Muon for Q/K | 2.5 | `model/optimizer.go` `headWiseViews` | `--head-wise-muon` |
 | Sinkhorn-balanced embeddings / lm_head | 2.5 | `optimizer/sinkhorn.go`, `model/optimizer.go` `sinkhornGroup` | `--sinkhorn-embeddings` |
 | Full-vocabulary on-policy distillation (OPD) | 5.2.4 | `tensors/loss.go` (`DistillationLossPerPosition`), `trainer/distill.go` | `cmd/chat_opd` |
@@ -40,7 +43,7 @@ layout.
 | Persistent multi-entry KV cache (LRU/TTL/disk) | 3.2.1 | `inference/cache.go` `CacheManager`, `model/kvcache_codec.go` | `Engine.Cache = NewCacheManager(...)` |
 | SWA pool + bounded replay (global-only persistence) | 3.2.1, 3.2.2 | `KVBuffer.StripRaw`, `Transformer.ReplaySWA`, `Engine.SWACache` | `CacheOptions.StripSWA`, `Engine.SWACache` |
 | FP4 main KV cache / FP4 indexer QAT | 2.4.4 | **not implemented** (float32-only) | — |
-| Engram, MoE, Single-Pass mHC | 2.1, 2.4 | **not applicable / not implemented** | — |
+| Engram, Single-Pass mHC | 2.1, 2.4 | **not applicable / not implemented** | — |
 
 ---
 
@@ -172,6 +175,96 @@ heads, cutting KV size and traffic. `Config.RotaryDims` (default 64) applies
 rotary embedding only to the trailing head dimensions, matching DeepSeek's
 partial RoPE (`model/rotary.go`).
 
+### 2.7 Mixture-of-Experts (DeepSeekMoE)
+
+Paper §2.1 and §4.2.1 use one shared expert plus many fine-grained routed
+experts in every feed-forward layer. gonano implements this as `model/moe.go`,
+enabled with `--moe`:
+
+- **Structure.** Every block keeps an always-active **shared expert** (`MLP` in
+  SwiGLU mode, owned by `block.mlp`) and adds a routed `MoE` (`block.moe`). Each
+  token selects its top-`k` routed experts by router affinity; the routed output
+  is the affinity-weighted sum of their SwiGLU outputs. There are no biases.
+- **Activation.** Experts and the shared expert use clamped SwiGLU,
+  `silu(min(gate,10)) * clamp(up,-10,10)` (`kernels.Backend.SwiGLU`,
+  `tensors.SwiGLU`). The clamp threshold is `Config.MoEClamp` (default 10; a
+  negative value disables clamping). Plain (non-MoE) blocks keep the ReLU² MLP.
+- **Weight layout.** Routed expert weights are packed contiguously as
+  `[E, Hidden, Dim]` (gate/up) and `[E, Dim, Hidden]` (down) so a future grouped
+  SIMD kernel can walk them without pointer chasing. The optimizer consumes
+  per-expert rank-2 views (`expertViews`) that share the parent's `Data`/`Grad`,
+  exactly like head-wise Muon.
+- **Routing.** `router.weight` maps the hidden state to `E` affinities;
+  softmax gives the output weights while a non-trainable correction bias,
+  `router.bias`, participates only in expert *selection*
+  (`gate_scores = logits + bias`). Selection reuses the bounded top-k heap from
+  the lightning indexer.
+- **Fused kernels.** The `kernels.MoE` contract fuses the hot paths, in the
+  spirit of the paper's "Mega-Gate"/"Mega-MoE": `MoEGateTopK` computes the
+  router softmax (vectorized) and the bias-aware top-k selection in one call,
+  backed by `TopKIndices`, a dedicated selection kernel that finds the maximum
+  with a vectorized reduction and its first index with a vectorized equality
+  mask (the DeepSelect-style TopK), giving ~7x over the scalar scan at hundreds
+  of experts. `GroupedMatMulTransposed` runs one GEMM over all experts from an
+  expert-major gathered input (vectorized dot products, parallelized across
+  rows), replacing one `MatMulTransposed` per expert. `MoE.forward` gathers the
+  selected rows, runs the three grouped GEMMs (gate/up/down) with a fused SwiGLU
+  between them, and scatter-adds the affinity-weighted outputs. Training keeps
+  per-expert rank-2 views into the grouped buffers for the linear-layer
+  backward. Both kernels have scalar reference implementations
+  (`kernels/scalar/moe.go`) and SIMD parity tests.
+- **Load balancing.** After each optimizer step,
+  `Transformer.UpdateRouterBias` applies the auxiliary-loss-free update
+  `bias_e += u·sign(mean_load − load_e)` with `u = Config.RouterBiasUpdate`
+  (default 0.001). Overloaded experts get a lower selection bias. The sequence-
+  level balance loss is not implemented.
+- **Accounting.** `MatmulParams` counts every expert (total parameters), while
+  `ActiveMatmulParams` counts only the top-`k` experts plus shared/router; the
+  decode FLOPs and `WeightReadBytes` (and therefore `cmd/infer_bench`) use the
+  active count, since only those weights are read per token.
+- **Sizing from depth.** With `--moe`, the routed expert count is
+  `model.MoEExpertsForDepth(depth) = max(8, 2·depth)`; `--num-experts`,
+  `--experts-per-token` (default 2), and `--expert-hidden-dim` (default the
+  embedding width) override the derivation. MoE is orthogonal to the attention
+  design, so it composes with GQA, compression, SWA, CED, and MLA (all covered
+  by tests). The scaling-law path `trainer.DeriveHyperparamsForConfig` uses
+  `ScalingParamsForConfig` for the target-token count (all experts) and
+  `EstimateFlopsPerTokenForConfig` for the per-token FLOPs (active experts), so
+  a MoE config gets a horizon that reflects its total parameter count.
+- **Deliberately omitted.** The paper's small sequence-level balance loss
+  (§4.2.2, weight 0.0001) is not implemented; load balancing is purely the
+  auxiliary-loss-free bias update. The grouped GEMM is fused for the forward
+  pass only; the backward keeps the per-expert linear-layer path.
+- **Speculative decoding.** DSpark (and the plain drafter) compose with a MoE
+  backbone: `DrafterConfig` keeps only the vocabulary and head geometry, so the
+  DSpark trunk is a dense small transformer regardless of the target, while
+  verification runs through the MoE target and trunk distillation uses the MoE
+  teacher's cache-less forward. Exact greedy speculative decoding is covered by
+  `TestSpeculativeDSparkOnMoEBackboneMatchesGreedy` and
+  `TestSpeculativeDraftOnMoEBackboneMatchesGreedy`; distillation from a MoE
+  teacher by `TestDistillWithMoETeacher`.
+
+Units: `model/moe_test.go` (`TestMoEConfigDefaults`, `TestMoEConfigValidation`,
+`TestMoEForwardFiniteAndShapes`, `TestMoENamedParameters`,
+`TestMoEActiveParameterAccounting`, `TestMoERouterSelectsDeterministically`,
+`TestMoERouterBiasBalancing`, `TestMoEForwardMatchesTrainForward`,
+`TestMoEDecodeMatchesPrefill`, `TestMoEGradientCheck`,
+`TestMoEPerElementGradientCheck`, `TestMoEConfigAccounting`,
+`TestMoEComposesWithGQA`, `TestMoEComposesWithCompression`,
+`TestMoEComposesWithCED`, `TestMoEComposesWithMLA`,
+`TestMoEScalarBackendMatchesSIMD`);
+`kernels/scalar` `TestSwiGLU`, `TestMoEGateTopK`, `TestTopKIndices`,
+`TestGroupedMatMulTransposed`; `kernels/simd` `TestElementwiseParity` (SwiGLU),
+`TestMoEGateTopKParity`, `TestTopKIndicesParity`,
+`TestGroupedMatMulTransposedParity`; `tensors` `TestSwiGLUForwardClamp`,
+`TestSwiGLUBackwardNumeric`; `model/checkpoint` (`TestSaveLoadRoundtripMoE`,
+`TestExportGGUFMoE`, `TestGGUFWithoutMoEMetadataStillLoads`);
+`trainer.TestTrainerMoEOverfitsTiny`, `trainer.TestDeriveHyperparamsForMoEConfig`;
+`model.TestDSparkOnMoEBackbone`; `inference`
+(`TestSpeculativeDSparkOnMoEBackboneMatchesGreedy`,
+`TestSpeculativeDraftOnMoEBackboneMatchesGreedy`,
+`TestDSparkDrafterDenseForMoEBackbone`); root `TestEndToEndMoE`.
+
 ---
 
 ## 3. Shared candidate pool (constant-cost deeper indexer)
@@ -218,6 +311,10 @@ the same work with vectorization and parallelism instead:
 - The batched scoring kernel is used for whole-sequence queries and the scalar
   loop for single-token decode (below `indexerKernelCoarseMinRows`), where
   per-row goroutine overhead would dominate.
+- **`kernels.MoE`** (new backend contract, `kernels/backend.go`): the fused
+  mixture-of-experts kernels `MoEGateTopK`, the vectorized `TopKIndices`
+  selection, and `GroupedMatMulTransposed` (DeepSeek-V4.1 §2.1/§4.2.1; see
+  §2.7), implemented in `kernels/simd/moe.go` and `kernels/scalar/moe.go`.
 
 Units: `kernels/simd/parity_test.go` (`TestIndexerScoresParity`,
 `TestIndexerBlockMaxParity`), `model/indexer_test.go`
@@ -468,6 +565,10 @@ factorizations in §5. Do not expect per-token KV bytes to match the paper's
 | `--query-compression-dim R` | 0 | Low-rank query bottleneck width. |
 | `--kv-latent-dim R` | 0 | Shared low-rank KV latent width. |
 | `--kv-head-ratio R` | 1 | Query heads per KV head (GQA). |
+| `--moe` | false | Enable the DeepSeekMoE feed-forward (shared + routed experts). |
+| `--num-experts E` | 0 | Routed expert count (`0` = derived from `--depth`). |
+| `--experts-per-token K` | 0 | Routed experts activated per token (`0` = 2). |
+| `--expert-hidden-dim H` | 0 | Routed and shared expert intermediate width (`0` = embedding width). |
 
 ### 9.2 Config fields (`model.Config`, persisted in the checkpoint)
 
@@ -518,6 +619,7 @@ GOEXPERIMENT=simd go test -race ./...
 | Area | Tests |
 |---|---|
 | Compression / CED / SWA | `model/compress_test.go`, `model/ced_test.go`, `model/swa_test.go` |
+| MoE / routing / balancing | `model/moe_test.go`, `trainer/moe_test.go`, `model/checkpoint/moe_test.go` |
 | Indexer / hierarchy / reuse | `model/indexer_test.go`, `model/model_test.go` |
 | Backprop (incl. low-rank, CED) | `model/gradcheck_test.go` |
 | Head-wise Muon | `model/optimizer_test.go` |
@@ -532,9 +634,9 @@ GOEXPERIMENT=simd go test -race ./...
 For completeness, the paper components that are out of scope here:
 
 - **FP4 main KV cache and FP4 indexer QAT** (see §8).
-- **MoE backbone, Engram conditional memory, and Single-Pass mHC.** gonano is a
-  dense single-residual-stream model; these are architectural components of the
-  552B model and do not map onto it.
+- **Engram conditional memory and Single-Pass mHC.** gonano is a
+  single-residual-stream model; these are architectural components of the 552B
+  model and do not map onto it. The MoE backbone *is* implemented (§2.7).
 - **End-to-end semi-autoregressive DSpark training.** The single-pass parallel
   draft and the survival scheduler are implemented, and the Markov/confidence
   heads are trained under the same placeholder forward as inference, but the
@@ -557,5 +659,6 @@ For completeness, the paper components that are out of scope here:
 | Attention forward/backward (training) | `model/train.go` |
 | Head-wise Muon | `model/optimizer.go` (`headWiseViews`) |
 | Prefix cache | `inference/prefix.go` |
+| MoE feed-forward + routing | `model/moe.go`, `model/mlp.go` |
 | Indexer kernels | `kernels/simd/indexer.go`, `kernels/scalar/indexer.go` |
 | Long-context benchmark | `benchmark_longctx.sh`, `cmd/infer_bench` |

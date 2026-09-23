@@ -92,5 +92,14 @@ func ReluSquared(source *Tensor) *Tensor {
 	return result
 }
 
+// SwiGLU returns the clamped SwiGLU activation silu(min(gate,clamp)) *
+// clamp(up,-clamp,clamp) element-wise. A clamp <= 0 disables clamping.
+func SwiGLU(gate, up *Tensor, clamp float32) *Tensor {
+	requireSameShape(gate, up)
+	result := New(gate.Shape...)
+	KernelBackend().SwiGLU(result.Data, gate.Data, up.Data, clamp)
+	return result
+}
+
 // Copy returns a deep copy of source.
 func Copy(source *Tensor) *Tensor { return source.Clone() }

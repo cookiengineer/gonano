@@ -29,6 +29,30 @@ func testSpeculativeModel() (*model.Transformer, *model.Transformer, *tokenizer.
 	return backbone, drafter, tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
 }
 
+// testSpeculativeMoEBackbone builds a perturbed MoE backbone for speculative
+// decoding tests. The drafter derived from it is dense (DrafterConfig keeps the
+// head geometry and vocabulary, not the MoE fields).
+func testSpeculativeMoEBackbone() *model.Transformer {
+	config := model.Config{
+		SequenceLen: 32, VocabSize: 32, NumLayer: 2, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L",
+		NumExperts: 4, NumExpertsPerToken: 2, ExpertHiddenDim: 16, SharedExpertHiddenDim: 16,
+	}
+	config.ApplyMoEDefaults()
+	backbone := model.NewTransformer(config)
+	backbone.InitWeights(tensors.NewRNG(42))
+	perturbSpeculative(backbone, 11)
+	return backbone
+}
+
+func testSpeculativeTokenizer() *tokenizer.Tokenizer {
+	ranks := make(map[string]int, 256)
+	for index := 0; index < 256; index++ {
+		ranks[string([]byte{byte(index)})] = index
+	}
+	return tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
+}
+
 func perturbSpeculative(transformer *model.Transformer, seed uint64) {
 	rng := tensors.NewRNG(seed)
 	for _, parameter := range transformer.Parameters() {
@@ -167,5 +191,64 @@ func TestScheduledLength(t *testing.T) {
 	// the threshold.
 	if got := scheduledLength([]float32{0.8, 0.8, 0.8}, 0.7); got != 2 {
 		t.Fatalf("length = %d, want 2", got)
+	}
+}
+
+// TestSpeculativeDraftOnMoEBackboneMatchesGreedy verifies that exact greedy
+// speculative decoding with a plain drafter still reproduces the MoE backbone's
+// greedy output.
+func TestSpeculativeDraftOnMoEBackboneMatchesGreedy(t *testing.T) {
+	backbone := testSpeculativeMoEBackbone()
+	drafter := model.NewDrafter(backbone)
+	drafter.InitWeights(tensors.NewRNG(99))
+	perturbSpeculative(drafter, 22)
+
+	engine := NewEngine(backbone, testSpeculativeTokenizer())
+	engine.Drafter = drafter
+	engine.Speculative = true
+	engine.DraftLength = 5
+
+	prompt := []int{1, 5, 2, 8, 3, 7}
+	got, _ := engine.GenerateBatch(prompt, 1, 12, 0, 0, 0)
+	if len(got[0]) < len(prompt) {
+		t.Fatalf("generation shorter than the prompt: %d", len(got[0]))
+	}
+	assertSameTokens(t, got[0][len(prompt):], greedyReference(backbone, prompt, 12))
+}
+
+// TestSpeculativeDSparkOnMoEBackboneMatchesGreedy verifies DSpark's confidence
+// scheduler preserves exactness when the target model is a MoE backbone. The
+// DSpark trunk is dense (derived from the backbone geometry), while verification
+// runs through the MoE target.
+func TestSpeculativeDSparkOnMoEBackboneMatchesGreedy(t *testing.T) {
+	backbone := testSpeculativeMoEBackbone()
+	dspark := model.NewDSpark(backbone)
+	dspark.InitWeights(tensors.NewRNG(123))
+
+	engine := NewEngine(backbone, testSpeculativeTokenizer())
+	engine.DSpark = dspark
+	engine.Speculative = true
+	engine.DraftLength = 5
+
+	prompt := []int{1, 5, 2, 8, 3, 7}
+	got, _ := engine.GenerateBatch(prompt, 1, 12, 0, 0, 0)
+	assertSameTokens(t, got[0][len(prompt):], greedyReference(backbone, prompt, 12))
+}
+
+// TestDSparkDrafterDenseForMoEBackbone documents that the DSpark trunk derived
+// from a MoE backbone is a dense drafter: DrafterConfig copies the vocabulary
+// and head geometry only.
+func TestDSparkDrafterDenseForMoEBackbone(t *testing.T) {
+	backbone := testSpeculativeMoEBackbone()
+	if !backbone.Config.MoEEnabled() {
+		t.Fatal("test backbone should be MoE")
+	}
+	dspark := model.NewDSpark(backbone)
+	if dspark.Drafter.Config.MoEEnabled() {
+		t.Fatal("DSpark trunk should be dense even for a MoE backbone")
+	}
+	if dspark.Drafter.Config.EmbedDim != backbone.Config.EmbedDim ||
+		dspark.Drafter.Config.VocabSize != backbone.Config.VocabSize {
+		t.Fatal("DSpark trunk must keep the backbone embedding and vocabulary")
 	}
 }

@@ -41,6 +41,21 @@ type Elementwise interface {
 	// ReluSquared computes destination[i] = max(source[i], 0)^2, the nanochat
 	// MLP activation.
 	ReluSquared(destination, source []float32)
+	// SwiGLU computes the clamped SwiGLU activation element-wise:
+	//
+	//	destination[i] = silu(min(gate[i], clamp)) * clampValue(up[i], clamp)
+	//
+	// where silu(x) = x*sigmoid(x) and clampValue(x, clamp) clamps x into
+	// [-clamp, clamp]. A clamp <= 0 disables clamping (plain SwiGLU). This is
+	// the DeepSeek-V4.1/DeepSeekMoE exotic feed-forward activation (paper
+	// §4.2.1, clamp threshold 10). gate, up, and destination must have the
+	// same length.
+	SwiGLU(destination, gate, up []float32, clamp float32)
+	// SwiGLUBackward computes the gradients of SwiGLU with respect to gate and
+	// up given the forward operands and the output gradient. gateGradient and
+	// upGradient receive the results (they are overwritten, not accumulated).
+	// clamp must equal the forward clamp.
+	SwiGLUBackward(gateGradient, upGradient, gate, up, outputGradient []float32, clamp float32)
 	// Exp computes destination[i] = exp(source[i]).
 	Exp(destination, source []float32)
 	// Sigmoid computes destination[i] = 1 / (1 + exp(-source[i])).
@@ -98,6 +113,31 @@ type Indexer interface {
 	// score, where a block's score is the maximum index score among its
 	// entries (DeepSeek-V4.1 §2.3.2).
 	IndexerBlockMax(destination, scores []float32, rowCount, blockCount, groupSize int)
+}
+
+// MoE is the contract for the routed mixture-of-experts feed-forward.
+type MoE interface {
+	// TopKIndices fills destination[row*k+slot] with the index of the slot-th
+	// largest score of row `row`, in descending order with ties broken toward
+	// the smaller index. scores is [rowCount, count] and destination is
+	// [rowCount, k]. It is the vectorized selection kernel behind MoEGateTopK
+	// (the paper's DeepSelect-style TopK).
+	TopKIndices(destination []int32, scores []float32, rowCount, count, k int)
+	// MoEGateTopK computes, for every token row, the softmax router
+	// probabilities and the top-k expert selection. logits and probs are
+	// [rowCount, expertCount]; the selection score is logits + bias. selected
+	// and selectedWeights are [rowCount*k]: selected holds the expert indices
+	// in descending score order (ties toward the smaller index) and
+	// selectedWeights holds the corresponding softmax affinity (the routed
+	// output weight).
+	MoEGateTopK(logits, bias, probs []float32, selected []int32, selectedWeights []float32, rowCount, expertCount, k int)
+	// GroupedMatMulTransposed computes per-expert destination = input @ weight^T
+	// for a packed weight [expertCount, columnCount, innerCount]. The input rows
+	// are grouped by expert in ascending expert order: expert e contributes
+	// tokenCounts[e] rows, and destination rows are written in the same order.
+	// It is the fused expert GEMM of the MoE feed-forward, replacing one
+	// MatMulTransposed call per expert.
+	GroupedMatMulTransposed(destination, input, weight []float32, tokenCounts []int32, expertCount, columnCount, innerCount int)
 }
 
 // Rows is the contract for fused operations that normalize each row of a
@@ -230,13 +270,15 @@ type Attention interface {
 }
 
 // Backend is the complete numeric contract. A backend must implement every
-// group; the fused groups (Rows, Attention) exist so implementations can fuse
-// operations for speed rather than composing them from Elementwise.
+// group; the fused groups (Indexer, Rows, MoE, Attention) exist so
+// implementations can fuse operations for speed rather than composing them from
+// Elementwise.
 type Backend interface {
 	Elementwise
 	Reductions
 	LinearAlgebra
 	Indexer
 	Rows
+	MoE
 	Attention
 }

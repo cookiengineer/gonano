@@ -1,8 +1,71 @@
 package tensors
 
 import (
+	"math"
 	"testing"
 )
+
+func TestSwiGLUForwardClamp(t *testing.T) {
+	useScalarBackend(t)
+	gate := NewWithData([]int{2}, []float32{0, 20})
+	up := NewWithData([]int{2}, []float32{1, 1})
+
+	// clamp = 10: gate 20 is clamped to 10.
+	output := SwiGLU(gate, up, 10)
+	if !close(output.Data[0], 0, 1e-6, 1e-6) {
+		t.Fatalf("silu(0)*1 = %v, want 0", output.Data[0])
+	}
+	want := float32(10) * float32(1/(1+math.Exp(-10)))
+	if !close(output.Data[1], want, 1e-5, 1e-6) {
+		t.Fatalf("clamped silu(10)*1 = %v, want %v", output.Data[1], want)
+	}
+
+	// clamp <= 0 disables clamping.
+	unclamped := SwiGLU(gate, up, 0)
+	wantUnclamped := float32(20) * float32(1/(1+math.Exp(-20)))
+	if !close(unclamped.Data[1], wantUnclamped, 1e-4, 1e-5) {
+		t.Fatalf("unclamped silu(20)*1 = %v, want %v", unclamped.Data[1], wantUnclamped)
+	}
+}
+
+// TestSwiGLUBackwardNumeric checks the analytic SwiGLU gradient against finite
+// differences of the projected loss sum(gradOut * swiglu(gate, up)).
+func TestSwiGLUBackwardNumeric(t *testing.T) {
+	useScalarBackend(t)
+	gate := NewWithData([]int{3}, []float32{0.3, -1.2, 2.5})
+	up := NewWithData([]int{3}, []float32{1.1, 0.7, -2.0})
+	gradientOutput := NewWithData([]int{3}, []float32{0.5, -0.9, 1.3})
+	clamp := float32(10)
+
+	gradientGate, gradientUp := SwiGLUBackward(gate, up, gradientOutput, clamp)
+
+	loss := func() float32 {
+		output := SwiGLU(gate, up, clamp)
+		var total float32
+		for index := range output.Data {
+			total += output.Data[index] * gradientOutput.Data[index]
+		}
+		return total
+	}
+
+	epsilon := float32(1e-3)
+	check := func(name string, parameter, analytic *Tensor) {
+		for index := range parameter.Data {
+			original := parameter.Data[index]
+			parameter.Data[index] = original + epsilon
+			lossPlus := loss()
+			parameter.Data[index] = original - epsilon
+			lossMinus := loss()
+			parameter.Data[index] = original
+			numeric := (lossPlus - lossMinus) / (2 * epsilon)
+			if !close(analytic.Data[index], numeric, 1e-2, 1e-3) {
+				t.Errorf("%s[%d]: analytic=%v numeric=%v", name, index, analytic.Data[index], numeric)
+			}
+		}
+	}
+	check("gate", gate, gradientGate)
+	check("up", up, gradientUp)
+}
 
 func TestCrossEntropyGradMatchesSoftmaxMinusOnehot(t *testing.T) {
 	useScalarBackend(t)

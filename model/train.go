@@ -469,20 +469,35 @@ func (attention *CausalSelfAttention) cedValueProjectionBackward(encoderHidden, 
 
 // mlpContext holds activations for the MLP backward.
 type mlpContext struct {
-	input     *tensors.Tensor // input to inputProjection (== norm input)
-	projected *tensors.Tensor // inputProjection output (pre ReLU-squared)
-	hidden    *tensors.Tensor // ReLU-squared output (input to outputProjection)
+	input         *tensors.Tensor // input to inputProjection (== norm input)
+	projected     *tensors.Tensor // inputProjection output (pre activation)
+	projectedUp   *tensors.Tensor // SwiGLU up projection (== projected)
+	projectedGate *tensors.Tensor // SwiGLU gate projection (nil for ReLU²)
+	hidden        *tensors.Tensor // nonlinearity output (input to outputProjection)
 }
 
 func (mlp *MLP) forwardTraining(input *tensors.Tensor) (*tensors.Tensor, *mlpContext) {
 	projected := mlp.inputProjection.Forward(input)
-	hidden := tensors.ReluSquared(projected)
+	context := &mlpContext{input: input, projected: projected, projectedUp: projected}
+	var hidden *tensors.Tensor
+	if mlp.gateProjection != nil {
+		context.projectedGate = mlp.gateProjection.Forward(input)
+		hidden = tensors.SwiGLU(context.projectedGate, projected, mlp.Clamp)
+	} else {
+		hidden = tensors.ReluSquared(projected)
+	}
 	output := mlp.outputProjection.Forward(hidden)
-	return output, &mlpContext{input: input, projected: projected, hidden: hidden}
+	context.hidden = hidden
+	return output, context
 }
 
 func (mlp *MLP) backwardTraining(outputGradient *tensors.Tensor, context *mlpContext) *tensors.Tensor {
 	gradientHidden := mlp.outputProjection.Backward(context.hidden, outputGradient)
+	if mlp.gateProjection != nil {
+		gradientGate, gradientUp := tensors.SwiGLUBackward(context.projectedGate, context.projectedUp, gradientHidden, mlp.Clamp)
+		gradientInput := mlp.gateProjection.Backward(context.input, gradientGate)
+		return tensors.Add(gradientInput, mlp.inputProjection.Backward(context.input, gradientUp))
+	}
 	gradientProjected := tensors.ReluSquaredBackward(context.projected, gradientHidden)
 	return mlp.inputProjection.Backward(context.input, gradientProjected)
 }
@@ -493,9 +508,10 @@ type blockContext struct {
 	attentionNormInput *tensors.Tensor // norm(input), the attention's actual input
 	attentionOutput    *tensors.Tensor // attention output (pre residual)
 	attentionContext   *attentionContext
-	mlpNormInput       *tensors.Tensor // input after attention residual (input to mlp norm)
+	mlpNormInput       *tensors.Tensor // input after attention residual (input to ffn norm)
 	mlpOutput          *tensors.Tensor
 	mlpContext         *mlpContext
+	moeContext         *moeContext // routed experts; nil for the dense MLP
 }
 
 func (block *Block) forwardTraining(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, share *compressionShare) (*tensors.Tensor, *blockContext) {
@@ -507,20 +523,31 @@ func (block *Block) forwardTraining(input, valueEmbedding, cosine, sine *tensors
 	context.attentionContext = attentionCtx
 	mid := tensors.Add(input, attentionOutput)
 	context.mlpNormInput = mid
-	mlpOutput, mlpContext := block.mlp.forwardTraining(normalizeLastDim(mid))
+	ffnInput := normalizeLastDim(mid)
+	mlpOutput, mlpContext := block.mlp.forwardTraining(ffnInput)
 	context.mlpOutput = mlpOutput
 	context.mlpContext = mlpContext
-	return tensors.Add(mid, mlpOutput), context
+	ffnOutput := mlpOutput
+	if block.moe != nil {
+		moeOutput, moeContext := block.moe.forwardTraining(ffnInput)
+		context.moeContext = moeContext
+		ffnOutput = tensors.Add(mlpOutput, moeOutput)
+	}
+	return tensors.Add(mid, ffnOutput), context
 }
 
 func (block *Block) backwardTraining(outputGradient *tensors.Tensor, context *blockContext, cosine, sine *tensors.Tensor, positionOffset int) *tensors.Tensor {
-	// Forward: mid = input + attentionOutput; output = mid + mlpOutput. The
-	// residual connections mean the gradient flows both through each sublayer
-	// and directly (identity) across it.
+	// Forward: mid = input + attentionOutput;
+	//          output = mid + sharedExpert(ffnInput) + moe(ffnInput).
+	// The residual connections mean the gradient flows both through each
+	// sublayer and directly (identity) across it.
 	gradientMid := outputGradient
 
-	gradientMLPNormInput := block.mlp.backwardTraining(outputGradient, context.mlpContext)
-	gradientMid = tensors.Add(gradientMid, normalizeLastDimBackward(context.mlpNormInput, gradientMLPNormInput))
+	gradientFFN := block.mlp.backwardTraining(outputGradient, context.mlpContext)
+	if block.moe != nil {
+		gradientFFN = tensors.Add(gradientFFN, block.moe.backwardTraining(outputGradient, context.moeContext))
+	}
+	gradientMid = tensors.Add(gradientMid, normalizeLastDimBackward(context.mlpNormInput, gradientFFN))
 
 	gradientAttentionNormInput := block.attention.backwardTraining(context.attentionNormInput, gradientMid, context.attentionContext, cosine, sine, positionOffset)
 	gradientInput := normalizeLastDimBackward(context.input, gradientAttentionNormInput)

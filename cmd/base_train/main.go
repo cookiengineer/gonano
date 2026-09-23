@@ -37,6 +37,10 @@ func main() {
 	kvLatentDim := flag.Int("kv-latent-dim", 0, "shared low-rank KV latent width (0 = full-rank)")
 	mlaLatent := flag.Int("mla-latent", 0, "absorbed MLA shared latent width (0 disables; must be trained from scratch)")
 	mlaRotaryDims := flag.Int("mla-rotary-dims", 0, "MLA decoupled rotary width (0 = headDim/2)")
+	moe := flag.Bool("moe", false, "enable the DeepSeekMoE feed-forward (shared + routed experts); size derived from --depth")
+	numExperts := flag.Int("num-experts", 0, "routed expert count (0 = derived from --depth when --moe is set)")
+	expertsPerToken := flag.Int("experts-per-token", 0, "routed experts activated per token (0 = 2)")
+	expertHiddenDim := flag.Int("expert-hidden-dim", 0, "routed and shared expert intermediate width (0 = embedding dim)")
 	vocabSize := flag.Int("vocab-size", 32768, "vocabulary size")
 	numIterations := flag.Int("num-iterations", 50, "optimization steps")
 	deviceBatchSize := flag.Int("device-batch-size", 1, "per-step batch size")
@@ -81,6 +85,15 @@ func main() {
 	configuration.KVLatentDim = *kvLatentDim
 	configuration.MLALatent = *mlaLatent
 	configuration.MLARotaryDims = *mlaRotaryDims
+	if *moe {
+		configuration.NumExperts = *numExperts
+		if configuration.NumExperts == 0 {
+			configuration.NumExperts = model.MoEExpertsForDepth(*depth)
+		}
+		configuration.NumExpertsPerToken = *expertsPerToken
+		configuration.ExpertHiddenDim = *expertHiddenDim
+		configuration.ApplyMoEDefaults()
+	}
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 

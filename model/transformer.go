@@ -43,6 +43,7 @@ type Transformer struct {
 // NewTransformer builds a Transformer with all parameters zero-initialized.
 // Call InitWeights to initialize them.
 func NewTransformer(config Config) *Transformer {
+	config.ApplyMoEDefaults()
 	config.Validate()
 	paddedVocabulary := config.PaddedVocab()
 	rotaryCosine, rotarySine := precomputeRotary(config.SequenceLen*rotaryOvercompute, config.RotaryDimension())
@@ -79,6 +80,22 @@ func (model *Transformer) NumLayers() int { return model.Config.NumLayer }
 // PaddedVocab returns the padded vocabulary size.
 func (model *Transformer) PaddedVocab() int { return model.paddedVocab }
 
+// UpdateRouterBias applies the auxiliary-loss-free load-balancing update to
+// every MoE router and resets the accumulated load statistics. It must be
+// called after each optimizer step, once per gradient-accumulation window
+// (DeepSeek-V4.1 §2.1.1, §4.2.2).
+func (model *Transformer) UpdateRouterBias() {
+	if !model.Config.MoEEnabled() {
+		return
+	}
+	speed := model.Config.MoERouterBiasUpdate()
+	for _, block := range model.blocks {
+		if block.moe != nil {
+			block.moe.updateRouterBias(speed)
+		}
+	}
+}
+
 // KVHeadDim returns the KV embedding dimension (numKVHead * headDim).
 func (model *Transformer) KVHeadDim() int {
 	return model.Config.NumKVHead * model.Config.HeadDim()
@@ -110,7 +127,17 @@ func (model *Transformer) InitWeights(rng *tensors.RNG) {
 		}
 		layers.InitZeros(block.attention.outputProjection.Weight)
 		layers.InitUniform(block.mlp.inputProjection.Weight, rng, -0.4*bound, 0.4*bound)
+		if block.mlp.gateProjection != nil {
+			layers.InitUniform(block.mlp.gateProjection.Weight, rng, -0.4*bound, 0.4*bound)
+		}
 		layers.InitZeros(block.mlp.outputProjection.Weight)
+		if block.moe != nil {
+			layers.InitUniform(block.moe.gateWeight, rng, -0.4*bound, 0.4*bound)
+			layers.InitUniform(block.moe.upWeight, rng, -0.4*bound, 0.4*bound)
+			layers.InitZeros(block.moe.downWeight)
+			layers.InitNormal(block.moe.router.weight.Weight, rng, 0.02)
+			layers.InitZeros(block.moe.router.bias)
+		}
 	}
 
 	numLayers := config.NumLayer

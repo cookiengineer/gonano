@@ -64,6 +64,17 @@ func ReluSquaredBackward(input, gradOut *Tensor) *Tensor {
 	return result
 }
 
+// SwiGLUBackward returns the gradients of the clamped SwiGLU with respect to
+// gate and up, given the forward operands and the output gradient.
+func SwiGLUBackward(gate, up, gradOut *Tensor, clamp float32) (gradGate, gradUp *Tensor) {
+	requireSameShape(gate, up)
+	requireSameShape(gate, gradOut)
+	gradGate = New(gate.Shape...)
+	gradUp = New(gate.Shape...)
+	KernelBackend().SwiGLUBackward(gradGate.Data, gradUp.Data, gate.Data, up.Data, gradOut.Data, clamp)
+	return gradGate, gradUp
+}
+
 // RMSNormBackward returns the gradient of RMSNorm applied over the last
 // dimension. With y = x / r and r = sqrt(mean(x^2)+epsilon):
 // grad_x = grad_y/r - x * (dot(grad_y, x) / (D * r^3)).

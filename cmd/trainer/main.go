@@ -45,6 +45,10 @@ func main() {
 		kvLatentDim       int
 		mlaLatent         int
 		mlaRotaryDims     int
+		moe               bool
+		numExperts        int
+		expertsPerToken   int
+		expertHiddenDim   int
 		numIterations     int
 		batchSize         int
 		modelTag          string
@@ -73,6 +77,10 @@ func main() {
 	flag.IntVar(&kvLatentDim, "kv-latent-dim", 0, "shared low-rank KV latent width (0 = full-rank)")
 	flag.IntVar(&mlaLatent, "mla-latent", 0, "absorbed MLA shared latent width (0 disables)")
 	flag.IntVar(&mlaRotaryDims, "mla-rotary-dims", 0, "MLA decoupled rotary width (0 = headDim/2)")
+	flag.BoolVar(&moe, "moe", false, "enable the DeepSeekMoE feed-forward (shared + routed experts); size derived from --depth")
+	flag.IntVar(&numExperts, "num-experts", 0, "routed expert count (0 = derived from --depth when --moe is set)")
+	flag.IntVar(&expertsPerToken, "experts-per-token", 0, "routed experts activated per token (0 = 2)")
+	flag.IntVar(&expertHiddenDim, "expert-hidden-dim", 0, "routed and shared expert intermediate width (0 = embedding dim)")
 	flag.IntVar(&numIterations, "num-iterations", 50, "optimization steps")
 	flag.IntVar(&batchSize, "device-batch-size", 1, "sequences per step")
 	flag.StringVar(&modelTag, "model-tag", "", "checkpoint directory name (default d<depth>)")
@@ -110,6 +118,15 @@ func main() {
 	configuration.KVLatentDim = kvLatentDim
 	configuration.MLALatent = mlaLatent
 	configuration.MLARotaryDims = mlaRotaryDims
+	if moe {
+		configuration.NumExperts = numExperts
+		if configuration.NumExperts == 0 {
+			configuration.NumExperts = model.MoEExpertsForDepth(depth)
+		}
+		configuration.NumExpertsPerToken = expertsPerToken
+		configuration.ExpertHiddenDim = expertHiddenDim
+		configuration.ApplyMoEDefaults()
+	}
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, sinkhornEmbedding)

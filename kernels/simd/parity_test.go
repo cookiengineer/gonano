@@ -1,6 +1,7 @@
 package simdbackend_test
 
 import (
+	"math"
 	"testing"
 
 	"github.com/cookiengineer/gonano/kernels"
@@ -58,6 +59,29 @@ func TestElementwiseParity(t *testing.T) {
 			testCase.simdOp(got, source)
 			testCase.scalarOp(want, source)
 			kerneltest.AssertSlicesClose(t, got, want, 1e-5, 1e-6)
+		}
+	}
+
+	// SwiGLU (binary + clamp) and its backward.
+	for _, length := range []int{1, 7, 31, 64, 513, 1031} {
+		gate := kerneltest.Data(length)
+		up := kerneltest.DataB(length)
+		outputGradient := kerneltest.DataB(length)
+		for _, clamp := range []float32{0, 2} {
+			got := make([]float32, length)
+			want := make([]float32, length)
+			simdBackend.SwiGLU(got, gate, up, clamp)
+			scalarBackend.SwiGLU(want, gate, up, clamp)
+			kerneltest.AssertSlicesClose(t, got, want, 1e-5, 1e-6)
+
+			gotGate := make([]float32, length)
+			gotUp := make([]float32, length)
+			wantGate := make([]float32, length)
+			wantUp := make([]float32, length)
+			simdBackend.SwiGLUBackward(gotGate, gotUp, gate, up, outputGradient, clamp)
+			scalarBackend.SwiGLUBackward(wantGate, wantUp, gate, up, outputGradient, clamp)
+			kerneltest.AssertSlicesClose(t, gotGate, wantGate, 1e-4, 1e-5)
+			kerneltest.AssertSlicesClose(t, gotUp, wantUp, 1e-4, 1e-5)
 		}
 	}
 
@@ -450,5 +474,117 @@ func TestIndexerBlockMaxParity(t *testing.T) {
 		simdBackend.IndexerBlockMax(got, source, testCase.rows, testCase.blocks, testCase.groupSize)
 		scalarBackend.IndexerBlockMax(want, source, testCase.rows, testCase.blocks, testCase.groupSize)
 		kerneltest.AssertSlicesClose(t, got, want, 1e-5, 1e-6)
+	}
+}
+
+// TestMoEGateTopKParity verifies the fused router softmax + top-k kernel
+// against the scalar reference, including the exact selection order.
+func TestMoEGateTopKParity(t *testing.T) {
+	simdBackend := simdbackend.New()
+	scalarBackend := scalar.New()
+
+	cases := []struct{ rows, experts, k int }{
+		{1, 2, 1},
+		{3, 4, 2},
+		{5, 8, 8},
+		{7, 33, 3},
+		{16, 64, 6},
+	}
+	for _, testCase := range cases {
+		logits := make([]float32, testCase.rows*testCase.experts)
+		for index := range logits {
+			logits[index] = float32(math.Sin(float64(index)*1.3)) * 2
+		}
+		bias := make([]float32, testCase.experts)
+		for index := range bias {
+			bias[index] = float32(index%5)*0.1 - 0.2
+		}
+
+		gotProbs := make([]float32, len(logits))
+		wantProbs := make([]float32, len(logits))
+		gotSelected := make([]int32, testCase.rows*testCase.k)
+		wantSelected := make([]int32, testCase.rows*testCase.k)
+		gotWeights := make([]float32, testCase.rows*testCase.k)
+		wantWeights := make([]float32, testCase.rows*testCase.k)
+
+		simdBackend.MoEGateTopK(logits, bias, gotProbs, gotSelected, gotWeights, testCase.rows, testCase.experts, testCase.k)
+		scalarBackend.MoEGateTopK(logits, bias, wantProbs, wantSelected, wantWeights, testCase.rows, testCase.experts, testCase.k)
+
+		kerneltest.AssertSlicesClose(t, gotProbs, wantProbs, 1e-5, 1e-6)
+		kerneltest.AssertSlicesClose(t, gotWeights, wantWeights, 1e-5, 1e-6)
+		for index := range gotSelected {
+			if gotSelected[index] != wantSelected[index] {
+				t.Fatalf("selection mismatch at %d: got %d, want %d (rows=%d experts=%d k=%d)",
+					index, gotSelected[index], wantSelected[index], testCase.rows, testCase.experts, testCase.k)
+			}
+		}
+	}
+}
+
+// TestGroupedMatMulTransposedParity verifies the per-expert grouped GEMM
+// against the scalar reference, including empty experts and uneven counts.
+func TestGroupedMatMulTransposedParity(t *testing.T) {
+	simdBackend := simdbackend.New()
+	scalarBackend := scalar.New()
+
+	cases := []struct {
+		counts  []int32
+		columns int
+		inner   int
+	}{
+		{[]int32{3, 0, 2, 5}, 6, 13},
+		{[]int32{1}, 4, 1},
+		{[]int32{0, 4, 0, 1}, 7, 64},
+		{[]int32{5, 5, 5}, 33, 17},
+	}
+	for _, testCase := range cases {
+		experts := len(testCase.counts)
+		totalRows := 0
+		for _, count := range testCase.counts {
+			totalRows += int(count)
+		}
+		input := kerneltest.Data(totalRows * testCase.inner)
+		weight := kerneltest.DataB(experts * testCase.columns * testCase.inner)
+
+		got := make([]float32, totalRows*testCase.columns)
+		want := make([]float32, totalRows*testCase.columns)
+		simdBackend.GroupedMatMulTransposed(got, input, weight, testCase.counts, experts, testCase.columns, testCase.inner)
+		scalarBackend.GroupedMatMulTransposed(want, input, weight, testCase.counts, experts, testCase.columns, testCase.inner)
+		kerneltest.AssertSlicesClose(t, got, want, 2e-3, 1e-4)
+	}
+}
+
+// TestTopKIndicesParity verifies the vectorized top-k selection against the
+// scalar reference, including tied scores and k equal to the row width, so the
+// exact tie-break must agree.
+func TestTopKIndicesParity(t *testing.T) {
+	simdBackend := simdbackend.New()
+	scalarBackend := scalar.New()
+
+	cases := []struct{ rows, count, k int }{
+		{1, 1, 1},
+		{3, 4, 2},
+		{4, 8, 8},
+		{7, 33, 3},
+		{16, 64, 6},
+	}
+	for _, testCase := range cases {
+		// Scores deliberately repeat across experts so ties exercise the
+		// smaller-index tie-break, and repeated across rows so lane handling is
+		// covered at several offsets.
+		scores := make([]float32, testCase.rows*testCase.count)
+		for index := range scores {
+			scores[index] = float32(index%5) * 0.25
+		}
+		got := make([]int32, testCase.rows*testCase.k)
+		want := make([]int32, testCase.rows*testCase.k)
+		simdBackend.TopKIndices(got, scores, testCase.rows, testCase.count, testCase.k)
+		scalarBackend.TopKIndices(want, scores, testCase.rows, testCase.count, testCase.k)
+		for index := range want {
+			if got[index] != want[index] {
+				t.Fatalf("top-k mismatch at %d: got %d, want %d (rows=%d count=%d k=%d)",
+					index, got[index], want[index], testCase.rows, testCase.count, testCase.k)
+			}
+		}
 	}
 }
