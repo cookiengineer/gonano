@@ -141,6 +141,21 @@ func (model *Transformer) InitWeights(rng *tensors.RNG) {
 // autoregressive inference (KV-cache). Loss computation is intentionally kept
 // out of the model; callers use tensors.CrossEntropy on the returned logits.
 func (model *Transformer) Forward(indexes *tensors.Int32s, cache *KVBuffer) *tensors.Tensor {
+	return model.forward(indexes, cache, false)
+}
+
+// ReplaySWA runs the model over a suffix of an already-filled cache to rebuild
+// the local sliding-window (SWA) key/value rows without re-appending the global
+// compressed state (DeepSeek-V4.1 §3.2.2, bounded replay). The persistent cache
+// calls it after loading a stripped snapshot, which omits raw SWA rows. The
+// returned logits are the replayed segment's and are ignored; the side effect is
+// that the cache's raw buffers for [position, position+len(indexes)) are
+// refilled.
+func (model *Transformer) ReplaySWA(indexes *tensors.Int32s, cache *KVBuffer) {
+	model.forward(indexes, cache, true)
+}
+
+func (model *Transformer) forward(indexes *tensors.Int32s, cache *KVBuffer, replay bool) *tensors.Tensor {
 	batchSize, sequenceLength := indexes.Shape[0], indexes.Shape[1]
 	if sequenceLength > model.Config.SequenceLen {
 		panic("model: sequence longer than rotary cache")
@@ -206,7 +221,7 @@ func (model *Transformer) Forward(indexes *tensors.Int32s, cache *KVBuffer) *ten
 			valueEmbedding = embedding.Forward(indexes)
 		}
 		if model.Config.ReuseModeAt(layerIndex) == ReuseFull {
-			currentShare = &compressionShare{producer: layerIndex}
+			currentShare = &compressionShare{producer: layerIndex, replay: replay}
 			if model.Config.IsDecoderLayer(layerIndex) {
 				currentShare.encoderHidden = encoderHidden
 			}

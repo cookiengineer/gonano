@@ -49,6 +49,12 @@ type KVBuffer struct {
 	// compressed entries as [maxBlocks, indexerKeyWidth].
 	indexerKeyWidth int
 	indexerKey      [][]*tensors.Tensor
+
+	// rawStripped marks a snapshot whose raw key/value buffers were dropped
+	// (DeepSeek-V4.1 §3.2.1): only the global compressed/indexer state and the
+	// buffered tail survive. Bounded replay rebuilds the local sliding-window
+	// rows from the cached tokens.
+	rawStripped bool
 }
 
 // NewKVBuffer allocates a zeroed KV cache for the given model geometry.
@@ -378,6 +384,7 @@ func (cache *KVBuffer) Clone() *KVBuffer {
 		keyValueHeadCount:     cache.keyValueHeadCount,
 		headDimension:         cache.headDimension,
 		sequenceLength:        cache.sequenceLength,
+		rawStripped:           cache.rawStripped,
 		keyCache:              make([][]*tensors.Tensor, cache.layerCount),
 		valueCache:            make([][]*tensors.Tensor, cache.layerCount),
 	}
@@ -540,6 +547,33 @@ func (cache *KVBuffer) BytesAllocated() int {
 		total += cache.previousEmbedding.Numel() * 4
 	}
 	return total
+}
+
+// RawStripped reports whether the raw key/value buffers were dropped from this
+// snapshot and must be rebuilt by bounded replay.
+func (cache *KVBuffer) RawStripped() bool { return cache.rawStripped }
+
+// StripRaw drops the raw key/value buffers and the local sliding-window tail
+// state, keeping only the global compressed KV, the cached indexer keys, and the
+// buffered compression tail. It implements the paper's persistent-cache policy
+// of not storing SWA KV; the local rows are rebuilt by ReplaySWA on a hit. It is
+// only meaningful for compressed caches, which are the only ones with a separate
+// global state.
+func (cache *KVBuffer) StripRaw() {
+	if cache.compressionRatio <= 1 {
+		return
+	}
+	for layer := 0; layer < cache.layerCount; layer++ {
+		for index := range cache.keyCache[layer] {
+			if cache.keyCache[layer][index] != nil {
+				clear(cache.keyCache[layer][index].Data)
+			}
+			if cache.valueCache[layer][index] != nil {
+				clear(cache.valueCache[layer][index].Data)
+			}
+		}
+	}
+	cache.rawStripped = true
 }
 
 // copyIndexerKeys replicates a layer's cached indexer-key projections from a

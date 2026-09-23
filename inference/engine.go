@@ -32,6 +32,11 @@ type Engine struct {
 	// (DeepSeek-V4.1 §3.2.1). It takes precedence over Prefix. It is ignored
 	// for CED models.
 	Cache *CacheManager
+	// SWACache, when non-nil, is a small short-TTL cache of full KV snapshots
+	// (including sliding-window state) checked before Cache. It is the paper's
+	// host-DRAM SWA pool: a hit avoids the bounded replay a stripped Cache entry
+	// would need.
+	SWACache *CacheManager
 	// Drafter, when set alongside Speculative, enables exact greedy speculative
 	// decoding (DeepSeek-V4.1 §2.4.3) with the given draft model.
 	Drafter *model.Transformer
@@ -81,13 +86,22 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 		config := engine.Model.Config
 		headDim := config.HeadDim()
 		store := engine.prefixStore()
+		swaStore := engine.SWACache
 
 		// 1) Batch-1 prefill of the prompt, reusing a cached prefix when the
-		// cached prompt strictly precedes the new one.
+		// cached prompt strictly precedes the new one. The full-state SWA pool
+		// is checked first; a stripped persistent entry triggers bounded replay.
 		var prefillCache *model.KVBuffer
 		matched := 0
-		if !config.CEDEnabled() && store != nil {
+		if !config.CEDEnabled() && swaStore != nil {
+			if cached, hit := swaStore.Lookup(tokens); cached != nil {
+				prefillCache = cached
+				matched = hit
+			}
+		}
+		if prefillCache == nil && !config.CEDEnabled() && store != nil {
 			if cached, hit := store.Lookup(tokens); cached != nil {
+				engine.replayLocalState(cached, tokens, hit)
 				prefillCache = cached
 				matched = hit
 			}
@@ -96,7 +110,7 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 			// When prefix caching is enabled the prefill buffer is sized to the
 			// full context so a later request can extend it in place.
 			capacity := len(tokens)
-			if store != nil && !config.CEDEnabled() {
+			if (store != nil || swaStore != nil) && !config.CEDEnabled() {
 				capacity = config.SequenceLen
 			}
 			prefillCache = model.NewKVBuffer(1, capacity, config.NumLayer, config.NumKVHead, headDim)
@@ -122,8 +136,13 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 		} else {
 			logits = engine.Model.Forward(inputIDs, prefillCache) // [1, T, vocab]
 		}
-		if store != nil && !config.CEDEnabled() {
-			store.Store(tokens, prefillCache)
+		if !config.CEDEnabled() {
+			if store != nil {
+				store.Store(tokens, prefillCache)
+			}
+			if swaStore != nil {
+				swaStore.Store(tokens, prefillCache)
+			}
 		}
 		vocab := config.VocabSize
 		rows := logits.Shape[1]

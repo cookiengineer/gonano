@@ -181,3 +181,63 @@ func TestKVCacheCodecRejectsInvalidData(t *testing.T) {
 		t.Fatalf("truncated error = %v, want io.ErrUnexpectedEOF", err)
 	}
 }
+
+func TestKVCacheCodecStrippedRoundTrip(t *testing.T) {
+	cache := populatedCache()
+	cache.StripRaw()
+	if !cache.RawStripped() {
+		t.Fatal("StripRaw must mark the cache as stripped")
+	}
+	data, err := cache.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	decoded, err := UnmarshalKVBuffer(data)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !decoded.RawStripped() {
+		t.Fatal("decoded cache lost the stripped flag")
+	}
+	if decoded.sequenceLength != cache.sequenceLength {
+		t.Fatalf("position = %d, want %d", decoded.sequenceLength, cache.sequenceLength)
+	}
+	// Raw buffers are gone.
+	for layer := 0; layer < decoded.layerCount; layer++ {
+		for _, tensor := range decoded.keyCache[layer] {
+			for _, value := range tensor.Data {
+				if value != 0 {
+					t.Fatal("stripped key cache is not zeroed")
+				}
+			}
+		}
+		for _, tensor := range decoded.valueCache[layer] {
+			for _, value := range tensor.Data {
+				if value != 0 {
+					t.Fatal("stripped value cache is not zeroed")
+				}
+			}
+		}
+	}
+	// Global compressed, indexer, and tail state survive.
+	for layer := 0; layer < cache.layerCount; layer++ {
+		if cache.compressedKey[layer] == nil {
+			continue
+		}
+		for index := range cache.compressedKey[layer] {
+			for element := 0; element < 2*cache.headDimension; element++ {
+				if decoded.compressedKey[layer][index].Data[element] != cache.compressedKey[layer][index].Data[element] {
+					t.Fatal("compressed key lost after strip round-trip")
+				}
+				if decoded.compressedValue[layer][index].Data[element] != cache.compressedValue[layer][index].Data[element] {
+					t.Fatal("compressed value lost after strip round-trip")
+				}
+			}
+			for element := 0; element < 2*cache.indexerKeyWidth; element++ {
+				if decoded.indexerKey[layer][index].Data[element] != cache.indexerKey[layer][index].Data[element] {
+					t.Fatal("indexer key lost after strip round-trip")
+				}
+			}
+		}
+	}
+}

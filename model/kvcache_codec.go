@@ -17,6 +17,7 @@ const (
 	kvFlagCompression       = 1 << 0
 	kvFlagIndexer           = 1 << 1
 	kvFlagPreviousEmbedding = 1 << 2
+	kvFlagRawStripped       = 1 << 3
 )
 
 // Per-layer serialization flags.
@@ -62,14 +63,21 @@ func (cache *KVBuffer) MarshalBinary() ([]byte, error) {
 	if cache.previousEmbedding != nil {
 		flags |= kvFlagPreviousEmbedding
 	}
+	if cache.rawStripped {
+		flags |= kvFlagRawStripped
+	}
 	writer.u32(flags)
 
-	position := int(cache.sequenceLength)
 	headDimension := cache.headDimension
-	for layer := 0; layer < cache.layerCount; layer++ {
-		for index := range cache.keyCache[layer] {
-			writer.f32s(cache.keyCache[layer][index].Data[:position*headDimension])
-			writer.f32s(cache.valueCache[layer][index].Data[:position*headDimension])
+	// A stripped snapshot omits the raw key/value buffers; bounded replay
+	// rebuilds the local sliding-window rows on load.
+	if !cache.rawStripped {
+		position := int(cache.sequenceLength)
+		for layer := 0; layer < cache.layerCount; layer++ {
+			for index := range cache.keyCache[layer] {
+				writer.f32s(cache.keyCache[layer][index].Data[:position*headDimension])
+				writer.f32s(cache.valueCache[layer][index].Data[:position*headDimension])
+			}
 		}
 	}
 
@@ -161,12 +169,15 @@ func UnmarshalKVBuffer(data []byte) (*KVBuffer, error) {
 
 	cache := NewKVBuffer(batchSize, maximumSequenceLength, layerCount, keyValueHeadCount, headDimension)
 	cache.sequenceLength = sequenceLength
+	cache.rawStripped = flags&kvFlagRawStripped != 0
 
-	position := int(sequenceLength)
-	for layer := 0; layer < layerCount; layer++ {
-		for index := range cache.keyCache[layer] {
-			reader.f32s(cache.keyCache[layer][index].Data[:position*headDimension])
-			reader.f32s(cache.valueCache[layer][index].Data[:position*headDimension])
+	if !cache.rawStripped {
+		position := int(sequenceLength)
+		for layer := 0; layer < layerCount; layer++ {
+			for index := range cache.keyCache[layer] {
+				reader.f32s(cache.keyCache[layer][index].Data[:position*headDimension])
+				reader.f32s(cache.valueCache[layer][index].Data[:position*headDimension])
+			}
 		}
 	}
 

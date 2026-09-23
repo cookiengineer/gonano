@@ -181,3 +181,51 @@ func assertSameTokens(t *testing.T, got, want []int) {
 		}
 	}
 }
+
+// TestSWAPoolGenerationMatchesFullPrefill verifies the paper's SWA pool: a
+// full-state cache checked before the stripped persistent tier yields exactly
+// the same continuation as a full prefill.
+func TestSWAPoolGenerationMatchesFullPrefill(t *testing.T) {
+	transformer, tokenizerImpl := testPrefixEngineModel()
+	engine := NewEngine(transformer, tokenizerImpl)
+	engine.Cache = NewCacheManager(CacheOptions{MaxEntries: 4, StripSWA: true})
+	engine.SWACache = NewCacheManager(CacheOptions{MaxEntries: 2, TTL: time.Minute})
+
+	prompt1 := []int{1, 5, 2, 8, 3, 7}
+	prompt2 := append(append([]int(nil), prompt1...), 4, 6, 9)
+
+	engine.GenerateBatch(prompt1, 1, 4, 0, 0, 7)
+	got, _ := engine.GenerateBatch(prompt2, 1, 6, 0, 0, 11)
+
+	referenceEngine := NewEngine(transformer, tokenizerImpl)
+	want, _ := referenceEngine.GenerateBatch(prompt2, 1, 6, 0, 0, 11)
+	assertSameTokens(t, got[0], want[0])
+}
+
+// TestStripSWAReplayRuns verifies that a stripped persistent entry is recovered
+// by bounded replay and still produces a finite continuation.
+func TestStripSWAReplayRuns(t *testing.T) {
+	transformer, tokenizerImpl := testPrefixEngineModel()
+	engine := NewEngine(transformer, tokenizerImpl)
+	engine.Cache = NewCacheManager(CacheOptions{MaxEntries: 4, StripSWA: true})
+
+	prompt1 := []int{1, 5, 2, 8, 3, 7}
+	prompt2 := append(append([]int(nil), prompt1...), 4, 6, 9)
+
+	engine.GenerateBatch(prompt1, 1, 4, 0, 0, 7)
+	for _, entry := range engine.Cache.entries {
+		if entry.state != nil && !entry.state.RawStripped() {
+			t.Fatal("stored entry should be raw-stripped")
+		}
+	}
+
+	got, _ := engine.GenerateBatch(prompt2, 1, 6, 0, 0, 11)
+	if len(got) != 1 || len(got[0]) <= len(prompt2) {
+		t.Fatalf("replay generation produced no continuation: %v", got)
+	}
+	for _, token := range got[0] {
+		if token < 0 || token >= transformer.Config.VocabSize {
+			t.Fatalf("token %d out of range", token)
+		}
+	}
+}

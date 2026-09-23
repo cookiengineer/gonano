@@ -37,6 +37,7 @@ layout.
 | MLA low-rank query / KV latent | 2.3, 4.2.1 | `model/attention.go` `projectQuery`/`projectKeyValue` | `--query-compression-dim`, `--kv-latent-dim` |
 | Global-KV prefix reuse + SWA replay | 3.2.1, 3.2.2 | `inference/prefix.go` `PrefixCache`, `Engine.Prefix` | `Engine.Prefix = NewPrefixCache(...)` |
 | Persistent multi-entry KV cache (LRU/TTL/disk) | 3.2.1 | `inference/cache.go` `CacheManager`, `model/kvcache_codec.go` | `Engine.Cache = NewCacheManager(...)` |
+| SWA pool + bounded replay (global-only persistence) | 3.2.1, 3.2.2 | `KVBuffer.StripRaw`, `Transformer.ReplaySWA`, `Engine.SWACache` | `CacheOptions.StripSWA`, `Engine.SWACache` |
 | FP4 main KV cache / FP4 indexer QAT | 2.4.4 | **not implemented** (float32-only) | — |
 | Engram, MoE, DSpark, Single-Pass mHC | 2.1, 2.4 | **not applicable / not implemented** | — |
 
@@ -281,6 +282,23 @@ Units: `TestKVCacheCodecRoundTrip`, `TestKVCacheCodecPlainRoundTrip`,
 `TestCacheManagerGenerationMatchesFullPrefill`,
 `TestCacheManagerDiskGenerationMatchesFullPrefill`.
 
+**SWA pool and bounded replay.** `CacheOptions.StripSWA` drops the raw
+sliding-window rows from compressed persistent snapshots, so only the global
+compressed KV, cached indexer keys, and the buffered compression tail are stored
+(the paper's persistent-cache policy of not retaining SWA KV). `Engine.SWACache`
+is a small short-TTL cache of *full* snapshots checked before the stripped tier,
+so common hits avoid replay; a hit only in the stripped tier is recovered by
+`Transformer.ReplaySWA`, which replays the tail of the cached prefix with the
+global state already in place. The replay share (`compressionShare.replay`)
+truncates the local branch to the replay segment, exactly as the paper specifies
+for a replay starting at position `s`. The replayed local state is approximate by
+design, except when the window covers the prefix, where it is exact.
+
+Units: `TestKVCacheCodecStrippedRoundTrip`,
+`TestReplaySWARebuildsExactWhenWindowCoversPrefix`,
+`TestReplaySWARepopulatesTailWindow`, `TestSWAPoolGenerationMatchesFullPrefill`,
+`TestStripSWAReplayRuns`.
+
 ---
 
 ## 7. Head-wise Muon for Q and K
@@ -465,9 +483,10 @@ For completeness, the paper components that are out of scope here:
   verification.** gonano implements exact greedy speculative decoding only. The
   paper's learned acceptance scheduler and semi-autoregressive draft heads are
   decode-throughput refinements that require calibrated acceptance statistics.
-- **Latent KV cache** — the low-rank KV latent reduces compute, not cache bytes.
-- **Persistent KV tier (SSD/host DRAM), EPD disaggregation, and the GPU kernel
-  fusions** (Mega-* kernels, FlashMLA): single-process CPU serving only.
+- **EPD disaggregation and the GPU kernel fusions** (Mega-* kernels, FlashMLA):
+  single-process CPU serving only.
+- **Latent KV cache** — see §5; the low-rank KV latent reduces compute, not
+  cache bytes.
 
 ---
 

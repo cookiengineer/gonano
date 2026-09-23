@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cookiengineer/gonano/model"
+	"github.com/cookiengineer/gonano/tensors"
 )
 
 // CacheOptions configures a CacheManager.
@@ -25,6 +26,11 @@ type CacheOptions struct {
 	// directory and only their metadata is kept in memory. Zero keeps every
 	// entry in memory.
 	DiskDir string
+	// StripSWA drops the raw sliding-window key/value rows from compressed
+	// snapshots (DeepSeek-V4.1 §3.2.1). A hit then needs bounded replay to
+	// rebuild them; pair it with Engine.SWACache, which keeps recent full
+	// snapshots so common hits avoid the replay.
+	StripSWA bool
 }
 
 // cacheEntry is one cached prefill.
@@ -124,22 +130,27 @@ func (cache *CacheManager) Store(tokens []int, state *model.KVBuffer) {
 	if existing, ok := cache.entries[key]; ok {
 		cache.removeEntryLocked(key, existing)
 	}
+	stored := state
+	if cache.options.StripSWA && state.CompressionEnabled() {
+		stored = state.Clone()
+		stored.StripRaw()
+	}
 	now := cache.now()
 	entry := &cacheEntry{
 		tokens:   append([]int(nil), tokens...),
-		size:     state.BytesAllocated(),
+		size:     stored.BytesAllocated(),
 		storedAt: now,
 		usedAt:   now,
 	}
 	if cache.options.DiskDir != "" {
 		path := filepath.Join(cache.options.DiskDir, key+".kv")
-		if err := saveKVFile(path, state); err == nil {
+		if err := saveKVFile(path, stored); err == nil {
 			entry.diskPath = path
 		} else {
-			entry.state = state.Clone()
+			entry.state = stored.Clone()
 		}
 	} else {
-		entry.state = state.Clone()
+		entry.state = stored.Clone()
 	}
 	cache.entries[key] = entry
 	cache.order = append(cache.order, key)
@@ -270,4 +281,31 @@ func loadKVFile(path string) (*model.KVBuffer, error) {
 		return nil, err
 	}
 	return model.UnmarshalKVBuffer(data)
+}
+
+// replayLocalState rebuilds the raw sliding-window rows of a stripped
+// persistent snapshot by replaying the tail of the cached prefix
+// (DeepSeek-V4.1 §3.2.2, bounded replay). It is a no-op when the snapshot kept
+// its raw state, when the model has no sliding window, or when the prefix is
+// empty. The replayed prefix state is approximate by design, as in the paper.
+func (engine *Engine) replayLocalState(cache *model.KVBuffer, tokens []int, position int) {
+	if cache == nil || !cache.RawStripped() {
+		return
+	}
+	window := engine.Model.Config.SWAWindowSize()
+	if window <= 0 || position <= 0 {
+		return
+	}
+	// Start one token before the window so the first needed row smears from the
+	// correct previous token.
+	start := position - window - 1
+	if start < 0 {
+		start = 0
+		// Replaying the whole prefix reproduces a fresh prefill exactly, so the
+		// stale previous embedding must not seed the first position.
+		cache.SetPrevEmbedding(nil)
+	}
+	cache.SetPosition(start)
+	indexes := tensors.NewInt32sWithData([]int{1, position - start}, toI32(tokens[start:position]))
+	engine.Model.ReplaySWA(indexes, cache)
 }
