@@ -31,6 +31,7 @@ layout.
 | Grouped-query attention | 2.1 | `model/attention.go`, `Config.NumKVHead` | `--kv-head-ratio R` |
 | Partial rotary embedding | 2.1 | `model/rotary.go`, `Config.RotaryDims` | `Config.RotaryDims` (default 64) |
 | Head-wise Muon for Q/K | 2.5 | `model/optimizer.go` `headWiseViews` | `--head-wise-muon` |
+| Sinkhorn-balanced embeddings / lm_head | 2.5 | `optimizer/sinkhorn.go`, `model/optimizer.go` `sinkhornGroup` | `--sinkhorn-embeddings` |
 | MLA low-rank query / KV latent | 2.3, 4.2.1 | `model/attention.go` `projectQuery`/`projectKeyValue` | `--query-compression-dim`, `--kv-latent-dim` |
 | Global-KV prefix reuse + SWA replay | 3.2.1, 3.2.2 | `inference/prefix.go` `PrefixCache`, `Engine.Prefix` | `Engine.Prefix = NewPrefixCache(...)` |
 | FP4 main KV cache / FP4 indexer QAT | 2.4.4 | **not implemented** (float32-only) | — |
@@ -277,6 +278,20 @@ update, giving each head its own preconditioner. In gonano:
 Units: `TestHeadWiseViewsShareStorage`,
 `TestSetupOptimizerHeadWiseSplitsQueryKey`, `TestHeadWiseMuonTrainStepFinite`.
 
+**Sinkhorn-balanced embeddings and prediction head.** `--sinkhorn-embeddings`
+routes the token embedding, `lm_head`, and value embeddings to the
+Sinkhorn-balanced momentum update instead of AdamW (Algorithm 1 of the paper):
+Nesterov momentum, masking of near-zero rows, `K=11` alternating row/column L2
+normalizations, a `√n` unit-RMS rescale, and the `γ=0.18` learning-rate
+correction, with no weight decay. Because it keeps only a momentum buffer, it
+halves the optimizer-state memory of those large `[vocab, dim]` matrices and
+matches the paper's choice for embedding tables and the prediction head. It is
+training-only; the checkpoint layout is unchanged.
+
+Units: `TestSinkhornSingleRowNormalization`, `TestSinkhornMasksNearZeroRows`,
+`TestSinkhornRowsHaveUnitRMS`, `TestSinkhornStateAllocatedAndFinite`,
+`TestSetupOptimizerSinkhornRoutesEmbeddings`, `TestSinkhornTrainStepFinite`.
+
 ---
 
 ## 8. Low-bit weights and KV were rejected
@@ -307,6 +322,7 @@ factorizations in §5. Do not expect per-token KV bytes to match the paper's
 | `--swa-window W` | 0 | Local sliding-window width on compressed layers. |
 | `--ced` | false | Causal encoder-decoder split; requires compression and SWA. |
 | `--head-wise-muon` | false | Split Q/K by head for Muon (training-only). |
+| `--sinkhorn-embeddings` | false | Sinkhorn-balanced update for embedding/lm_head/value embeds (training-only). |
 | `--query-compression-dim R` | 0 | Low-rank query bottleneck width. |
 | `--kv-latent-dim R` | 0 | Shared low-rank KV latent width. |
 | `--kv-head-ratio R` | 1 | Query heads per KV head (GQA). |

@@ -17,11 +17,15 @@ import (
 type Kind int
 
 const (
-	// KindAdamW routes a group to the AdamW optimizer (embeddings, scalars,
-	// the unembedding layer, and other non-matrix parameters).
+	// KindAdamW routes a group to the AdamW optimizer (scalars, normalization
+	// weights, and other non-matrix parameters).
 	KindAdamW Kind = iota
 	// KindMuon routes a group to the Muon optimizer (2D matrix parameters).
 	KindMuon
+	// KindSinkhorn routes a group to the Sinkhorn-balanced momentum update
+	// (DeepSeek-V4.1 §2.5, Algorithm 1), used for the large embedding tables
+	// and the prediction head.
+	KindSinkhorn
 )
 
 // ParamGroup describes a group of parameters that share optimizer
@@ -41,6 +45,15 @@ type ParamGroup struct {
 	Momentum  float32
 	NSSteps   int
 	MuonBeta2 float32
+
+	// Sinkhorn hyperparameters (DeepSeek-V4.1 §2.5, Algorithm 1). Gamma is the
+	// learning-rate correction factor, SinkhornSteps the odd number of
+	// alternating normalizations, SinkhornTau the near-zero row-mask threshold,
+	// and SinkhornEps the normalization epsilon.
+	Gamma         float32
+	SinkhornSteps int
+	SinkhornTau   float32
+	SinkhornEps   float32
 }
 
 // adamwState is the per-parameter optimizer state for AdamW.
@@ -58,18 +71,20 @@ type muonState struct {
 
 // MuonAdamW is the combined Muon + AdamW optimizer.
 type MuonAdamW struct {
-	Groups     []ParamGroup
-	step       int
-	adamStates map[*tensors.Tensor]*adamwState
-	muonStates map[*tensors.Tensor]*muonState
+	Groups         []ParamGroup
+	step           int
+	adamStates     map[*tensors.Tensor]*adamwState
+	muonStates     map[*tensors.Tensor]*muonState
+	sinkhornStates map[*tensors.Tensor]*sinkhornState
 }
 
 // NewMuonAdamW builds the optimizer with the given parameter groups.
 func NewMuonAdamW(groups []ParamGroup) *MuonAdamW {
 	optimizer := &MuonAdamW{
-		Groups:     groups,
-		adamStates: make(map[*tensors.Tensor]*adamwState),
-		muonStates: make(map[*tensors.Tensor]*muonState),
+		Groups:         groups,
+		adamStates:     make(map[*tensors.Tensor]*adamwState),
+		muonStates:     make(map[*tensors.Tensor]*muonState),
+		sinkhornStates: make(map[*tensors.Tensor]*sinkhornState),
 	}
 	for _, group := range groups {
 		for _, param := range group.Params {
@@ -87,6 +102,10 @@ func NewMuonAdamW(groups []ParamGroup) *MuonAdamW {
 				optimizer.muonStates[param] = &muonState{
 					momentum:  tensors.New(param.Shape...),
 					secondMom: tensors.New(reduceDim),
+				}
+			case KindSinkhorn:
+				optimizer.sinkhornStates[param] = &sinkhornState{
+					momentum: tensors.New(param.Shape...),
 				}
 			}
 		}
@@ -107,6 +126,10 @@ func (optimizer *MuonAdamW) Step() {
 		case KindMuon:
 			for _, param := range group.Params {
 				optimizer.muonStep(group, param)
+			}
+		case KindSinkhorn:
+			for _, param := range group.Params {
+				optimizer.sinkhornStep(group, param)
 			}
 		}
 	}

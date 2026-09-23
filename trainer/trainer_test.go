@@ -64,7 +64,7 @@ func TestTrainerOverfitsTiny(tester *testing.T) {
 	}
 	transformer := model.NewTransformer(config)
 	transformer.InitWeights(tensors.NewRNG(0))
-	groups := transformer.SetupOptimizer(0.01, 0.1, 0.01, 0.0, 0.1)
+	groups := transformer.SetupOptimizer(0.01, 0.1, 0.01, 0.0, 0.1, false)
 	trainer := NewTrainer(transformer, groups, 1)
 	trainer.WarmupSteps = 2
 	trainer.WarmdownRatio = 0.0

@@ -21,7 +21,7 @@ func TestEndToEnd(t *testing.T) {
 	}
 	m := model.NewTransformer(cfg)
 	m.InitWeights(tensors.NewRNG(0))
-	groups := m.SetupOptimizer(0.01, 0.1, 0.01, 0.0, 0.1)
+	groups := m.SetupOptimizer(0.01, 0.1, 0.01, 0.0, 0.1, false)
 	tr := trainer.NewTrainer(m, groups, 1)
 	tr.WarmupSteps = 2
 	tr.WarmdownRatio = 0

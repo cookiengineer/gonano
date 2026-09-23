@@ -40,7 +40,7 @@ func TestTrainSFT(tester *testing.T) {
 	}
 	loader := data.NewSFTLoader(tokenizerInstance, 1, 32, provider, 5)
 
-	groups := transformer.SetupOptimizer(0.01, 0.1, 0.01, 0.0, 0.1)
+	groups := transformer.SetupOptimizer(0.01, 0.1, 0.01, 0.0, 0.1, false)
 	losses := TrainSFT(transformer, groups, loader, 20, nil)
 	if len(losses) == 0 {
 		tester.Fatal("no losses recorded")
@@ -76,7 +76,7 @@ func TestPolicyGradientStep(tester *testing.T) {
 
 func TestRLStep(tester *testing.T) {
 	transformer, _ := newSFTModel()
-	groups := transformer.SetupOptimizer(0.01, 0.1, 0.01, 0.0, 0.1)
+	groups := transformer.SetupOptimizer(0.01, 0.1, 0.01, 0.0, 0.1, false)
 	optimizer := optimizer.NewMuonAdamW(groups)
 	inputs := tensors.NewInt32sWithData([]int{1, 4}, []int32{1, 2, 3, 4})
 	targets := tensors.NewInt32sWithData([]int{1, 4}, []int32{2, 3, 4, 5})

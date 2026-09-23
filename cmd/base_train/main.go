@@ -32,6 +32,7 @@ func main() {
 	swaWindow := flag.Int("swa-window", 0, "local sliding-window branch width on compressed layers (0 disables)")
 	ced := flag.Bool("ced", false, "causal encoder-decoder split (decoder global KV from the encoder hidden state; requires --compression-ratio and --swa-window)")
 	headWiseMuon := flag.Bool("head-wise-muon", false, "split query/key projection weights by attention head for the Muon update")
+	sinkhornEmbeddings := flag.Bool("sinkhorn-embeddings", false, "Sinkhorn-balanced momentum update for the embedding table, lm_head, and value embeddings")
 	queryCompressionDim := flag.Int("query-compression-dim", 0, "low-rank query bottleneck width (0 = full-rank)")
 	kvLatentDim := flag.Int("kv-latent-dim", 0, "shared low-rank KV latent width (0 = full-rank)")
 	vocabSize := flag.Int("vocab-size", 32768, "vocabulary size")
@@ -80,7 +81,7 @@ func main() {
 	model.InitWeights(tensors.NewRNG(42))
 
 	// Optimizer groups and training hyperparameters.
-	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5)
+	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, *sinkhornEmbeddings)
 
 	// Data source.
 	var provider data.DocProvider

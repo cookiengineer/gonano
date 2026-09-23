@@ -58,7 +58,7 @@ func main() {
 	}
 	loader := data.NewSFTLoader(tokenizer, *batchSize, *maxSeqLen, provider, 100)
 
-	groups := model.SetupOptimizer(0.008, 0.2, 0.02, 0.0, 0.5)
+	groups := model.SetupOptimizer(0.008, 0.2, 0.02, 0.0, 0.5, false)
 	trainer.TrainSFT(model, groups, loader, *numIterations, func(step int, loss float32) {
 		if step%20 == 0 {
 			logger.Info("sft", "step", step, "loss", fmt.Sprintf("%.4f", loss))

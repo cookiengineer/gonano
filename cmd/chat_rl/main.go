@@ -53,7 +53,7 @@ func main() {
 		{Question: "What is 3+3?", Answer: "#### 6"},
 	})
 
-	groups := model.SetupOptimizer(0.004, 0.2, 0.02, 0.0, 0.5)
+	groups := model.SetupOptimizer(0.004, 0.2, 0.02, 0.0, 0.5, false)
 	for index := range groups {
 		groups[index].LR *= 0.05
 	}

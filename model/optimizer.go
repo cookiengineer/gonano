@@ -11,7 +11,12 @@ import (
 // setup_optimizer: embeddings, the unembedding layer, and scalars use AdamW;
 // the 2D matrix parameters use Muon, grouped by shape. Learning rates for the
 // AdamW groups are scaled by 1/sqrt(model_dim/768).
-func (model *Transformer) SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, weightDecay, scalarLR float32) []optimizer.ParamGroup {
+//
+// When sinkhorn is true the embedding table, the unembedding layer, and the
+// value embeddings are routed to the Sinkhorn-balanced momentum update
+// (DeepSeek-V4.1 §2.5, Algorithm 1) instead of AdamW, which halves their
+// optimizer-state memory.
+func (model *Transformer) SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, weightDecay, scalarLR float32, sinkhorn bool) []optimizer.ParamGroup {
 	modelDimension := model.Config.EmbedDim
 
 	// Separate out the matrix parameters (transformer block Linear weights).
@@ -69,14 +74,25 @@ func (model *Transformer) SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, w
 
 	modelDimensionLRScale := float32(math.Pow(float64(modelDimension)/768.0, -0.5))
 
-	groups := []optimizer.ParamGroup{
-		{Kind: optimizer.KindAdamW, Params: []*tensors.Tensor{model.lmHead.Weight}, LR: unembeddingLR * modelDimensionLRScale, Beta1: 0.8, Beta2: 0.96, Eps: 1e-10, WeightDecay: 0.01},
-		{Kind: optimizer.KindAdamW, Params: []*tensors.Tensor{model.tokenEmbedding.Weight}, LR: embeddingLR * modelDimensionLRScale, Beta1: 0.8, Beta2: 0.995, Eps: 1e-10, WeightDecay: 0.001},
-		{Kind: optimizer.KindAdamW, Params: valueEmbeddingParameters, LR: embeddingLR * modelDimensionLRScale * 0.5, Beta1: 0.8, Beta2: 0.995, Eps: 1e-10, WeightDecay: 0.01},
-		{Kind: optimizer.KindAdamW, Params: []*tensors.Tensor{model.residLambdas}, LR: scalarLR * 0.01, Beta1: 0.8, Beta2: 0.95, Eps: 1e-10, WeightDecay: 0.05},
-		{Kind: optimizer.KindAdamW, Params: []*tensors.Tensor{model.x0Lambdas}, LR: scalarLR, Beta1: 0.96, Beta2: 0.95, Eps: 1e-10, WeightDecay: 0.0},
-		{Kind: optimizer.KindAdamW, Params: smearParameters, LR: 0.2, Beta1: 0.8, Beta2: 0.95, Eps: 1e-10, WeightDecay: 0.0},
+	groups := make([]optimizer.ParamGroup, 0, 8)
+	if sinkhorn {
+		groups = append(groups,
+			sinkhornGroup([]*tensors.Tensor{model.lmHead.Weight}, unembeddingLR*modelDimensionLRScale),
+			sinkhornGroup([]*tensors.Tensor{model.tokenEmbedding.Weight}, embeddingLR*modelDimensionLRScale),
+			sinkhornGroup(valueEmbeddingParameters, embeddingLR*modelDimensionLRScale*0.5),
+		)
+	} else {
+		groups = append(groups,
+			optimizer.ParamGroup{Kind: optimizer.KindAdamW, Params: []*tensors.Tensor{model.lmHead.Weight}, LR: unembeddingLR * modelDimensionLRScale, Beta1: 0.8, Beta2: 0.96, Eps: 1e-10, WeightDecay: 0.01},
+			optimizer.ParamGroup{Kind: optimizer.KindAdamW, Params: []*tensors.Tensor{model.tokenEmbedding.Weight}, LR: embeddingLR * modelDimensionLRScale, Beta1: 0.8, Beta2: 0.995, Eps: 1e-10, WeightDecay: 0.001},
+			optimizer.ParamGroup{Kind: optimizer.KindAdamW, Params: valueEmbeddingParameters, LR: embeddingLR * modelDimensionLRScale * 0.5, Beta1: 0.8, Beta2: 0.995, Eps: 1e-10, WeightDecay: 0.01},
+		)
 	}
+	groups = append(groups,
+		optimizer.ParamGroup{Kind: optimizer.KindAdamW, Params: []*tensors.Tensor{model.residLambdas}, LR: scalarLR * 0.01, Beta1: 0.8, Beta2: 0.95, Eps: 1e-10, WeightDecay: 0.05},
+		optimizer.ParamGroup{Kind: optimizer.KindAdamW, Params: []*tensors.Tensor{model.x0Lambdas}, LR: scalarLR, Beta1: 0.96, Beta2: 0.95, Eps: 1e-10, WeightDecay: 0.0},
+		optimizer.ParamGroup{Kind: optimizer.KindAdamW, Params: smearParameters, LR: 0.2, Beta1: 0.8, Beta2: 0.95, Eps: 1e-10, WeightDecay: 0.0},
+	)
 
 	// Muon groups, binned by shape.
 	parametersByShape := map[[2]int][]*tensors.Tensor{}
@@ -96,6 +112,22 @@ func (model *Transformer) SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, w
 		})
 	}
 	return groups
+}
+
+// sinkhornGroup builds a Sinkhorn-balanced parameter group with the
+// DeepSeek-V4.1 §2.5 configuration: K=11 odd alternating normalizations,
+// tau=1e-3, epsilon=1e-20, gamma=0.18, and the same momentum as Muon.
+func sinkhornGroup(params []*tensors.Tensor, learningRate float32) optimizer.ParamGroup {
+	return optimizer.ParamGroup{
+		Kind:          optimizer.KindSinkhorn,
+		Params:        params,
+		LR:            learningRate,
+		Momentum:      0.95,
+		Gamma:         0.18,
+		SinkhornSteps: 11,
+		SinkhornTau:   1e-3,
+		SinkhornEps:   1e-20,
+	}
 }
 
 // headWiseViews splits a [heads*headDim, columns] weight matrix into `heads`

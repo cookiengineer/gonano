@@ -40,6 +40,7 @@ func main() {
 		swaWindow         int
 		ced               bool
 		headWiseMuon      bool
+		sinkhornEmbedding bool
 		queryCompression  int
 		kvLatentDim       int
 		numIterations     int
@@ -65,6 +66,7 @@ func main() {
 	flag.IntVar(&swaWindow, "swa-window", 0, "local sliding-window branch width on compressed layers (0 disables)")
 	flag.BoolVar(&ced, "ced", false, "causal encoder-decoder split (decoder global KV from the encoder hidden state; requires --compression-ratio and --swa-window)")
 	flag.BoolVar(&headWiseMuon, "head-wise-muon", false, "split query/key projection weights by attention head for the Muon update")
+	flag.BoolVar(&sinkhornEmbedding, "sinkhorn-embeddings", false, "Sinkhorn-balanced momentum update for the embedding table, lm_head, and value embeddings")
 	flag.IntVar(&queryCompression, "query-compression-dim", 0, "low-rank query bottleneck width (0 = full-rank)")
 	flag.IntVar(&kvLatentDim, "kv-latent-dim", 0, "shared low-rank KV latent width (0 = full-rank)")
 	flag.IntVar(&numIterations, "num-iterations", 50, "optimization steps")
@@ -104,7 +106,7 @@ func main() {
 	configuration.KVLatentDim = kvLatentDim
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
-	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5)
+	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, sinkhornEmbedding)
 
 	// 3) Data source.
 	source, err := newDocProvider(dataDir, format)

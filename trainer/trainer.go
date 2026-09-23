@@ -69,9 +69,15 @@ func (trainer *Trainer) StepOptimizer(step, numIterations int) {
 	for index := range trainer.Optim.Groups {
 		group := &trainer.Optim.Groups[index]
 		group.LR = trainer.initialLRs[index] * lrMultiplier
-		if group.Kind == optimizer.KindMuon {
+		switch group.Kind {
+		case optimizer.KindMuon:
 			group.Momentum = momentum
 			group.WeightDecay = weightDecay
+		case optimizer.KindSinkhorn:
+			// The Sinkhorn-balanced update uses the Muon momentum schedule but
+			// applies no weight decay (DeepSeek-V4.1 §2.5).
+			group.Momentum = momentum
+			group.WeightDecay = 0
 		}
 	}
 	trainer.Optim.Step()

@@ -244,8 +244,8 @@ calculator, plus any tools you register in `cmd/server`). See
 See `guides/00-quickstart.md` for a copy-pasteable ArchLinux setup, and `guides/` for the
 step-by-step training, export, deployment, and debugging guides. The long-context
 attention design and the DeepSeek-V4.1-Flash optimizations (CED, CSA2 reuse, the
-hierarchical sparse indexer, low-rank query/KV, the KV prefix cache, and head-wise
-Muon) are documented in `guides/05-deepseek-v4.1-optimizations.md`.
+hierarchical sparse indexer, low-rank query/KV, the KV prefix cache, head-wise
+Muon, and Sinkhorn-balanced embeddings) are documented in `guides/05-deepseek-v4.1-optimizations.md`.
 
 ## Packages
 
@@ -258,7 +258,7 @@ Muon) are documented in `guides/05-deepseek-v4.1-optimizations.md`.
 | `model`             | The nanochat GPT transformer (RoPE, QK-norm, GQA, value embeddings, sliding windows) + training forward/backward |
 | `model/layers`      | Neural-network building blocks: linear layers, embeddings, initializers                                          |
 | `model/checkpoint`  | Versioned binary checkpoint save/load + GGUF export                                                              |
-| `optimizer`         | AdamW + Muon (Polar Express) + MuonAdamW                                                                         |
+| `optimizer`         | AdamW + Muon (Polar Express) + Sinkhorn-balanced momentum + MuonAdamW                                            |
 | `tokenizer`         | Byte-level BPE training/inference + chat rendering                                                               |
 | `data`              | Parquet reader, Snappy, HF-Hub download, Markdown source, BOS-aligned dataloaders                                |
 | `trainer`           | Scaling laws, schedulers, pretraining/SFT/RL loops                                                               |
