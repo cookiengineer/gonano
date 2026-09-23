@@ -72,7 +72,7 @@ func main() {
 		{Question: "What is 3+3?", Answer: "#### 6"},
 	})
 
-	groups := student.SetupOptimizer(0.008, 0.2, 0.02, 0.0, 0.5, false)
+	groups := student.SetupOptimizer(0.008, 0.2, 0.02, 0.0, 0.5, true)
 	for index := range groups {
 		groups[index].LR *= 0.05
 	}

@@ -22,25 +22,7 @@ import (
 func main() {
 	depth := flag.Int("depth", 12, "transformer depth (complexity dial)")
 	maxSeqLen := flag.Int("max-seq-len", 512, "context length")
-	kvHeadRatio := flag.Int("kv-head-ratio", 1, "query heads per key/value head (1 = MHA, >1 = GQA)")
-	compressionRatio := flag.Int("compression-ratio", 0, "HCA-style dense KV compression ratio (0/1 disables)")
-	sparseTopK := flag.Int("sparse-topk", 0, "CSA sparse attention top-k compressed blocks (0 disables)")
-	indexerDim := flag.Int("indexer-dim", 64, "lightning indexer per-head dimension")
-	indexerPool := flag.Int("indexer-pool", 0, "hierarchical indexer super-block size (0 disables)")
-	indexerCandidates := flag.Int("indexer-candidates", 0, "hierarchical indexer candidate budget (0 = auto)")
-	reusePattern := flag.String("reuse-pattern", "", "cross-layer reuse pattern of F/R/U per layer (empty = all full)")
-	swaWindow := flag.Int("swa-window", 0, "local sliding-window branch width on compressed layers (0 disables)")
-	ced := flag.Bool("ced", false, "causal encoder-decoder split (decoder global KV from the encoder hidden state; requires --compression-ratio and --swa-window)")
-	headWiseMuon := flag.Bool("head-wise-muon", false, "split query/key projection weights by attention head for the Muon update")
-	sinkhornEmbeddings := flag.Bool("sinkhorn-embeddings", false, "Sinkhorn-balanced momentum update for the embedding table, lm_head, and value embeddings")
-	queryCompressionDim := flag.Int("query-compression-dim", 0, "low-rank query bottleneck width (0 = full-rank)")
-	kvLatentDim := flag.Int("kv-latent-dim", 0, "shared low-rank KV latent width (0 = full-rank)")
-	mlaLatent := flag.Int("mla-latent", 0, "absorbed MLA shared latent width (0 disables; must be trained from scratch)")
-	mlaRotaryDims := flag.Int("mla-rotary-dims", 0, "MLA decoupled rotary width (0 = headDim/2)")
-	moe := flag.Bool("moe", false, "enable the DeepSeekMoE feed-forward (shared + routed experts); size derived from --depth")
-	numExperts := flag.Int("num-experts", 0, "routed expert count (0 = derived from --depth when --moe is set)")
-	expertsPerToken := flag.Int("experts-per-token", 0, "routed experts activated per token (0 = 2)")
-	expertHiddenDim := flag.Int("expert-hidden-dim", 0, "routed and shared expert intermediate width (0 = embedding dim)")
+	presetName := flag.String("preset", string(model.DefaultPreset), "architecture preset: flash (DeepSeek-V4.1 long-context + MoE), latent (absorbed MLA + MoE), dense (classic)")
 	vocabSize := flag.Int("vocab-size", 32768, "vocabulary size")
 	numIterations := flag.Int("num-iterations", 50, "optimization steps")
 	deviceBatchSize := flag.Int("device-batch-size", 1, "per-step batch size")
@@ -55,6 +37,12 @@ func main() {
 		*baseDir = data.BaseDir()
 	}
 	logger := logging.Default(slog.LevelInfo)
+
+	preset, err := model.ParsePreset(*presetName)
+	if err != nil {
+		logger.Error("invalid preset", "err", err)
+		os.Exit(1)
+	}
 
 	// Tokenizer: load a trained tokenizer if present, else fall back to a
 	// byte-level tokenizer for smoke runs.
@@ -71,34 +59,14 @@ func main() {
 		}
 	}
 
-	configuration := model.ConfigForDepthRatio(*depth, tokenizer.VocabSize(), 64, 128, *maxSeqLen, "SSSL", *kvHeadRatio)
-	configuration.CompressionRatio = *compressionRatio
-	configuration.SparseTopK = *sparseTopK
-	configuration.IndexerDim = *indexerDim
-	configuration.IndexerPool = *indexerPool
-	configuration.IndexerCandidates = *indexerCandidates
-	configuration.ReusePattern = *reusePattern
-	configuration.SWAWindow = *swaWindow
-	configuration.CED = *ced
-	configuration.HeadWiseMuon = *headWiseMuon
-	configuration.QueryCompressionDim = *queryCompressionDim
-	configuration.KVLatentDim = *kvLatentDim
-	configuration.MLALatent = *mlaLatent
-	configuration.MLARotaryDims = *mlaRotaryDims
-	if *moe {
-		configuration.NumExperts = *numExperts
-		if configuration.NumExperts == 0 {
-			configuration.NumExperts = model.MoEExpertsForDepth(*depth)
-		}
-		configuration.NumExpertsPerToken = *expertsPerToken
-		configuration.ExpertHiddenDim = *expertHiddenDim
-		configuration.ApplyMoEDefaults()
-	}
+	// The preset selects the whole architecture: compression, sparsity,
+	// cross-layer reuse, SWA, CED, MoE, GQA, head-wise Muon, and Sinkhorn.
+	configuration := model.ConfigForPreset(preset, *depth, tokenizer.VocabSize(), 64, 128, *maxSeqLen, "SSSL")
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 
 	// Optimizer groups and training hyperparameters.
-	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, *sinkhornEmbeddings)
+	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, preset.UsesSinkhorn())
 
 	// Data source.
 	var provider data.DocProvider

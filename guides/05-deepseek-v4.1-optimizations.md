@@ -19,26 +19,30 @@ layout.
 
 ## 1. Concept map
 
+The whole stack below is **on by default** through the `flash` preset; the
+`latent` and `dense` presets are alternates. The "Enable with" column names the
+preset (or runtime API) that turns each concept on.
+
 | Paper concept | § | Implemented in | Enable with |
 |---|---|---|---|
-| Causal Encoder-Decoder (CED) | 2.2 | `model/transformer.go` `PrefillCED`, `model/train_transformer.go`, `model/train.go` | `--ced` |
-| Decoder SWA bounded replay | 2.2, 3.2.2 | `PrefillCED` phase 3 | implied by `--ced --swa-window` |
-| HCA dense KV compression | 2.3 | `model/compress.go` `ChannelCompressor` | `--compression-ratio N` |
-| CSA sparse attention | 2.3 | `model/indexer.go` `SparseIndexer` | `--sparse-topk K` |
-| Cross-layer KV + index reuse (Full/Reindex/Reuse) | 2.3.1 | `model/config.go` `ReusePattern`, `model/share.go`, `forwardCompressedSparse`, `sparseTrainingPlan` | `--reuse-pattern FRUU` |
-| Hierarchical sparse indexer | 2.3.2 | `model/indexer.go` `SelectProjectedWithCandidates`, block-max candidate pool | `--indexer-pool P` |
-| Local sliding-window branch (SWA) | 2.2 | `model/compress_attention.go` `mergeAttentionBranches` | `--swa-window W` |
-| Grouped-query attention | 2.1 | `model/attention.go`, `Config.NumKVHead` | `--kv-head-ratio R` |
-| Partial rotary embedding | 2.1 | `model/rotary.go`, `Config.RotaryDims` | `Config.RotaryDims` (default 64) |
-| Mixture-of-Experts (DeepSeekMoE) | 2.1, 4.2.1 | `model/moe.go`, `model/mlp.go` | `--moe` |
-| Clamped SwiGLU experts | 4.2.1 | `kernels/backend.go` (`SwiGLU`), `tensors.SwiGLU` | implied by `--moe` |
-| Auxiliary-loss-free load balancing | 2.1.1, 4.2.2 | `MoE.updateRouterBias`, `Transformer.UpdateRouterBias` | implied by `--moe` |
-| Head-wise Muon for Q/K | 2.5 | `model/optimizer.go` `headWiseViews` | `--head-wise-muon` |
-| Sinkhorn-balanced embeddings / lm_head | 2.5 | `optimizer/sinkhorn.go`, `model/optimizer.go` `sinkhornGroup` | `--sinkhorn-embeddings` |
+| Causal Encoder-Decoder (CED) | 2.2 | `model/transformer.go` `PrefillCED`, `model/train_transformer.go`, `model/train.go` | `flash` |
+| Decoder SWA bounded replay | 2.2, 3.2.2 | `PrefillCED` phase 3 | `flash` |
+| HCA dense KV compression | 2.3 | `model/compress.go` `ChannelCompressor` | `flash` |
+| CSA sparse attention | 2.3 | `model/indexer.go` `SparseIndexer` | `flash` |
+| Cross-layer KV + index reuse (Full/Reindex/Reuse) | 2.3.1 | `model/config.go` `ReusePattern`, `model/share.go`, `forwardCompressedSparse`, `sparseTrainingPlan` | `flash` |
+| Hierarchical sparse indexer | 2.3.2 | `model/indexer.go` `SelectProjectedWithCandidates`, block-max candidate pool | `flash` |
+| Local sliding-window branch (SWA) | 2.2 | `model/compress_attention.go` `mergeAttentionBranches` | `flash` |
+| Grouped-query attention | 2.1 | `model/attention.go`, `Config.NumKVHead` | `flash` / `latent` |
+| Partial rotary embedding | 2.1 | `model/rotary.go`, `Config.RotaryDims` | default 64 |
+| Mixture-of-Experts (DeepSeekMoE) | 2.1, 4.2.1 | `model/moe.go`, `model/mlp.go` | `flash` / `latent` |
+| Clamped SwiGLU experts | 4.2.1 | `kernels/backend.go` (`SwiGLU`), `tensors.SwiGLU` | MoE (default on) |
+| Auxiliary-loss-free load balancing | 2.1.1, 4.2.2 | `MoE.updateRouterBias`, `Transformer.UpdateRouterBias` | MoE (default on) |
+| Head-wise Muon for Q/K | 2.5 | `model/optimizer.go` `headWiseViews` | `flash` |
+| Sinkhorn-balanced embeddings / lm_head | 2.5 | `optimizer/sinkhorn.go`, `model/optimizer.go` `sinkhornGroup` | all presets except `dense` |
 | Full-vocabulary on-policy distillation (OPD) | 5.2.4 | `tensors/loss.go` (`DistillationLossPerPosition`), `trainer/distill.go` | `cmd/chat_opd` |
 | DSpark semi-autoregressive drafting + survival scheduler | 2.4.3 | `model/dspark.go` (`DSpark`), `inference/speculative.go` | `--drafter` + `--speculative` |
-| MLA low-rank query / KV latent | 2.3, 4.2.1 | `model/attention.go` `projectQuery`/`projectKeyValue` | `--query-compression-dim`, `--kv-latent-dim` |
-| Absorbed MLA latent cache | 2.3, 4.2.1 | `model/mla.go`, `KVBuffer.EnableMLA` | `--mla-latent`, `--mla-rotary-dims` |
+| MLA low-rank query / KV latent | 2.3, 4.2.1 | `model/attention.go` `projectQuery`/`projectKeyValue` | `model.Config` fields |
+| Absorbed MLA latent cache | 2.3, 4.2.1 | `model/mla.go`, `KVBuffer.EnableMLA` | `latent` |
 | Global-KV prefix reuse + SWA replay | 3.2.1, 3.2.2 | `inference/prefix.go` `PrefixCache`, `Engine.Prefix` | `Engine.Prefix = NewPrefixCache(...)` |
 | Persistent multi-entry KV cache (LRU/TTL/disk) | 3.2.1 | `inference/cache.go` `CacheManager`, `model/kvcache_codec.go` | `Engine.Cache = NewCacheManager(...)` |
 | SWA pool + bounded replay (global-only persistence) | 3.2.1, 3.2.2 | `KVBuffer.StripRaw`, `Transformer.ReplaySWA`, `Engine.SWACache` | `CacheOptions.StripSWA`, `Engine.SWACache` |
@@ -548,47 +552,63 @@ factorizations in §5. Do not expect per-token KV bytes to match the paper's
 
 ## 9. Configuration reference
 
-### 9.1 Flags (`cmd/base_train`, `cmd/trainer`)
+### 9.1 Presets (`cmd/base_train`, `cmd/trainer`)
 
-| Flag | Default | Meaning |
+The architecture is selected with a single flag, `--preset`. The recommended
+DeepSeek-V4.1-Flash stack is the default, so a training run needs no
+feature flags at all.
+
+| Preset | Default | What it enables |
 |---|---|---|
-| `--compression-ratio N` | 0 | HCA dense KV compression; each `N` rows become one entry. Requires `N > 1` to activate. |
-| `--sparse-topk K` | 0 | CSA top-k compressed blocks per query; requires compression. |
-| `--indexer-dim D` | 64 | Lightning-indexer per-head dimension. |
-| `--indexer-pool P` | 0 | Hierarchical indexer super-block size; `>1` enables coarse-to-fine. |
-| `--indexer-candidates C` | 0 | Candidate budget; `0` = `max(8*K, 64)`. |
-| `--reuse-pattern F/R/U` | "" | Cross-layer reuse cycle; must start with `F`. |
-| `--swa-window W` | 0 | Local sliding-window width on compressed layers. |
-| `--ced` | false | Causal encoder-decoder split; requires compression and SWA. |
-| `--head-wise-muon` | false | Split Q/K by head for Muon (training-only). |
-| `--sinkhorn-embeddings` | false | Sinkhorn-balanced update for embedding/lm_head/value embeds (training-only). |
-| `--query-compression-dim R` | 0 | Low-rank query bottleneck width. |
-| `--kv-latent-dim R` | 0 | Shared low-rank KV latent width. |
-| `--kv-head-ratio R` | 1 | Query heads per KV head (GQA). |
-| `--moe` | false | Enable the DeepSeekMoE feed-forward (shared + routed experts). |
-| `--num-experts E` | 0 | Routed expert count (`0` = derived from `--depth`). |
-| `--experts-per-token K` | 0 | Routed experts activated per token (`0` = 2). |
-| `--expert-hidden-dim H` | 0 | Routed and shared expert intermediate width (`0` = embedding width). |
+| `flash` | ✓ | HCA compression (ratio 4), CSA sparse attention (top-k 8), hierarchical indexer (pool 8), cross-layer reuse (`FRU`), SWA (128), CED, SwiGLU DeepSeekMoE, GQA, head-wise Muon, partial RoPE, Sinkhorn embeddings/head |
+| `latent` | | Absorbed MLA + SwiGLU DeepSeekMoE + GQA + partial RoPE + Sinkhorn |
+| `dense` | | The historical dense nanochat decoder (full attention, ReLU² MLP, no MoE) |
 
-### 9.2 Config fields (`model.Config`, persisted in the checkpoint)
+The remaining flags are the ordinary training controls, not architecture
+switches: `--depth`, `--max-seq-len`, `--vocab-size`, `--num-iterations`,
+`--device-batch-size`, `--total-batch-size`, `--data-dir`, `--data-format`,
+`--model-tag`, `--base-dir` (plus the tokenizer flags on `cmd/trainer`).
 
-`RotaryDims`, `IndexerHeads`, `IndexerLossWeight` exist as fields but are not
-exposed as CLI flags; set them when building a `Config` directly. `Config.Validate`
-enforces the cross-field rules (sparse requires compression, CED requires
-compression + SWA, the reuse pattern must start with `F`, etc.).
+The former per-feature flags (`--compression-ratio`, `--sparse-topk`,
+`--indexer-*`, `--reuse-pattern`, `--swa-window`, `--ced`, `--head-wise-muon`,
+`--sinkhorn-embeddings`, `--query-compression-dim`, `--kv-latent-dim`,
+`--mla-*`, `--moe`, `--num-experts`, `--experts-per-token`,
+`--expert-hidden-dim`, `--kv-head-ratio`) have been removed: the preset is the
+best default, and the exact numbers are derived from `--depth` and the
+embedding width.
 
-### 9.3 Recommended long-context configuration
+### 9.2 Programmatic configuration (`model.Config`)
 
-```
---compression-ratio 4 --sparse-topk 8 --indexer-pool 8 --reuse-pattern FRU \
---swa-window 128 --ced
+`model.Config` still carries every field, and it is serialized into each
+checkpoint, so a loaded model reconstructs its architecture exactly. Library
+callers get the same defaults without the CLI:
+
+```go
+preset, _ := model.ParsePreset("flash") // "" also selects the default
+cfg := model.ConfigForPreset(preset, depth, vocabSize, 64, 128, seqLen, "SSSL")
+model := model.NewTransformer(cfg)
+groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, preset.UsesSinkhorn())
 ```
 
-Add `--query-compression-dim 64 --kv-latent-dim 64` for the low-rank variant
-(requires training from scratch). Add `--swa-window`/`--ced` only when local
-fidelity matters more than the last few percent of decode throughput; a
-decode-only short-prompt workload is often faster with plain compression +
-sparsity.
+`Config.ApplyPreset` only turns *on* disabled options, so an explicit
+configuration is never silently broadened. MoE shape (`NumExperts`,
+`NumExpertsPerToken`, `ExpertHiddenDim`, `SharedExpertHiddenDim`) defaults to
+`max(8, 2·depth)` experts, top-2, with an expert width equal to the embedding
+width. `Config.Validate` still enforces the cross-field rules (sparse requires
+compression, CED requires compression + SWA, MLA excludes the compression
+stack and head-wise Muon, etc.).
+
+### 9.3 Recommended configuration
+
+The recommended long-context configuration **is the default**:
+
+```bash
+go run ./cmd/base_train --depth 12 --max-seq-len 8192
+```
+
+which is equivalent to the explicit `flash` preset. Use `--preset latent` for
+the absorbed-MLA variant (smaller KV and parameter count, at the cost of the
+compression/sparse stack) and `--preset dense` for the classic decoder.
 
 ---
 
@@ -601,8 +621,7 @@ sequence lengths:
 ```bash
 SEQS=4096,16384 BATCH_SIZES=1,16,64 DECODE_TOKENS=16 ./benchmark_longctx.sh
 
-CONFIG="--compression-ratio 4 --sparse-topk 8 --indexer-pool 8 \
-        --reuse-pattern FRU --swa-window 128 --ced" ./benchmark_longctx.sh
+CONFIG="--preset latent" ./benchmark_longctx.sh
 ```
 
 Set `STEPS=0` (the default) for a random-weight latency/throughput measurement;

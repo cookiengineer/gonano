@@ -9,9 +9,9 @@
 # then benchmarks prefill TTFT and decode throughput at long context.
 #
 # Usage:
-#   ./benchmark_longctx.sh                       # recommended config, seq 4096+16384
+#   ./benchmark_longctx.sh                       # flash preset, seq 4096+16384
 #   SEQS="4096,16384" BATCH_SIZES="1,16,64" ./benchmark_longctx.sh
-#   CONFIG="--compression-ratio 4 --sparse-topk 8 --swa-window 128 --ced" ./benchmark_longctx.sh
+#   CONFIG="--preset dense" ./benchmark_longctx.sh
 #   STEPS=50 ./benchmark_longctx.sh              # actually train a few steps
 
 set -euo pipefail
@@ -27,8 +27,9 @@ BATCH_SIZES="${BATCH_SIZES:-1,16,64}"
 DECODE_TOKENS="${DECODE_TOKENS:-16}"
 STEPS="${STEPS:-0}"
 
-# Architecture config under test. Override with the CONFIG environment variable.
-CONFIG="${CONFIG:---compression-ratio 4 --sparse-topk 8 --indexer-pool 8 --reuse-pattern FRU --swa-window 128 --ced}"
+# Architecture preset under test. Override with the CONFIG environment variable
+# (for example CONFIG="--preset dense" or CONFIG="--preset latent").
+CONFIG="${CONFIG:---preset flash}"
 
 WORKDIR="$(mktemp -d)"
 export GONANO_BASE_DIR="$WORKDIR"

@@ -206,6 +206,7 @@ Key flags (`cmd/base_train/main.go`):
 | Flag | Meaning | Default |
 |---|---|---|
 | `--depth` | number of layers; sets width/heads automatically | 12 |
+| `--preset` | architecture preset: `flash` (DeepSeek-V4.1 long-context + MoE), `latent` (MLA + MoE), `dense` | `flash` |
 | `--max-seq-len` | context length | 512 |
 | `--num-iterations` | optimization steps | 50 |
 | `--device-batch-size` | sequences per step | 1 |
@@ -217,8 +218,10 @@ Key flags (`cmd/base_train/main.go`):
 
 What happens under the hood (`trainer/trainer.go`, `trainer/scaling.go`):
 
-1. `model.ConfigForDepth(depth, vocab, 64, 128, seqLen, "SSSL")` computes
-   `n_embd = depth*64` (rounded up to a multiple of the 128-dim head).
+1. `model.ConfigForPreset(preset, depth, vocab, 64, 128, seqLen, "SSSL")`
+   computes `n_embd = depth*64` (rounded up to a multiple of the 128-dim head)
+   and then applies the preset (compression, sparse attention, cross-layer
+   reuse, SWA, CED, MoE, GQA, head-wise Muon by default).
 2. `trainer.DeriveHyperparams` computes the total batch size
    (`B ∝ D^0.383`, Power Laws), the LR scaling (`∝ √B`), and weight decay
    (T-epoch framework).

@@ -22,37 +22,19 @@ import (
 
 func main() {
 	var (
-		dataDir           string
-		format            string
-		tokenizerPath     string
-		trainTok          bool
-		vocabSize         int
-		maxChars          int
-		depth             int
-		maxSeqLen         int
-		kvHeadRatio       int
-		compressionRatio  int
-		sparseTopK        int
-		indexerDim        int
-		indexerPool       int
-		indexerCandidates int
-		reusePattern      string
-		swaWindow         int
-		ced               bool
-		headWiseMuon      bool
-		sinkhornEmbedding bool
-		queryCompression  int
-		kvLatentDim       int
-		mlaLatent         int
-		mlaRotaryDims     int
-		moe               bool
-		numExperts        int
-		expertsPerToken   int
-		expertHiddenDim   int
-		numIterations     int
-		batchSize         int
-		modelTag          string
-		baseDir           string
+		dataDir       string
+		format        string
+		tokenizerPath string
+		trainTok      bool
+		vocabSize     int
+		maxChars      int
+		depth         int
+		maxSeqLen     int
+		presetName    string
+		numIterations int
+		batchSize     int
+		modelTag      string
+		baseDir       string
 	)
 	flag.StringVar(&dataDir, "data-dir", "", "directory of training data (.parquet or .md) (required)")
 	flag.StringVar(&format, "format", "parquet", "data format: parquet|markdown")
@@ -62,25 +44,7 @@ func main() {
 	flag.IntVar(&maxChars, "max-chars", 2000000000, "max characters for tokenizer training")
 	flag.IntVar(&depth, "depth", 12, "transformer depth (the complexity dial)")
 	flag.IntVar(&maxSeqLen, "max-seq-len", 512, "context length")
-	flag.IntVar(&kvHeadRatio, "kv-head-ratio", 1, "query heads per key/value head (1 = MHA, >1 = GQA)")
-	flag.IntVar(&compressionRatio, "compression-ratio", 0, "HCA-style dense KV compression ratio (0/1 disables)")
-	flag.IntVar(&sparseTopK, "sparse-topk", 0, "CSA sparse attention top-k compressed blocks (0 disables)")
-	flag.IntVar(&indexerDim, "indexer-dim", 64, "lightning indexer per-head dimension")
-	flag.IntVar(&indexerPool, "indexer-pool", 0, "hierarchical indexer super-block size (0 disables)")
-	flag.IntVar(&indexerCandidates, "indexer-candidates", 0, "hierarchical indexer candidate budget (0 = auto)")
-	flag.StringVar(&reusePattern, "reuse-pattern", "", "cross-layer reuse pattern of F/R/U per layer (empty = all full)")
-	flag.IntVar(&swaWindow, "swa-window", 0, "local sliding-window branch width on compressed layers (0 disables)")
-	flag.BoolVar(&ced, "ced", false, "causal encoder-decoder split (decoder global KV from the encoder hidden state; requires --compression-ratio and --swa-window)")
-	flag.BoolVar(&headWiseMuon, "head-wise-muon", false, "split query/key projection weights by attention head for the Muon update")
-	flag.BoolVar(&sinkhornEmbedding, "sinkhorn-embeddings", false, "Sinkhorn-balanced momentum update for the embedding table, lm_head, and value embeddings")
-	flag.IntVar(&queryCompression, "query-compression-dim", 0, "low-rank query bottleneck width (0 = full-rank)")
-	flag.IntVar(&kvLatentDim, "kv-latent-dim", 0, "shared low-rank KV latent width (0 = full-rank)")
-	flag.IntVar(&mlaLatent, "mla-latent", 0, "absorbed MLA shared latent width (0 disables)")
-	flag.IntVar(&mlaRotaryDims, "mla-rotary-dims", 0, "MLA decoupled rotary width (0 = headDim/2)")
-	flag.BoolVar(&moe, "moe", false, "enable the DeepSeekMoE feed-forward (shared + routed experts); size derived from --depth")
-	flag.IntVar(&numExperts, "num-experts", 0, "routed expert count (0 = derived from --depth when --moe is set)")
-	flag.IntVar(&expertsPerToken, "experts-per-token", 0, "routed experts activated per token (0 = 2)")
-	flag.IntVar(&expertHiddenDim, "expert-hidden-dim", 0, "routed and shared expert intermediate width (0 = embedding dim)")
+	flag.StringVar(&presetName, "preset", string(model.DefaultPreset), "architecture preset: flash (DeepSeek-V4.1 long-context + MoE), latent (absorbed MLA + MoE), dense (classic)")
 	flag.IntVar(&numIterations, "num-iterations", 50, "optimization steps")
 	flag.IntVar(&batchSize, "device-batch-size", 1, "sequences per step")
 	flag.StringVar(&modelTag, "model-tag", "", "checkpoint directory name (default d<depth>)")
@@ -89,7 +53,7 @@ func main() {
 
 	logger := logging.Default(slog.LevelInfo)
 	if dataDir == "" {
-		fmt.Fprintln(os.Stderr, "usage: trainer --data-dir <dir> [--format parquet|markdown] [--train-tokenizer] [--depth N] ...")
+		fmt.Fprintln(os.Stderr, "usage: trainer --data-dir <dir> [--format parquet|markdown] [--train-tokenizer] [--depth N] [--preset flash|latent|dense] ...")
 		os.Exit(1)
 	}
 	if format != "parquet" && format != "markdown" {
@@ -99,37 +63,20 @@ func main() {
 	if baseDir == "" {
 		baseDir = data.BaseDir()
 	}
+	preset, err := model.ParsePreset(presetName)
+	if err != nil {
+		logger.Error("invalid preset", "err", err)
+		os.Exit(1)
+	}
 
 	// 1) Tokenizer setup.
 	tokenizer := setupTokenizer(logger, baseDir, dataDir, format, tokenizerPath, trainTok, vocabSize, maxChars)
 
-	// 2) Model.
-	configuration := model.ConfigForDepthRatio(depth, tokenizer.VocabSize(), 64, 128, maxSeqLen, "SSSL", kvHeadRatio)
-	configuration.CompressionRatio = compressionRatio
-	configuration.SparseTopK = sparseTopK
-	configuration.IndexerDim = indexerDim
-	configuration.IndexerPool = indexerPool
-	configuration.IndexerCandidates = indexerCandidates
-	configuration.ReusePattern = reusePattern
-	configuration.SWAWindow = swaWindow
-	configuration.CED = ced
-	configuration.HeadWiseMuon = headWiseMuon
-	configuration.QueryCompressionDim = queryCompression
-	configuration.KVLatentDim = kvLatentDim
-	configuration.MLALatent = mlaLatent
-	configuration.MLARotaryDims = mlaRotaryDims
-	if moe {
-		configuration.NumExperts = numExperts
-		if configuration.NumExperts == 0 {
-			configuration.NumExperts = model.MoEExpertsForDepth(depth)
-		}
-		configuration.NumExpertsPerToken = expertsPerToken
-		configuration.ExpertHiddenDim = expertHiddenDim
-		configuration.ApplyMoEDefaults()
-	}
+	// 2) Model: the preset selects the whole architecture.
+	configuration := model.ConfigForPreset(preset, depth, tokenizer.VocabSize(), 64, 128, maxSeqLen, "SSSL")
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
-	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, sinkhornEmbedding)
+	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, preset.UsesSinkhorn())
 
 	// 3) Data source.
 	source, err := newDocProvider(dataDir, format)

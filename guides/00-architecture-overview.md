@@ -176,9 +176,12 @@ model's forward pass needs to write to it, and `model` may not import `inference
 ### 3.4 `model`
 
 1. `Config` is the architecture description: `SequenceLen`, `VocabSize`,
-   `NumLayer`, `NumHead`, `NumKVHead`, `EmbedDim`, `WindowPattern`.
-   `ConfigForDepth(depth, vocab, 64, 128, seqLen, "SSSL")` derives a whole
-   config from a single depth dial.
+   `NumLayer`, `NumHead`, `NumKVHead`, `EmbedDim`, `WindowPattern`, plus the
+   DeepSeek-V4.1 features (compression, sparsity, reuse, CED, MoE, MLA). A
+   preset fills the best defaults:
+   `ConfigForPreset(preset, depth, vocab, 64, 128, seqLen, "SSSL")` derives the
+   whole config from a single depth dial and then applies the preset
+   (`flash`/`latent`/`dense`).
 
 2. `NewTransformer(cfg)` allocates every parameter (zero-initialized) and
    precomputes the rotary `cos`/`sin` tables; `InitWeights(rng)` applies the
@@ -319,7 +322,8 @@ model's forward pass needs to write to it, and `model` may not import `inference
 Follow these steps to trace what `cmd/base_train` actually does.
 
 1. `base_train` loads (or falls back to creating) a tokenizer, then calls
-   `model.ConfigForDepth(depth, vocab, ...)` to derive the model shape and
+   `model.ConfigForPreset(preset, depth, vocab, ...)` (preset defaults to the
+   DeepSeek-V4.1 `flash` stack) to derive the model shape and
    `model.NewTransformer` to allocate it.
 
 2. `InitWeights` fills the parameters, and `SetupOptimizer` builds the

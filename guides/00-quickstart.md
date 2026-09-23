@@ -75,6 +75,12 @@ go run ./cmd/chat_cli \
 The output will be near-gibberish (it's a 20-step toy model) — the point is
 that **the whole pipeline works**: train → save → load → inference.
 
+> The default `--preset flash` turns on the full DeepSeek-V4.1-Flash stack
+> (KV compression, sparse attention, cross-layer reuse, sliding-window
+> attention, the causal encoder-decoder split, and DeepSeekMoE). Pass
+> `--preset dense` for the lightweight classic decoder, or `--preset latent`
+> for absorbed MLA + MoE.
+
 ## 5. Train on a real base English corpus (FineWeb-Edu)
 
 ```bash

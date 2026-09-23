@@ -97,7 +97,7 @@ func main() {
 	loader := data.NewPretrainLoader(tokenizer, *deviceBatchSize, sequenceLen, provider, 1000)
 
 	// Phase 1: distill the trunk from the frozen backbone.
-	trunkGroups := drafter.SetupOptimizer(0.008, 0.2, 0.02, 0.0, 0.5, false)
+	trunkGroups := drafter.SetupOptimizer(0.008, 0.2, 0.02, 0.0, 0.5, true)
 	distillNext := func() (*tensors.Int32s, *tensors.Int32s, bool) {
 		inputs, _, _ := loader.Next()
 		return inputs, nil, true

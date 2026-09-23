@@ -20,6 +20,15 @@ GOEXPERIMENT=simd go test ./...;
 
 ## Features
 
+> **The full DeepSeek-V4.1-Flash stack is on by default.** Training commands
+> take a single `--preset` (`flash` is the default) rather than per-feature
+> flags; `flash` enables HCA compression, CSA sparse attention, the hierarchical
+> indexer, cross-layer reuse, sliding-window attention, the causal
+> encoder-decoder split, DeepSeekMoE, grouped-query attention, head-wise Muon,
+> partial RoPE, and Sinkhorn embeddings/head. Use `--preset latent` for absorbed
+> MLA + MoE, or `--preset dense` for the classic decoder. The individual
+> `model.Config` fields remain for programmatic use.
+
 gonano is optimized for CPU long-context inference and batched decode. The table
 below summarizes the measured effect of each optimization. Values are speedups
 (`×`, higher is better; below `1×` means slower) for the two inference phases,
@@ -37,20 +46,21 @@ its own row, so the cells are not one single end-to-end run.
 | Compression + sparsity | uncompressed, seq 4096 | 1.05–1.23× | 1.31× | 1.29× | 1.48× |
 | Compression + sparsity + SWA + CED (recommended, long context) | uncompressed, seq 16384 | ~3.3× | 1.6× | 1.8× | 2.1× |
 
-**Recommended configuration:** for long-context workloads enable the full stack,
-`--compression-ratio 4 --sparse-topk 8 --swa-window 128 --ced`. It is the best
-combined result: prefill ≈3.3× and decode ≈1.6–2.1× versus uncompressed at seq
-16384, because CED's bounded replay cuts prefill by another ≈1.5× over SWA-only
-without a measurable decode cost. The one exception is a **decode-only**
-workload with short prompts, where plain `--compression-ratio 4 --sparse-topk 8`
-(no SWA/CED) is ~10–15% faster on decode; SWA and CED trade that decode margin
-for local fidelity and the large prefill win.
+**Recommended configuration:** the `flash` preset is the recommended default
+(compression ratio 4, top-k 8, indexer pool 8, reuse `FRU`, SWA 128, CED). It is
+the best combined result: prefill ≈3.3× and decode ≈1.6–2.1× versus uncompressed
+at seq 16384, because CED's bounded replay cuts prefill by another ≈1.5× over
+SWA-only without a measurable decode cost. The one exception is a **decode-only**
+workload with short prompts, where compression + sparsity without SWA/CED is
+~10–15% faster on decode; SWA and CED trade that decode margin for local fidelity
+and the large prefill win (the exact per-feature flags below are the knobs the
+preset sets).
 
 Architectural features that reduce memory rather than latency:
 
-- **Grouped-query / multi-query attention** (`--kv-head-ratio N`): one KV head
-  per `N` query heads. Ratio 3 cuts KV-cache size 3× (no throughput claim; KV
-  traffic is reduced proportionally).
+- **Grouped-query / multi-query attention**: one KV head per `N` query heads
+  (the `flash`/`latent` presets use a 2:1 ratio). Cuts KV-cache size without a
+  throughput claim (KV traffic is reduced proportionally).
 - **Partial RoPE** (`RotaryDims`, default 64): DeepSeek-style rotary embedding
   applied only to the trailing head dimensions, with no throughput cost.
 - **Hierarchical sparse indexer**: coarse-to-fine block selection scores each
@@ -60,7 +70,8 @@ Architectural features that reduce memory rather than latency:
 
 ### Local sliding-window attention
 
-`--swa-window N` adds a **layer-local sliding-window branch** to compressed
+The `flash` preset's sliding-window branch (width 128; `--swa-window N` in the
+underlying config) adds a **layer-local sliding-window branch** to compressed
 layers: every query attends to the global compressed blocks *and* the raw
 keys/values of the last `N` tokens. The two branches are merged through a single
 exact softmax (they share one log-sum-exp, and each branch's backward is
