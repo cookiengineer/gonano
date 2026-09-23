@@ -63,6 +63,10 @@ type Config struct {
 	// The decoder's local sliding-window branch still reads its own hidden
 	// state. CED requires compression and a local window.
 	CED bool `json:"ced,omitempty"`
+	// HeadWiseMuon splits the query and key projection weights by attention
+	// head and orthogonalizes each head independently with Muon (DeepSeek-V4.1
+	// §2.5). It is a training-only setting; it adds no inference cost.
+	HeadWiseMuon bool `json:"head_wise_muon,omitempty"`
 	// QueryCompressionDim enables a low-rank (MLA-style) query projection: the
 	// query is down-projected to this width and then up-projected per head
 	// (DeepSeek-V4.1 §2.3/§4.2.1). Zero keeps the full-rank projection.

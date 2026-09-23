@@ -16,9 +16,20 @@ func (model *Transformer) SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, w
 
 	// Separate out the matrix parameters (transformer block Linear weights).
 	var matrixParameters []*tensors.Tensor
+	headWise := model.Config.HeadWiseMuon
 	for _, block := range model.blocks {
-		matrixParameters = append(matrixParameters,
-			block.attention.queryProjection.Weight, block.attention.keyProjection.Weight)
+		if headWise {
+			// Split Q and K by attention head so each head is orthogonalized
+			// independently (DeepSeek-V4.1 §2.5). The views share storage with
+			// the parent weights and their gradients.
+			matrixParameters = append(matrixParameters,
+				headWiseViews(block.attention.queryProjection.Weight, model.Config.NumHead, model.Config.HeadDim())...)
+			matrixParameters = append(matrixParameters,
+				headWiseViews(block.attention.keyProjection.Weight, model.Config.NumKVHead, model.Config.HeadDim())...)
+		} else {
+			matrixParameters = append(matrixParameters,
+				block.attention.queryProjection.Weight, block.attention.keyProjection.Weight)
+		}
 		matrixParameters = append(matrixParameters,
 			block.attention.valueProjection.Weight, block.attention.outputProjection.Weight,
 			block.mlp.inputProjection.Weight, block.mlp.outputProjection.Weight,
@@ -85,6 +96,32 @@ func (model *Transformer) SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, w
 		})
 	}
 	return groups
+}
+
+// headWiseViews splits a [heads*headDim, columns] weight matrix into `heads`
+// row-block views of shape [headDim, columns]. Each view shares the parent's
+// Data and Grad backing arrays, so the Muon update and the backpropagated
+// gradient both operate in place on the same storage.
+func headWiseViews(weight *tensors.Tensor, heads, headDim int) []*tensors.Tensor {
+	if heads < 1 {
+		return nil
+	}
+	columns := weight.Shape[1]
+	if weight.Shape[0] != heads*headDim {
+		panic("model: head-wise Muon weight shape does not match heads*headDim")
+	}
+	weight.EnsureGrad()
+	views := make([]*tensors.Tensor, heads)
+	for head := 0; head < heads; head++ {
+		start := head * headDim * columns
+		end := start + headDim*columns
+		views[head] = &tensors.Tensor{
+			Shape: []int{headDim, columns},
+			Data:  weight.Data[start:end],
+			Grad:  weight.Grad[start:end],
+		}
+	}
+	return views
 }
 
 func sortShapes(shapes [][2]int) {
