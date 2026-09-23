@@ -267,3 +267,102 @@ func TestMLATrainOverfitsTiny(t *testing.T) {
 		t.Fatalf("MLA loss did not decrease: %v -> %v", first, last)
 	}
 }
+
+func newMLACache(config Config, capacity int) *KVBuffer {
+	cache := NewKVBuffer(1, capacity, config.NumLayer, config.NumKVHead, config.HeadDim())
+	cache.EnableMLA(config.MLALatent, config.NumKVHead*config.MLARotaryDimension())
+	return cache
+}
+
+// TestMLAInferenceMatchesTraining verifies that the absorbed inference path
+// computes the same function as the non-absorbed training construction.
+func TestMLAInferenceMatchesTraining(t *testing.T) {
+	transformer := mlaTinyModel()
+	config := transformer.Config
+	ids := tensors.NewInt32sWithData([]int{1, 8}, []int32{1, 2, 3, 4, 5, 6, 7, 8})
+
+	trainLogits, _ := transformer.TrainForward(ids)
+	cache := newMLACache(config, 16)
+	forwardLogits := transformer.Forward(ids, cache)
+
+	for index := range trainLogits.Data {
+		if math.Abs(float64(trainLogits.Data[index]-forwardLogits.Data[index])) > 1e-3 {
+			t.Fatalf("logit %d: training=%v inference=%v", index, trainLogits.Data[index], forwardLogits.Data[index])
+		}
+	}
+}
+
+// TestMLADecodeMatchesPrefill verifies the latent KV cache: decoding a token
+// incrementally matches prefilling the whole sequence.
+func TestMLADecodeMatchesPrefill(t *testing.T) {
+	transformer := mlaTinyModel()
+	config := transformer.Config
+	tokens := []int32{1, 5, 2, 8, 3, 7, 4, 6}
+	vocabulary := config.VocabSize
+
+	prefillCache := newMLACache(config, 16)
+	prefilled := transformer.Forward(tensors.NewInt32sWithData([]int{1, len(tokens)}, tokens), prefillCache)
+	prefillLast := prefilled.Data[(len(tokens)-1)*vocabulary:]
+
+	decodeCache := newMLACache(config, 16)
+	transformer.Forward(tensors.NewInt32sWithData([]int{1, len(tokens) - 1}, tokens[:len(tokens)-1]), decodeCache)
+	decoded := transformer.Forward(tensors.NewInt32sWithData([]int{1, 1}, tokens[len(tokens)-1:]), decodeCache)
+	decodeLast := decoded.Data
+
+	for index := range prefillLast {
+		if math.Abs(float64(prefillLast[index]-decodeLast[index])) > 1e-3 {
+			t.Fatalf("logit %d: prefill=%v decode=%v", index, prefillLast[index], decodeLast[index])
+		}
+	}
+}
+
+func TestMLACacheCodecRoundTrip(t *testing.T) {
+	config := mlaTestConfig()
+	transformer := mlaTinyModel()
+	ids := tensors.NewInt32sWithData([]int{1, 5}, []int32{1, 2, 3, 4, 5})
+	cache := newMLACache(config, 16)
+	transformer.Forward(ids, cache)
+
+	data, err := cache.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	decoded, err := UnmarshalKVBuffer(data)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !decoded.MLAEnabled() {
+		t.Fatal("decoded cache lost MLA buffers")
+	}
+	if decoded.MLALatentWidth() != config.MLALatent || decoded.MLARopeKeyWidth() != config.NumKVHead*config.MLARotaryDimension() {
+		t.Fatal("MLA widths mismatch after round-trip")
+	}
+	position := cache.Position()
+	for layer := 0; layer < config.NumLayer; layer++ {
+		original := cache.MLALatent(layer, 0, position)
+		restored := decoded.MLALatent(layer, 0, position)
+		for index := range original {
+			if original[index] != restored[index] {
+				t.Fatalf("latent mismatch at layer %d index %d", layer, index)
+			}
+		}
+		original = cache.MLARopeKey(layer, 0, position)
+		restored = decoded.MLARopeKey(layer, 0, position)
+		for index := range original {
+			if original[index] != restored[index] {
+				t.Fatalf("rope key mismatch at layer %d index %d", layer, index)
+			}
+		}
+	}
+}
+
+func TestMLAKVBytesReduced(t *testing.T) {
+	full := NewTransformer(testConfig())
+	mla := NewTransformer(mlaTestConfig())
+	if mla.KVBytesPerToken() >= full.KVBytesPerToken() {
+		t.Fatalf("MLA KV bytes %d must be fewer than full %d", mla.KVBytesPerToken(), full.KVBytesPerToken())
+	}
+	if mla.KVReadBytes(8) >= full.KVReadBytes(8) {
+		t.Fatal("MLA KV read bytes must be fewer than full")
+	}
+}

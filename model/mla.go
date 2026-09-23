@@ -173,3 +173,107 @@ func splitHeads(input, content, rope *tensors.Tensor, headCount, contentDim, rop
 func batchSizeTimesHeads(input *tensors.Tensor, headDimension int) int {
 	return input.Numel() / headDimension
 }
+
+// mlaForwardInference computes absorbed MLA attention for one layer. It stores
+// only the shared latent and the decoupled rotary key in the cache, folds the
+// content key up-projection into the query, and concatenates the folded content
+// query with the rotary query (and the latent with the rotary key) so the
+// attention score is the per-position sum of the content and rotary scores. The
+// value is the latent padded so the kernel's key and value widths match; the
+// value up-projection is applied to the attention-weighted latent sum, so no
+// per-cached-position up-projection is ever materialized.
+func (attention *CausalSelfAttention) mlaForwardInference(input, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, cache *KVBuffer, layer int) *tensors.Tensor {
+	mla := attention.mla
+	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
+	contentDim := mla.contentDim
+	ropeDim := mla.ropeDim
+	latentDim := mla.latentDim
+	queryHeads := mla.queryHeadCount
+	kvHeads := mla.kvHeadCount
+	valueDim := mla.valueDim
+	headRatio := queryHeads / kvHeads
+	headDim := latentDim + ropeDim
+	if !cache.MLAEnabled() {
+		panic("model: MLA attention requires an MLA-enabled KV cache")
+	}
+
+	queryLatent := mla.QueryDown.Forward(input)
+	queryContent := mla.QueryUp.Forward(queryLatent).Reshape(batchSize, sequenceLength, queryHeads, contentDim)
+	queryRope := ApplyRotary(mla.QueryRope.Forward(input).Reshape(batchSize, sequenceLength, queryHeads, ropeDim), cosine, sine, positionOffset)
+
+	kvLatent := mla.KVDown.Forward(input)
+	keyRope := ApplyRotary(mla.KeyRope.Forward(input).Reshape(batchSize, sequenceLength, kvHeads, ropeDim), cosine, sine, positionOffset)
+
+	for batch := 0; batch < batchSize; batch++ {
+		for row := 0; row < sequenceLength; row++ {
+			latentBase := (batch*sequenceLength + row) * latentDim
+			cache.AppendMLALatentAt(layer, batch, row, kvLatent.Data[latentBase:latentBase+latentDim])
+			ropeBase := (batch*sequenceLength + row) * kvHeads * ropeDim
+			cache.AppendMLARopeKeyAt(layer, batch, row, keyRope.Data[ropeBase:ropeBase+kvHeads*ropeDim])
+		}
+	}
+
+	count := cache.Position() + sequenceLength
+	output := tensors.New(batchSize, sequenceLength, queryHeads*valueDim)
+	keyUp := mla.KeyUp.Weight.Data
+	valueUp := mla.ValueUp.Weight.Data
+
+	query := make([]float32, sequenceLength*headDim)
+	key := make([]float32, count*headDim)
+	value := make([]float32, count*headDim)
+	attentionOut := make([]float32, sequenceLength*headDim)
+	logSumExp := make([]float32, sequenceLength)
+
+	for batch := 0; batch < batchSize; batch++ {
+		latentCache := cache.MLALatent(layer, batch, count)
+		ropeCache := cache.MLARopeKey(layer, batch, count)
+		for queryHead := 0; queryHead < queryHeads; queryHead++ {
+			kvHead := queryHead / headRatio
+
+			// Fold the content key up-projection into the query, then build
+			// Q = [q_abs | q_rope].
+			for token := 0; token < sequenceLength; token++ {
+				contentBase := ((batch*sequenceLength+token)*queryHeads + queryHead) * contentDim
+				queryBase := token * headDim
+				for rank := 0; rank < latentDim; rank++ {
+					var sum float32
+					for channel := 0; channel < contentDim; channel++ {
+						sum += queryContent.Data[contentBase+channel] * keyUp[(kvHead*contentDim+channel)*latentDim+rank]
+					}
+					query[queryBase+rank] = sum
+				}
+				ropeBase := ((batch*sequenceLength+token)*queryHeads + queryHead) * ropeDim
+				copy(query[queryBase+latentDim:queryBase+headDim], queryRope.Data[ropeBase:ropeBase+ropeDim])
+			}
+
+			// K = [c_kv | k_rope], V = [c_kv | 0].
+			for token := 0; token < count; token++ {
+				base := token * headDim
+				copy(key[base:base+latentDim], latentCache[token*latentDim:(token+1)*latentDim])
+				ropeBase := token*kvHeads*ropeDim + kvHead*ropeDim
+				copy(key[base+latentDim:base+headDim], ropeCache[ropeBase:ropeBase+ropeDim])
+				copy(value[base:base+latentDim], latentCache[token*latentDim:(token+1)*latentDim])
+				for index := base + latentDim; index < base+headDim; index++ {
+					value[index] = 0
+				}
+			}
+
+			tensors.AttentionForward(query, key, value, attentionOut, logSumExp,
+				sequenceLength, count, headDim, positionOffset, window[0])
+
+			for token := 0; token < sequenceLength; token++ {
+				outputBase := ((batch*sequenceLength+token)*queryHeads + queryHead) * valueDim
+				latentOutBase := token * headDim
+				for dimension := 0; dimension < valueDim; dimension++ {
+					var sum float32
+					for rank := 0; rank < latentDim; rank++ {
+						sum += attentionOut[latentOutBase+rank] * valueUp[(kvHead*valueDim+dimension)*latentDim+rank]
+					}
+					output.Data[outputBase+dimension] = sum
+				}
+			}
+		}
+	}
+	sequenceFlat := output.Reshape(batchSize, sequenceLength, queryHeads*valueDim)
+	return attention.outputProjection.Forward(sequenceFlat)
+}

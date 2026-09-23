@@ -35,6 +35,8 @@ func main() {
 	sinkhornEmbeddings := flag.Bool("sinkhorn-embeddings", false, "Sinkhorn-balanced momentum update for the embedding table, lm_head, and value embeddings")
 	queryCompressionDim := flag.Int("query-compression-dim", 0, "low-rank query bottleneck width (0 = full-rank)")
 	kvLatentDim := flag.Int("kv-latent-dim", 0, "shared low-rank KV latent width (0 = full-rank)")
+	mlaLatent := flag.Int("mla-latent", 0, "absorbed MLA shared latent width (0 disables; must be trained from scratch)")
+	mlaRotaryDims := flag.Int("mla-rotary-dims", 0, "MLA decoupled rotary width (0 = headDim/2)")
 	vocabSize := flag.Int("vocab-size", 32768, "vocabulary size")
 	numIterations := flag.Int("num-iterations", 50, "optimization steps")
 	deviceBatchSize := flag.Int("device-batch-size", 1, "per-step batch size")
@@ -77,6 +79,8 @@ func main() {
 	configuration.HeadWiseMuon = *headWiseMuon
 	configuration.QueryCompressionDim = *queryCompressionDim
 	configuration.KVLatentDim = *kvLatentDim
+	configuration.MLALatent = *mlaLatent
+	configuration.MLARotaryDims = *mlaRotaryDims
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 

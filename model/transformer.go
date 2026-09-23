@@ -64,8 +64,9 @@ func NewTransformer(config Config) *Transformer {
 		rotarySine:     rotarySine,
 	}
 	for layerIndex := 0; layerIndex < config.NumLayer; layerIndex++ {
-		model.blocks[layerIndex] = NewBlock(config, hasValueEmbedding(layerIndex, config.NumLayer), layerIndex)
-		if hasValueEmbedding(layerIndex, config.NumLayer) {
+		hasValue := !config.MLAEnabled() && hasValueEmbedding(layerIndex, config.NumLayer)
+		model.blocks[layerIndex] = NewBlock(config, hasValue, layerIndex)
+		if hasValue {
 			model.valueEmbeds[layerIndex] = layers.NewEmbedding(paddedVocabulary, config.NumKVHead*config.HeadDim())
 		}
 	}

@@ -35,6 +35,7 @@ layout.
 | Full-vocabulary on-policy distillation (OPD) | 5.2.4 | `tensors/loss.go` (`DistillationLossPerPosition`), `trainer/distill.go` | `cmd/chat_opd` |
 | DSpark speculative decoding + confidence scheduler | 2.4.3 | `model/dspark.go` (`DSpark`), `inference/speculative.go` | `--drafter` + `--speculative` |
 | MLA low-rank query / KV latent | 2.3, 4.2.1 | `model/attention.go` `projectQuery`/`projectKeyValue` | `--query-compression-dim`, `--kv-latent-dim` |
+| Absorbed MLA latent cache | 2.3, 4.2.1 | `model/mla.go`, `KVBuffer.EnableMLA` | `--mla-latent`, `--mla-rotary-dims` |
 | Global-KV prefix reuse + SWA replay | 3.2.1, 3.2.2 | `inference/prefix.go` `PrefixCache`, `Engine.Prefix` | `Engine.Prefix = NewPrefixCache(...)` |
 | Persistent multi-entry KV cache (LRU/TTL/disk) | 3.2.1 | `inference/cache.go` `CacheManager`, `model/kvcache_codec.go` | `Engine.Cache = NewCacheManager(...)` |
 | SWA pool + bounded replay (global-only persistence) | 3.2.1, 3.2.2 | `KVBuffer.StripRaw`, `Transformer.ReplaySWA`, `Engine.SWACache` | `CacheOptions.StripSWA`, `Engine.SWACache` |
@@ -230,14 +231,32 @@ Forward and backward are fully wired (`CausalSelfAttention.projectQuery` /
 `cedValueProjectionBackward`). It reduces projection parameters, matmul FLOPs,
 and per-token weight bytes.
 
-**Scope note:** the KV cache still stores the full per-head keys/values. The
-low-rank latent reduces **compute and parameters, not cache bytes**; a latent KV
-cache is future work. Also note the low-rank path is a genuine architectural
-change and must be trained from scratch.
+**Scope note:** the low-rank query/KV latent (`--query-compression-dim`,
+`--kv-latent-dim`) reduces **compute and parameters, not cache bytes**; it keeps
+the full per-head KV cache. Both are genuine architectural changes and must be
+trained from scratch.
+
+**Absorbed MLA latent cache.** `--mla-latent R` enables a separate absorbed MLA
+mode: the content key/value latent is shared (`c_kv`, width `R`) and a decoupled
+rotary key is stored per KV head, so the cache holds one latent row per token
+instead of a key and a value per head. At inference `model/mla.go` folds the
+content key up-projection into the query, concatenates the folded content query
+with the rotary query (and the latent with the rotary key) so the attention score
+is the per-position sum of the two, and applies the value up-projection to the
+attention-weighted latent sum. This is a genuine architectural change trained
+from scratch; it is incompatible with compression, CED, sparsity, cross-layer
+reuse, the low-rank settings, head-wise Muon, and value embeddings, and
+`Config.Validate` rejects those combinations. `KVBytesPerToken`/`KVReadBytes`
+report the reduced footprint.
 
 Units: `TestBackpropDirectionalGradientCheckLowRank` (query, kv, both),
 `TestBackpropPerElementLowRankCED`, `TestLowRankReducesParameters`,
-`TestSaveLoadRoundtripLowRank`, `TestForwardLowRankDecodePath`.
+`TestSaveLoadRoundtripLowRank`, `TestForwardLowRankDecodePath`,
+`TestMLAConfigValidation`, `TestMLARotaryDimensionDefault`, `TestMLAParameterShapes`,
+`TestMLATrainStepFinite`, `TestBackpropDirectionalGradientCheckMLA`,
+`TestBackpropPerElementMLA`, `TestMLATrainOverfitsTiny`,
+`TestMLAInferenceMatchesTraining`, `TestMLADecodeMatchesPrefill`,
+`TestMLACacheCodecRoundTrip`, `TestMLAKVBytesReduced`.
 
 ---
 
@@ -490,8 +509,6 @@ For completeness, the paper components that are out of scope here:
   parallel draft is a further throughput refinement left as future work.
 - **EPD disaggregation and the GPU kernel fusions** (Mega-* kernels, FlashMLA):
   single-process CPU serving only.
-- **Latent KV cache** — see §5; the low-rank KV latent reduces compute, not
-  cache bytes.
 
 ---
 

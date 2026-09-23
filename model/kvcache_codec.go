@@ -18,6 +18,7 @@ const (
 	kvFlagIndexer           = 1 << 1
 	kvFlagPreviousEmbedding = 1 << 2
 	kvFlagRawStripped       = 1 << 3
+	kvFlagMLA               = 1 << 4
 )
 
 // Per-layer serialization flags.
@@ -50,10 +51,15 @@ func (cache *KVBuffer) MarshalBinary() ([]byte, error) {
 	writer.u32(uint32(cache.compressedEmbeddingDim))
 	writer.u32(uint32(cache.compressedKVWidth))
 	writer.u32(uint32(cache.indexerKeyWidth))
+	writer.u32(uint32(cache.mlaLatentWidth))
+	writer.u32(uint32(cache.mlaRopeKeyWidth))
 
 	flags := uint32(0)
 	compression := cache.compressionRatio > 1
 	indexer := cache.indexerKey != nil
+	if cache.mlaLatent != nil {
+		flags |= kvFlagMLA
+	}
 	if compression {
 		flags |= kvFlagCompression
 	}
@@ -130,6 +136,18 @@ func (cache *KVBuffer) MarshalBinary() ([]byte, error) {
 		}
 	}
 
+	if flags&kvFlagMLA != 0 {
+		position := int(cache.sequenceLength)
+		latentWidth := cache.mlaLatentWidth
+		ropeWidth := cache.mlaRopeKeyWidth
+		for layer := 0; layer < cache.layerCount; layer++ {
+			for batch := 0; batch < cache.batchSize; batch++ {
+				writer.f32s(cache.mlaLatent[layer][batch].Data[:position*latentWidth])
+				writer.f32s(cache.mlaRopeKey[layer][batch].Data[:position*ropeWidth])
+			}
+		}
+	}
+
 	if flags&kvFlagPreviousEmbedding != 0 {
 		channels := cache.previousEmbedding.Shape[2]
 		writer.u32(uint32(channels))
@@ -156,6 +174,8 @@ func UnmarshalKVBuffer(data []byte) (*KVBuffer, error) {
 	compressedEmbeddingDim := int(reader.u32())
 	compressedKVWidth := int(reader.u32())
 	indexerKeyWidth := int(reader.u32())
+	mlaLatentWidth := int(reader.u32())
+	mlaRopeKeyWidth := int(reader.u32())
 	flags := reader.u32()
 	if reader.err != nil {
 		return nil, reader.err
@@ -254,6 +274,17 @@ func UnmarshalKVBuffer(data []byte) (*KVBuffer, error) {
 					count := cache.compressedCount[layer][batch]
 					reader.f32s(cache.indexerKey[layer][index].Data[:count*indexerKeyWidth])
 				}
+			}
+		}
+	}
+
+	if flags&kvFlagMLA != 0 {
+		cache.EnableMLA(mlaLatentWidth, mlaRopeKeyWidth)
+		position := int(sequenceLength)
+		for layer := 0; layer < layerCount; layer++ {
+			for batch := 0; batch < batchSize; batch++ {
+				reader.f32s(cache.mlaLatent[layer][batch].Data[:position*mlaLatentWidth])
+				reader.f32s(cache.mlaRopeKey[layer][batch].Data[:position*mlaRopeKeyWidth])
 			}
 		}
 	}

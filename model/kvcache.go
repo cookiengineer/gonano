@@ -50,6 +50,14 @@ type KVBuffer struct {
 	indexerKeyWidth int
 	indexerKey      [][]*tensors.Tensor
 
+	// MLA latent cache (DeepSeek-V4.1 §2.3/§4.2.1): the shared key/value latent
+	// c_kv is one row per token (not per head), and the decoupled rotary key is
+	// per key/value head. Allocated by EnableMLA.
+	mlaLatentWidth  int
+	mlaRopeKeyWidth int
+	mlaLatent       [][]*tensors.Tensor // [layer][batch] [maxSeq, mlaLatentWidth]
+	mlaRopeKey      [][]*tensors.Tensor // [layer][batch] [maxSeq, mlaRopeKeyWidth]
+
 	// rawStripped marks a snapshot whose raw key/value buffers were dropped
 	// (DeepSeek-V4.1 §3.2.1): only the global compressed/indexer state and the
 	// buffered tail survive. Bounded replay rebuilds the local sliding-window
@@ -211,6 +219,60 @@ func (cache *KVBuffer) EnableIndexerKeysLayers(width int, allocate []bool) {
 	}
 }
 
+// EnableMLA allocates the MLA latent and rope-key buffers: one shared latent row
+// and one rope-key row per token per (layer, batch).
+func (cache *KVBuffer) EnableMLA(latentWidth, ropeKeyWidth int) {
+	cache.mlaLatentWidth = latentWidth
+	cache.mlaRopeKeyWidth = ropeKeyWidth
+	cache.mlaLatent = make([][]*tensors.Tensor, cache.layerCount)
+	cache.mlaRopeKey = make([][]*tensors.Tensor, cache.layerCount)
+	for layer := 0; layer < cache.layerCount; layer++ {
+		cache.mlaLatent[layer] = make([]*tensors.Tensor, cache.batchSize)
+		cache.mlaRopeKey[layer] = make([]*tensors.Tensor, cache.batchSize)
+		for batch := 0; batch < cache.batchSize; batch++ {
+			cache.mlaLatent[layer][batch] = tensors.New(cache.maximumSequenceLength, latentWidth)
+			cache.mlaRopeKey[layer][batch] = tensors.New(cache.maximumSequenceLength, ropeKeyWidth)
+		}
+	}
+}
+
+// MLAEnabled reports whether the MLA latent buffers were allocated.
+func (cache *KVBuffer) MLAEnabled() bool { return cache.mlaLatent != nil }
+
+// MLALatentWidth returns the shared key/value latent width.
+func (cache *KVBuffer) MLALatentWidth() int { return cache.mlaLatentWidth }
+
+// MLARopeKeyWidth returns the decoupled rotary key width (NumKVHead*ropeDim).
+func (cache *KVBuffer) MLARopeKeyWidth() int { return cache.mlaRopeKeyWidth }
+
+// AppendMLALatentAt writes one token's shared latent at position+row.
+func (cache *KVBuffer) AppendMLALatentAt(layer, batch, row int, latent []float32) {
+	position := int(cache.sequenceLength) + row
+	copy(cache.mlaLatent[layer][batch].Data[position*cache.mlaLatentWidth:], latent)
+}
+
+// AppendMLARopeKeyAt writes one token's decoupled rotary key at position+row.
+func (cache *KVBuffer) AppendMLARopeKeyAt(layer, batch, row int, key []float32) {
+	position := int(cache.sequenceLength) + row
+	copy(cache.mlaRopeKey[layer][batch].Data[position*cache.mlaRopeKeyWidth:], key)
+}
+
+// MLALatent returns the first count shared latent rows.
+func (cache *KVBuffer) MLALatent(layer, batch, count int) []float32 {
+	if cache.mlaLatent == nil {
+		return nil
+	}
+	return cache.mlaLatent[layer][batch].Data[:count*cache.mlaLatentWidth]
+}
+
+// MLARopeKey returns the first count decoupled rotary key rows.
+func (cache *KVBuffer) MLARopeKey(layer, batch, count int) []float32 {
+	if cache.mlaRopeKey == nil {
+		return nil
+	}
+	return cache.mlaRopeKey[layer][batch].Data[:count*cache.mlaRopeKeyWidth]
+}
+
 // AppendIndexerKey stores the indexer key projection of one compressed entry.
 func (cache *KVBuffer) AppendIndexerKey(layer, batch, head int, key []float32) {
 	if cache.indexerKey == nil || cache.indexerKey[layer] == nil {
@@ -362,6 +424,18 @@ func PrefillFrom(destination, source *KVBuffer) {
 		}
 	}
 
+	if destination.mlaLatent != nil {
+		position := source.Position()
+		latentWidth := destination.mlaLatentWidth
+		ropeWidth := destination.mlaRopeKeyWidth
+		for layer := 0; layer < destination.layerCount; layer++ {
+			for batch := 0; batch < destination.batchSize; batch++ {
+				copy(destination.mlaLatent[layer][batch].Data[:position*latentWidth], source.mlaLatent[layer][0].Data[:position*latentWidth])
+				copy(destination.mlaRopeKey[layer][batch].Data[:position*ropeWidth], source.mlaRopeKey[layer][0].Data[:position*ropeWidth])
+			}
+		}
+	}
+
 	destination.sequenceLength = source.sequenceLength
 	if source.previousEmbedding != nil {
 		// Expand the batch-1 previous embedding across all decode rows.
@@ -444,6 +518,21 @@ func (cache *KVBuffer) Clone() *KVBuffer {
 			clone.indexerKey[layer] = make([]*tensors.Tensor, len(cache.indexerKey[layer]))
 			for index := range cache.indexerKey[layer] {
 				clone.indexerKey[layer][index] = cache.indexerKey[layer][index].Clone()
+			}
+		}
+	}
+
+	if cache.mlaLatent != nil {
+		clone.mlaLatentWidth = cache.mlaLatentWidth
+		clone.mlaRopeKeyWidth = cache.mlaRopeKeyWidth
+		clone.mlaLatent = make([][]*tensors.Tensor, cache.layerCount)
+		clone.mlaRopeKey = make([][]*tensors.Tensor, cache.layerCount)
+		for layer := 0; layer < cache.layerCount; layer++ {
+			clone.mlaLatent[layer] = make([]*tensors.Tensor, len(cache.mlaLatent[layer]))
+			clone.mlaRopeKey[layer] = make([]*tensors.Tensor, len(cache.mlaRopeKey[layer]))
+			for batch := range cache.mlaLatent[layer] {
+				clone.mlaLatent[layer][batch] = cache.mlaLatent[layer][batch].Clone()
+				clone.mlaRopeKey[layer][batch] = cache.mlaRopeKey[layer][batch].Clone()
 			}
 		}
 	}
@@ -540,6 +629,20 @@ func (cache *KVBuffer) BytesAllocated() int {
 			}
 			for _, row := range cache.tailValue[layer] {
 				total += len(row) * 4
+			}
+		}
+	}
+	if cache.mlaLatent != nil {
+		for layer := 0; layer < cache.layerCount; layer++ {
+			for _, tensor := range cache.mlaLatent[layer] {
+				if tensor != nil {
+					total += tensor.Numel() * 4
+				}
+			}
+			for _, tensor := range cache.mlaRopeKey[layer] {
+				if tensor != nil {
+					total += tensor.Numel() * 4
+				}
 			}
 		}
 	}

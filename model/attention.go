@@ -234,7 +234,7 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool, layer 
 // result has shape [batch, sequence, embedding].
 func (attention *CausalSelfAttention) Forward(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, cache *KVBuffer, layer int, share *compressionShare) *tensors.Tensor {
 	if attention.mla != nil {
-		panic("model: MLA attention is not implemented")
+		return attention.mlaForwardInference(input, cosine, sine, positionOffset, window, cache, layer)
 	}
 	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
 	query := attention.projectQuery(input).Reshape(batchSize, sequenceLength, attention.queryHeadCount, attention.headDimension)

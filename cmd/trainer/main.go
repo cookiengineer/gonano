@@ -43,6 +43,8 @@ func main() {
 		sinkhornEmbedding bool
 		queryCompression  int
 		kvLatentDim       int
+		mlaLatent         int
+		mlaRotaryDims     int
 		numIterations     int
 		batchSize         int
 		modelTag          string
@@ -69,6 +71,8 @@ func main() {
 	flag.BoolVar(&sinkhornEmbedding, "sinkhorn-embeddings", false, "Sinkhorn-balanced momentum update for the embedding table, lm_head, and value embeddings")
 	flag.IntVar(&queryCompression, "query-compression-dim", 0, "low-rank query bottleneck width (0 = full-rank)")
 	flag.IntVar(&kvLatentDim, "kv-latent-dim", 0, "shared low-rank KV latent width (0 = full-rank)")
+	flag.IntVar(&mlaLatent, "mla-latent", 0, "absorbed MLA shared latent width (0 disables)")
+	flag.IntVar(&mlaRotaryDims, "mla-rotary-dims", 0, "MLA decoupled rotary width (0 = headDim/2)")
 	flag.IntVar(&numIterations, "num-iterations", 50, "optimization steps")
 	flag.IntVar(&batchSize, "device-batch-size", 1, "sequences per step")
 	flag.StringVar(&modelTag, "model-tag", "", "checkpoint directory name (default d<depth>)")
@@ -104,6 +108,8 @@ func main() {
 	configuration.HeadWiseMuon = headWiseMuon
 	configuration.QueryCompressionDim = queryCompression
 	configuration.KVLatentDim = kvLatentDim
+	configuration.MLALatent = mlaLatent
+	configuration.MLARotaryDims = mlaRotaryDims
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, sinkhornEmbedding)

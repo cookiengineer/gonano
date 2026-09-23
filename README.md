@@ -246,7 +246,7 @@ step-by-step training, export, deployment, and debugging guides. The long-contex
 attention design and the DeepSeek-V4.1-Flash optimizations (CED, CSA2 reuse, the
 hierarchical sparse indexer, low-rank query/KV, the KV prefix cache, the persistent
 multi-entry KV cache tier, head-wise Muon, Sinkhorn-balanced embeddings, on-policy
-distillation, and DSpark speculative decoding with a confidence scheduler) are documented in `guides/05-deepseek-v4.1-optimizations.md`.
+distillation, DSpark speculative decoding with a confidence scheduler, and an absorbed MLA latent KV cache) are documented in `guides/05-deepseek-v4.1-optimizations.md`.
 
 ## Packages
 

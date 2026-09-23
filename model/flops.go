@@ -202,8 +202,13 @@ func (model *Transformer) WeightReadBytes() int {
 }
 
 // KVBytesPerToken returns the bytes to store one token of KV cache across all
-// layers (float32).
+// layers (float32). For MLA it is the shared latent plus the decoupled rotary
+// key, which is smaller than two per-head key/value rows.
 func (model *Transformer) KVBytesPerToken() int {
+	if model.Config.MLAEnabled() {
+		perLayer := model.Config.MLALatent + model.Config.NumKVHead*model.Config.MLARotaryDimension()
+		return model.Config.NumLayer * perLayer * 4
+	}
 	headDimension := model.Config.HeadDim()
 	return model.Config.NumLayer * 2 * model.Config.NumKVHead * headDimension * 4
 }
@@ -212,6 +217,18 @@ func (model *Transformer) KVBytesPerToken() int {
 // given context length (sliding-window layers read only the recent window).
 func (model *Transformer) KVReadBytes(contextLength int) int {
 	headDimension := model.Config.HeadDim()
+	if model.Config.MLAEnabled() {
+		perToken := model.Config.MLALatent + model.Config.NumKVHead*model.Config.MLARotaryDimension()
+		total := 0
+		for _, windowSize := range model.windowSizes {
+			effectiveLength := contextLength
+			if window := windowSize[0]; window >= 0 && window < effectiveLength {
+				effectiveLength = window
+			}
+			total += perToken * 4 * effectiveLength
+		}
+		return total
+	}
 	total := 0
 	for _, windowSize := range model.windowSizes {
 		window := windowSize[0]
