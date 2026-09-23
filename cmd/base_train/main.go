@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 
 	"github.com/cookiengineer/gonano/data"
+	"github.com/cookiengineer/gonano/internal/device"
 	"github.com/cookiengineer/gonano/internal/logging"
 	"github.com/cookiengineer/gonano/model"
 	"github.com/cookiengineer/gonano/model/checkpoint"
@@ -20,10 +21,11 @@ import (
 )
 
 func main() {
-	depth := flag.Int("depth", 12, "transformer depth (complexity dial)")
+	depth := flag.Int("depth", model.DefaultDepth, "transformer depth (complexity dial)")
 	maxSeqLen := flag.Int("max-seq-len", 512, "context length")
 	presetName := flag.String("preset", string(model.DefaultPreset), "architecture preset: flash (DeepSeek-V4.1 long-context + MoE), latent (absorbed MLA + MoE), dense (classic)")
-	vocabSize := flag.Int("vocab-size", 32768, "vocabulary size")
+	vocabSize := flag.Int("vocab-size", model.DefaultVocabSize, "vocabulary size")
+	headDim := flag.Int("head-dim", model.DefaultHeadDim, "attention head dimension")
 	numIterations := flag.Int("num-iterations", 50, "optimization steps")
 	deviceBatchSize := flag.Int("device-batch-size", 1, "per-step batch size")
 	totalBatchSize := flag.Int("total-batch-size", -1, "total batch tokens (-1 = auto)")
@@ -62,7 +64,30 @@ func main() {
 
 	// The preset selects the whole architecture: compression, sparsity,
 	// cross-layer reuse, SWA, CED, MoE, GQA, head-wise Muon, and Sinkhorn.
-	configuration := model.ConfigForPreset(preset, *depth, tokenizer.VocabSize(), 64, 128, *maxSeqLen, "SSSL")
+	configuration := model.ConfigForPreset(preset, *depth, tokenizer.VocabSize(), 64, *headDim, *maxSeqLen, "SSSL")
+
+	// Preflight: refuse to build a training run that cannot fit in RAM. The
+	// trainer is fully in-RAM (weights + gradients + optimizer state plus
+	// activations), so estimate the requirement and compare it against the
+	// kernel's available memory before allocating anything.
+	requiredBytes := model.EstimatedTrainingMemoryBytes(configuration, *deviceBatchSize, *maxSeqLen)
+	if availableBytes, ok := device.AvailableMemoryBytes(); ok && uint64(requiredBytes) > availableBytes {
+		logger.Error("insufficient memory for training",
+			"required", humanGiB(requiredBytes),
+			"available", humanGiB(int64(availableBytes)),
+			"params", model.TotalParamsForConfig(configuration),
+			"depth", *depth, "head_dim", *headDim, "vocab", tokenizer.VocabSize(),
+			"device_batch_size", *deviceBatchSize, "max_seq_len", *maxSeqLen)
+		fmt.Fprintf(os.Stderr,
+			"gonano: estimated training memory %s exceeds the available %s.\n"+
+				"  The trainer is fully in-RAM: %d bytes/parameter for weights, gradients, and optimizer state, plus activations.\n"+
+				"  Lower --depth, --device-batch-size, or --max-seq-len, or run on a host with more RAM.\n"+
+				"  (Weights alone are %.1f GiB; checkpoints go to disk, but the training working set cannot.)\n",
+			humanGiB(requiredBytes), humanGiB(int64(availableBytes)), model.TrainingBytesPerParameter,
+			float64(model.TotalParamsForConfig(configuration))*4/(1<<30))
+		os.Exit(1)
+	}
+
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 
@@ -136,6 +161,11 @@ func modelTagOrDepth(tag string, depth int) string {
 		return tag
 	}
 	return fmt.Sprintf("d%d", depth)
+}
+
+// humanGiB formats a byte count as GiB for the memory preflight messages.
+func humanGiB(bytes int64) string {
+	return fmt.Sprintf("%.1f GiB", float64(bytes)/(1<<30))
 }
 
 func byteTokenizer() *tokenizer.Tokenizer {

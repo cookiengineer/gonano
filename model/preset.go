@@ -29,6 +29,23 @@ const (
 // DefaultPreset is the preset applied when none is specified.
 const DefaultPreset = PresetFlash
 
+// Default model-sizing knobs shared by the training commands. Together with the
+// default flash preset they target a ~5.3B-total / ~1.6B-active
+// Mixture-of-Experts model with a 128k vocabulary and a 64-wide head, which
+// gives grouped-query attention at even depths. The depth is chosen so the full
+// float32 training working set (weights + gradients + optimizer state,
+// ~12 bytes/parameter) fits alongside activations on a ~96 GB host; raise it on
+// a larger machine.
+const (
+	// DefaultDepth is the transformer depth dial (n_embd = depth * aspect ratio).
+	DefaultDepth = 20
+	// DefaultVocabSize is the target vocabulary size (padded to a multiple of 64).
+	DefaultVocabSize = 131072
+	// DefaultHeadDim is the attention head width. 64 keeps the query head count
+	// even at even depths, so grouped-query attention applies.
+	DefaultHeadDim = 64
+)
+
 // ParsePreset resolves a preset name. The empty string selects DefaultPreset.
 func ParsePreset(name string) (Preset, error) {
 	switch strings.ToLower(strings.TrimSpace(name)) {

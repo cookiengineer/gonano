@@ -207,8 +207,10 @@ Key flags (`cmd/base_train/main.go`):
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--depth` | number of layers; sets width/heads automatically | 12 |
+| `--depth` | number of layers; sets width/heads automatically | 20 |
 | `--preset` | architecture preset: `flash` (DeepSeek-V4.1 long-context + MoE), `latent` (MLA + MoE), `dense` | `flash` |
+| `--vocab-size` | target vocabulary size (multiple of 64) | 131072 |
+| `--head-dim` | attention head width; 64 keeps grouped-query attention at even depths | 64 |
 | `--max-seq-len` | context length | 512 |
 | `--num-iterations` | optimization steps | 50 |
 | `--device-batch-size` | sequences per step | 1 |
@@ -220,10 +222,25 @@ Key flags (`cmd/base_train/main.go`):
 
 What happens under the hood (`trainer/trainer.go`, `trainer/scaling.go`):
 
-1. `model.ConfigForPreset(preset, depth, vocab, 64, 128, seqLen, "SSSL")`
-   computes `n_embd = depth*64` (rounded up to a multiple of the 128-dim head)
+1. `model.ConfigForPreset(preset, depth, vocab, 64, headDim, seqLen, "SSSL")`
+   computes `n_embd = depth*64` (rounded up to a multiple of the head width)
    and then applies the preset (compression, sparse attention, cross-layer
-   reuse, SWA, CED, MoE, GQA, head-wise Muon by default).
+   reuse, SWA, CED, MoE, GQA, head-wise Muon by default). The defaults
+   (`--depth 20 --head-dim 64 --vocab-size 131072`) describe a ~5.3B-total /
+   ~1.6B-active MoE.
+
+> **Training memory.** The trainer is fully in-RAM: a training step needs the
+> float32 weights, the gradients, and the optimizer state resident at once —
+> roughly `12 bytes/parameter` for the flash preset (Muon momentum + factored
+> second moment, Sinkhorn momentum for the embedding tables), plus activations
+> and the Go runtime. Checkpoints (`checkpoint.Save`) go to SSD, but SSD does
+> **not** extend the training working set: gonano has no activation, gradient,
+> or optimizer offloading. `base_train` estimates the requirement (via
+> `model.EstimatedTrainingMemoryBytes`) and exits before allocating if it
+> exceeds the host's available memory. For reference at the default 128k vocab:
+> depth 20 → 19.9 GiB weights / ~60 GiB training state; depth 22 → 27.7 GiB /
+> ~83 GiB; depth 24 → 37.9 GiB / ~114 GiB. Inference (weights only) can hold a
+> larger checkpoint than the host can train.
 2. `trainer.DeriveHyperparams` computes the total batch size
    (`B ∝ D^0.383`, Power Laws), the LR scaling (`∝ √B`), and weight decay
    (T-epoch framework).

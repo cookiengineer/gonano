@@ -11,12 +11,13 @@ import (
 	"github.com/cookiengineer/gonano/data"
 	"github.com/cookiengineer/gonano/data/parquet"
 	"github.com/cookiengineer/gonano/internal/logging"
+	"github.com/cookiengineer/gonano/model"
 	"github.com/cookiengineer/gonano/tokenizer"
 )
 
 func main() {
 	dataDir := flag.String("data-dir", "", "directory of .parquet text shards (required)")
-	vocabSize := flag.Int("vocab-size", 32768, "vocabulary size")
+	vocabSize := flag.Int("vocab-size", model.DefaultVocabSize, "vocabulary size")
 	maxChars := flag.Int("max-chars", 2000000, "max characters to train on")
 	baseDir := flag.String("base-dir", "", "output directory (default ~/.cache/gonano)")
 	flag.Parse()

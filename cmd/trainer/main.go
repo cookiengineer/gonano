@@ -29,6 +29,7 @@ func main() {
 		vocabSize     int
 		maxChars      int
 		depth         int
+		headDim       int
 		maxSeqLen     int
 		presetName    string
 		numIterations int
@@ -41,9 +42,10 @@ func main() {
 	flag.StringVar(&format, "format", "parquet", "data format: parquet|markdown")
 	flag.StringVar(&tokenizerPath, "tokenizer", "", "path to a tokenizer.json (overrides auto-setup)")
 	flag.BoolVar(&trainTok, "train-tokenizer", false, "train a new tokenizer on the data (ignored if --tokenizer is set)")
-	flag.IntVar(&vocabSize, "vocab-size", 32768, "vocabulary size when training a tokenizer")
+	flag.IntVar(&vocabSize, "vocab-size", model.DefaultVocabSize, "vocabulary size when training a tokenizer")
 	flag.IntVar(&maxChars, "max-chars", 2000000000, "max characters for tokenizer training")
-	flag.IntVar(&depth, "depth", 12, "transformer depth (the complexity dial)")
+	flag.IntVar(&depth, "depth", model.DefaultDepth, "transformer depth (the complexity dial)")
+	flag.IntVar(&headDim, "head-dim", model.DefaultHeadDim, "attention head dimension")
 	flag.IntVar(&maxSeqLen, "max-seq-len", 512, "context length")
 	flag.StringVar(&presetName, "preset", string(model.DefaultPreset), "architecture preset: flash (DeepSeek-V4.1 long-context + MoE), latent (absorbed MLA + MoE), dense (classic)")
 	flag.IntVar(&numIterations, "num-iterations", 50, "optimization steps")
@@ -75,7 +77,7 @@ func main() {
 	tokenizer := setupTokenizer(logger, baseDir, dataDir, format, tokenizerPath, trainTok, vocabSize, maxChars)
 
 	// 2) Model: the preset selects the whole architecture.
-	configuration := model.ConfigForPreset(preset, depth, tokenizer.VocabSize(), 64, 128, maxSeqLen, "SSSL")
+	configuration := model.ConfigForPreset(preset, depth, tokenizer.VocabSize(), 64, headDim, maxSeqLen, "SSSL")
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, preset.UsesSinkhorn())
