@@ -2,6 +2,7 @@ package model
 
 import (
 	"math"
+	"sort"
 	"testing"
 
 	"github.com/cookiengineer/gonano/tensors"
@@ -266,6 +267,60 @@ func TestHierarchicalPoolCoversAllWhenUnbounded(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// referenceTopK is an independent full-sort implementation used to verify the
+// bounded top-k selection.
+func referenceTopK(values []float32, k int) []int {
+	if k <= 0 {
+		return []int{}
+	}
+	order := make([]int, len(values))
+	for index := range order {
+		order[index] = index
+	}
+	sort.SliceStable(order, func(left, right int) bool {
+		if values[order[left]] != values[order[right]] {
+			return values[order[left]] > values[order[right]]
+		}
+		return order[left] < order[right]
+	})
+	if k < len(order) {
+		order = order[:k]
+	}
+	return order
+}
+
+func TestTopKIndicesMatchesFullSort(t *testing.T) {
+	rng := tensors.NewRNG(2024)
+	for _, length := range []int{0, 1, 2, 5, 16, 64, 257, 1000} {
+		values := make([]float32, length)
+		for index := range values {
+			// Quantize so the input contains many ties.
+			values[index] = float32(int(rng.NormFloat32() * 4))
+		}
+		for _, k := range []int{-1, 0, 1, 3, length / 2, length, length + 5} {
+			got := topKIndices(values, k)
+			want := referenceTopK(values, k)
+			if len(got) != len(want) {
+				t.Fatalf("length %d k %d: got %d indices, want %d", length, k, len(got), len(want))
+			}
+			for index := range want {
+				if got[index] != want[index] {
+					t.Fatalf("length %d k %d: got %v, want %v", length, k, got, want)
+				}
+			}
+		}
+	}
+}
+
+func TestTopKIndicesTieBreak(t *testing.T) {
+	// Three equal maxima: the smallest indices win, in order.
+	values := []float32{5, 5, 5, 1, 2}
+	got := topKIndices(values, 2)
+	if len(got) != 2 || got[0] != 0 || got[1] != 1 {
+		t.Fatalf("topKIndices = %v, want [0 1]", got)
 	}
 }
 

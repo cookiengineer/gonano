@@ -77,6 +77,24 @@ type LinearAlgebra interface {
 	DotProduct(left, right []float32) float32
 }
 
+// Indexer is the contract for the lightning indexer's sparse scoring. It
+// computes, for every query row and key block, the ReLU-weighted multi-head dot
+// product that selects which compressed blocks each query attends to
+// (DeepSeek-V4.1 §2.3). query is [rowCount, headCount, dim], key is
+// [blockCount, headCount, dim], weight is [headCount], and destination is
+// [rowCount, blockCount]:
+//
+//	destination[row, block] = sum_h weight[h] * max(0, dot(query[row,h], key[block,h]))
+type Indexer interface {
+	// IndexerScores computes the per-(row, block) index scores. weight must
+	// have headCount elements.
+	IndexerScores(destination, query, key, weight []float32, rowCount, blockCount, headCount, dim int)
+	// PooledMean averages consecutive non-overlapping groups of `groupSize`
+	// rows of source [blockCount, width] into destination [ceil(blockCount/
+	// groupSize), width]. The trailing group keeps its actual row count.
+	PooledMean(destination, source []float32, blockCount, groupSize, width int)
+}
+
 // Rows is the contract for fused operations that normalize each row of a
 // matrix independently.
 type Rows interface {
@@ -213,6 +231,7 @@ type Backend interface {
 	Elementwise
 	Reductions
 	LinearAlgebra
+	Indexer
 	Rows
 	Attention
 }

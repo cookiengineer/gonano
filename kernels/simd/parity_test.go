@@ -403,3 +403,52 @@ func TestAttentionParity(t *testing.T) {
 		})
 	}
 }
+
+// TestIndexerScoresParity verifies the lightning-indexer scoring kernel against
+// the scalar reference across non-vector-multiple shapes.
+func TestIndexerScoresParity(t *testing.T) {
+	simdBackend := simdbackend.New()
+	scalarBackend := scalar.New()
+
+	shapes := []struct{ rows, blocks, heads, dim int }{
+		{1, 1, 1, 1},
+		{3, 7, 2, 5},
+		{8, 33, 4, 13},
+		{17, 129, 3, 64},
+		{40, 200, 5, 128},
+	}
+	for _, shape := range shapes {
+		query := kerneltest.Data(shape.rows * shape.heads * shape.dim)
+		key := kerneltest.DataB(shape.blocks * shape.heads * shape.dim)
+		weight := kerneltest.Data(shape.heads)
+		got := make([]float32, shape.rows*shape.blocks)
+		want := make([]float32, shape.rows*shape.blocks)
+		simdBackend.IndexerScores(got, query, key, weight, shape.rows, shape.blocks, shape.heads, shape.dim)
+		scalarBackend.IndexerScores(want, query, key, weight, shape.rows, shape.blocks, shape.heads, shape.dim)
+		kerneltest.AssertSlicesClose(t, got, want, 2e-3, 1e-5)
+	}
+}
+
+// TestPooledMeanParity verifies the indexer's pooled-mean kernel against the
+// scalar reference, including a partial trailing group.
+func TestPooledMeanParity(t *testing.T) {
+	simdBackend := simdbackend.New()
+	scalarBackend := scalar.New()
+
+	cases := []struct{ blocks, groupSize, width int }{
+		{1, 1, 1},
+		{3, 2, 5},
+		{64, 8, 13},
+		{129, 7, 64},
+		{200, 16, 128},
+	}
+	for _, testCase := range cases {
+		groups := (testCase.blocks + testCase.groupSize - 1) / testCase.groupSize
+		source := kerneltest.Data(testCase.blocks * testCase.width)
+		got := make([]float32, groups*testCase.width)
+		want := make([]float32, groups*testCase.width)
+		simdBackend.PooledMean(got, source, testCase.blocks, testCase.groupSize, testCase.width)
+		scalarBackend.PooledMean(want, source, testCase.blocks, testCase.groupSize, testCase.width)
+		kerneltest.AssertSlicesClose(t, got, want, 1e-5, 1e-6)
+	}
+}

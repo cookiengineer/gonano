@@ -68,24 +68,14 @@ func (indexer *SparseIndexer) ScoresWithContext(hidden, compressed *tensors.Tens
 	queryData, keyData, scoreData := query.Data, key.Data, scores.Data
 	weightData := indexer.headWeights.Data
 
-	for row := 0; row < batchSize*sequenceLength; row++ {
-		batchIndex := row / sequenceLength
-		for block := 0; block < blockCount; block++ {
-			keyRow := batchIndex*blockCount + block
-			var total float32
-			for head := 0; head < headCount; head++ {
-				queryBase := (row*headCount + head) * dim
-				keyBase := (keyRow*headCount + head) * dim
-				var dot float32
-				for index := 0; index < dim; index++ {
-					dot += queryData[queryBase+index] * keyData[keyBase+index]
-				}
-				if dot > 0 {
-					total += weightData[head] * dot
-				}
-			}
-			scoreData[row*blockCount+block] = total
-		}
+	// Score each batch's key set with the fused, vectorized indexer kernel.
+	queryWidth := headCount * dim
+	backend := tensors.KernelBackend()
+	for batch := 0; batch < batchSize; batch++ {
+		queryBatch := queryData[batch*sequenceLength*queryWidth : (batch+1)*sequenceLength*queryWidth]
+		keyBatch := keyData[batch*blockCount*queryWidth : (batch+1)*blockCount*queryWidth]
+		scoreBatch := scoreData[batch*sequenceLength*blockCount : (batch+1)*sequenceLength*blockCount]
+		backend.IndexerScores(scoreBatch, queryBatch, keyBatch, weightData, sequenceLength, blockCount, headCount, dim)
 	}
 	return scores, &indexerContext{
 		hidden:         hidden,
@@ -180,18 +170,8 @@ func TopK(scores *tensors.Tensor, k int) [][]int {
 	}
 	selected := make([][]int, rowCount)
 	for row := 0; row < rowCount; row++ {
-		order := make([]int, blockCount)
-		for block := 0; block < blockCount; block++ {
-			order[block] = block
-		}
 		rowScores := scores.Data[row*blockCount : (row+1)*blockCount]
-		sort.SliceStable(order, func(left, right int) bool {
-			if rowScores[order[left]] != rowScores[order[right]] {
-				return rowScores[order[left]] > rowScores[order[right]]
-			}
-			return order[left] < order[right]
-		})
-		selected[row] = append([]int(nil), order[:k]...)
+		selected[row] = topKIndices(rowScores, k)
 	}
 	return selected
 }
@@ -215,22 +195,9 @@ func SelectBlocks(scores *tensors.Tensor, positionOffset, ratio, topK int) [][]i
 			selection[token] = []int{}
 			continue
 		}
-		order := make([]int, allowed)
-		for block := 0; block < allowed; block++ {
-			order[block] = block
-		}
 		rowScores := scores.Data[token*blockCount : token*blockCount+allowed]
-		sort.SliceStable(order, func(left, right int) bool {
-			if rowScores[order[left]] != rowScores[order[right]] {
-				return rowScores[order[left]] > rowScores[order[right]]
-			}
-			return order[left] < order[right]
-		})
-		count := topK
-		if count > allowed {
-			count = allowed
-		}
-		selection[token] = append([]int(nil), order[:count]...)
+		count := min(topK, allowed)
+		selection[token] = topKIndices(rowScores, count)
 	}
 	return selection
 }
@@ -249,6 +216,91 @@ func argsortDescending(values []float32) []int {
 		return order[left] < order[right]
 	})
 	return order
+}
+
+// topKIndices returns the indices of the k largest values in descending order,
+// with ties broken toward the smaller index. It uses a bounded size-k selection
+// when k is much smaller than the input and falls back to a full sort otherwise.
+// The result is identical to argsortDescending(values)[:k].
+func topKIndices(values []float32, k int) []int {
+	if k <= 0 {
+		return []int{}
+	}
+	if k >= len(values) {
+		return argsortDescending(values)
+	}
+	// For large k the bounded heap's constant factors lose to the optimized
+	// sort, so only use it when it meaningfully prunes the comparison count.
+	if k*4 >= len(values) {
+		return argsortDescending(values)[:k]
+	}
+	heap := make([]int, 0, k)
+	for index := range values {
+		if len(heap) < k {
+			heap = append(heap, index)
+			siftUpIndex(values, heap, len(heap)-1)
+			continue
+		}
+		if indexBetter(values, index, heap[0]) {
+			heap[0] = index
+			siftDownIndex(values, heap, 0)
+		}
+	}
+	// Pop the worst (heap root) repeatedly to obtain ascending order, then
+	// reverse into descending order.
+	ordered := make([]int, len(heap))
+	for count := len(heap) - 1; count >= 0; count-- {
+		ordered[count] = heap[0]
+		heap[0] = heap[len(heap)-1]
+		heap = heap[:len(heap)-1]
+		siftDownIndex(values, heap, 0)
+	}
+	return ordered
+}
+
+// indexBetter reports whether candidate index a outranks b: larger value, or
+// equal value with a smaller index.
+func indexBetter(values []float32, a, b int) bool {
+	if values[a] != values[b] {
+		return values[a] > values[b]
+	}
+	return a < b
+}
+
+// siftUpIndex restores the min-heap invariant where the root is the worst
+// retained element.
+func siftUpIndex(values []float32, heap []int, position int) {
+	for position > 0 {
+		parent := (position - 1) / 2
+		if !indexBetter(values, heap[parent], heap[position]) {
+			break
+		}
+		heap[parent], heap[position] = heap[position], heap[parent]
+		position = parent
+	}
+}
+
+// siftDownIndex restores the min-heap invariant from the root.
+func siftDownIndex(values []float32, heap []int, position int) {
+	size := len(heap)
+	for {
+		left := 2*position + 1
+		if left >= size {
+			return
+		}
+		worst := position
+		if indexBetter(values, heap[position], heap[left]) {
+			worst = left
+		}
+		if right := left + 1; right < size && indexBetter(values, heap[worst], heap[right]) {
+			worst = right
+		}
+		if worst == position {
+			return
+		}
+		heap[position], heap[worst] = heap[worst], heap[position]
+		position = worst
+	}
 }
 
 // HierarchicalSelect is the two-level indexer of DeepSeek-V4.1 (§2.3.2).
@@ -309,24 +361,22 @@ func (indexer *SparseIndexer) selectHierarchical(queryData, keyData []float32, b
 
 	selection = make([][]int, batchSize*sequenceLength)
 	candidatePool = make([][]int, batchSize*sequenceLength)
+	backend := tensors.KernelBackend()
+	// For a whole sequence of queries the coarse scoring is a batched GEMM and
+	// the fused kernel wins; for single-token decode (sequenceLength == 1) it
+	// would just add per-row goroutine overhead, so the scalar loop is used.
+	useKernelCoarse := sequenceLength >= indexerKernelCoarseMinRows
 	for batch := 0; batch < batchSize; batch++ {
 		batchKeyBase := batch * blockCount * headWidth
 		groups := (blockCount + pool - 1) / pool
 		pooled := make([]float32, groups*headWidth)
-		for group := 0; group < groups; group++ {
-			start := group * pool
-			end := min(start+pool, blockCount)
-			count := end - start
-			if count <= 0 {
-				continue
-			}
-			for element := 0; element < headWidth; element++ {
-				var sum float32
-				for entry := start; entry < end; entry++ {
-					sum += keyData[batchKeyBase+entry*headWidth+element]
-				}
-				pooled[group*headWidth+element] = sum / float32(count)
-			}
+		backend.PooledMean(pooled, keyData[batchKeyBase:batchKeyBase+blockCount*headWidth], blockCount, pool, headWidth)
+
+		var coarseAll []float32
+		if useKernelCoarse {
+			coarseAll = make([]float32, sequenceLength*groups)
+			queryBatch := queryData[batch*sequenceLength*headWidth : (batch+1)*sequenceLength*headWidth]
+			backend.IndexerScores(coarseAll, queryBatch, pooled, weightData, sequenceLength, groups, headCount, dim)
 		}
 
 		for token := 0; token < sequenceLength; token++ {
@@ -343,25 +393,29 @@ func (indexer *SparseIndexer) selectHierarchical(queryData, keyData []float32, b
 			queryBase := row * headWidth
 
 			allowedGroups := (allowed + pool - 1) / pool
-			coarse := make([]float32, allowedGroups)
-			for group := 0; group < allowedGroups; group++ {
-				var total float32
-				for head := 0; head < headCount; head++ {
-					var dot float32
-					for dimension := 0; dimension < dim; dimension++ {
-						dot += queryData[queryBase+head*dim+dimension] * pooled[group*headWidth+head*dim+dimension]
+			var coarse []float32
+			if useKernelCoarse {
+				coarse = coarseAll[token*groups : token*groups+allowedGroups]
+			} else {
+				coarse = make([]float32, allowedGroups)
+				for group := 0; group < allowedGroups; group++ {
+					var total float32
+					for head := 0; head < headCount; head++ {
+						var dot float32
+						queryHead := queryData[queryBase+head*dim:]
+						pooledHead := pooled[group*headWidth+head*dim:]
+						for dimension := 0; dimension < dim; dimension++ {
+							dot += queryHead[dimension] * pooledHead[dimension]
+						}
+						if dot > 0 {
+							total += weightData[head] * dot
+						}
 					}
-					if dot > 0 {
-						total += weightData[head] * dot
-					}
+					coarse[group] = total
 				}
-				coarse[group] = total
 			}
 
-			chosenGroups := argsortDescending(coarse)
-			if len(chosenGroups) > groupsPerToken {
-				chosenGroups = chosenGroups[:groupsPerToken]
-			}
+			chosenGroups := topKIndices(coarse, groupsPerToken)
 			candidates := make([]int, 0, groupsPerToken*pool)
 			for _, group := range chosenGroups {
 				start := group * pool
@@ -376,6 +430,10 @@ func (indexer *SparseIndexer) selectHierarchical(queryData, keyData []float32, b
 	}
 	return selection, candidatePool
 }
+
+// indexerKernelCoarseMinRows is the query-row count at which the batched coarse
+// scoring kernel beats the per-row scalar loop.
+const indexerKernelCoarseMinRows = 16
 
 // selectWithinPool scores only the candidate blocks of each query row and
 // selects its top-k. The caller must guarantee the pool contains only causally
@@ -441,10 +499,9 @@ func (indexer *SparseIndexer) fineSelect(queryData, keyData []float32, row, batc
 	if len(kept) == 0 {
 		return []int{}
 	}
-	order := argsortDescending(fine)
-	count := min(topK, len(order))
-	selected := make([]int, count)
-	for index := 0; index < count; index++ {
+	order := topKIndices(fine, topK)
+	selected := make([]int, len(order))
+	for index := range order {
 		selected[index] = kept[order[index]]
 	}
 	return selected
