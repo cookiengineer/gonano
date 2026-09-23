@@ -148,7 +148,7 @@ func (model *Transformer) InitWeights(rng *tensors.RNG) {
 // autoregressive inference (KV-cache). Loss computation is intentionally kept
 // out of the model; callers use tensors.CrossEntropy on the returned logits.
 func (model *Transformer) Forward(indexes *tensors.Int32s, cache *KVBuffer) *tensors.Tensor {
-	logits, _ := model.forward(indexes, cache, false)
+	logits, _ := model.forward(indexes, cache, false, nil, 0)
 	return logits
 }
 
@@ -156,7 +156,16 @@ func (model *Transformer) Forward(indexes *tensors.Int32s, cache *KVBuffer) *ten
 // [B,T,EmbedDim] that feeds lm_head. It is used to train the DSpark confidence
 // head.
 func (model *Transformer) ForwardHidden(indexes *tensors.Int32s, cache *KVBuffer) (logits, hidden *tensors.Tensor) {
-	return model.forward(indexes, cache, false)
+	return model.forward(indexes, cache, false, nil, 0)
+}
+
+// ForwardHiddenSuffix is ForwardHidden with the embeddings of positions
+// [suffixStart, T) replaced by the single [1, EmbedDim] suffixEmbedding before
+// the trunk runs. DSpark's semi-autoregressive drafting uses it to append
+// learned draft-mask positions and read the parallel next-token predictions for
+// those positions in a single causal forward pass (DeepSeek-V4.1 §2.4.3).
+func (model *Transformer) ForwardHiddenSuffix(indexes *tensors.Int32s, cache *KVBuffer, suffixEmbedding *tensors.Tensor, suffixStart int) (logits, hidden *tensors.Tensor) {
+	return model.forward(indexes, cache, false, suffixEmbedding, suffixStart)
 }
 
 // ReplaySWA runs the model over a suffix of an already-filled cache to rebuild
@@ -167,10 +176,10 @@ func (model *Transformer) ForwardHidden(indexes *tensors.Int32s, cache *KVBuffer
 // that the cache's raw buffers for [position, position+len(indexes)) are
 // refilled.
 func (model *Transformer) ReplaySWA(indexes *tensors.Int32s, cache *KVBuffer) {
-	model.forward(indexes, cache, true)
+	model.forward(indexes, cache, true, nil, 0)
 }
 
-func (model *Transformer) forward(indexes *tensors.Int32s, cache *KVBuffer, replay bool) (*tensors.Tensor, *tensors.Tensor) {
+func (model *Transformer) forward(indexes *tensors.Int32s, cache *KVBuffer, replay bool, suffixEmbedding *tensors.Tensor, suffixStart int) (*tensors.Tensor, *tensors.Tensor) {
 	batchSize, sequenceLength := indexes.Shape[0], indexes.Shape[1]
 	if sequenceLength > model.Config.SequenceLen {
 		panic("model: sequence longer than rotary cache")
@@ -184,6 +193,9 @@ func (model *Transformer) forward(indexes *tensors.Int32s, cache *KVBuffer, repl
 
 	activations := model.tokenEmbedding.Forward(indexes) // [B,T,C]
 	activations = normalizeLastDim(activations)
+	if suffixEmbedding != nil && suffixStart < sequenceLength {
+		applySuffixEmbedding(activations, suffixEmbedding, suffixStart)
+	}
 
 	positionOffset := 0
 	if cache != nil {
@@ -266,6 +278,26 @@ func (model *Transformer) forward(indexes *tensors.Int32s, cache *KVBuffer, repl
 	logits = trimVocab(logits, model.paddedVocab, model.Config.VocabSize)
 	logits = tensors.Softcap(logits, softcap)
 	return logits.Reshape(batchSize, sequenceLength, model.Config.VocabSize), activations
+}
+
+// applySuffixEmbedding overwrites rows [suffixStart, T) of a [B, T, C]
+// activation tensor with the single [1, C] suffix embedding, broadcast across
+// batch and suffix rows. It lets the drafter insert learned draft-mask
+// positions without extending the vocabulary.
+func applySuffixEmbedding(activations, suffixEmbedding *tensors.Tensor, suffixStart int) {
+	batchSize := activations.Shape[0]
+	sequenceLength := activations.Shape[1]
+	channels := activations.Shape[2]
+	if len(suffixEmbedding.Data) < channels {
+		return
+	}
+	source := suffixEmbedding.Data[:channels]
+	for batch := 0; batch < batchSize; batch++ {
+		for position := suffixStart; position < sequenceLength; position++ {
+			base := (batch*sequenceLength + position) * channels
+			copy(activations.Data[base:base+channels], source)
+		}
+	}
 }
 
 // PrefillCED runs the causal encoder-decoder prefill. The encoder half

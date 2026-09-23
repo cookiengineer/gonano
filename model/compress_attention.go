@@ -68,24 +68,31 @@ func sparseTrainingPlan(attention *CausalSelfAttention, input, keyCompressed, qu
 			scores, context := attention.indexer.ScoresWithContext(hiddenSlice, compressed)
 			contexts[index] = context
 			scoresByHead[index] = scores
+			target := distillationTarget(queryHeadMajor, keyCompressed, batch, head, headRatio, ratio, sequenceLength, blockCount, headDimension)
 			if attention.reuseMode == ReuseReindex && usePool && sharedPool != nil {
 				var candidatePool [][]int
 				if index < len(sharedPool) {
 					candidatePool = sharedPool[index]
 				}
 				selection[index] = attention.indexer.selectWithinPool(context.query.Data, context.key.Data, 1, sequenceLength, blockCount, 0, ratio, attention.sparseTopK, candidatePool)
+				// Deeper indexers are optimized under the same search domain
+				// they use at inference (DeepSeek-V4.1 §2.3.2): restrict the
+				// distillation to the shared candidate pool.
+				if candidatePool != nil {
+					restrictIndexerToPool(scores, target, candidatePool)
+				}
 			} else {
 				poolSize := attention.indexerPool
 				if poolSize < 1 {
 					poolSize = 1
 				}
-				selected, candidates := attention.indexer.selectHierarchical(context.query.Data, context.key.Data, 1, sequenceLength, blockCount, 0, ratio, attention.sparseTopK, poolSize, attention.indexerCandidates)
+				selected, candidates := attention.indexer.selectFromScoreMatrix(scores.Data, 1, sequenceLength, blockCount, 0, ratio, attention.sparseTopK, poolSize, attention.indexerCandidates)
 				selection[index] = selected
 				if producedPool != nil {
 					producedPool[index] = candidates
 				}
 			}
-			targets[index] = distillationTarget(queryHeadMajor, keyCompressed, batch, head, headRatio, ratio, sequenceLength, blockCount, headDimension)
+			targets[index] = target
 		}
 	}
 	return selection, contexts, scoresByHead, targets, producedPool
@@ -173,6 +180,41 @@ func distillationTarget(queryHeadMajor, keyCompressed *tensors.Tensor, batch, ke
 	return target
 }
 
+// restrictIndexerToPool masks an indexer's scores and distillation target to a
+// shared candidate pool: entries outside the pool get a -inf score and a zero
+// target, and the target is renormalized within the pool. This makes a Reindex
+// layer's indexer optimize under the same search domain it uses at inference
+// (DeepSeek-V4.1 §2.3.2).
+func restrictIndexerToPool(scores, target *tensors.Tensor, pool [][]int) {
+	blockCount := scores.Shape[1]
+	rowCount := scores.Shape[0]
+	for row := 0; row < rowCount; row++ {
+		var allowed []int
+		if row < len(pool) {
+			allowed = pool[row]
+		}
+		inPool := make(map[int]bool, len(allowed))
+		for _, entry := range allowed {
+			inPool[entry] = true
+		}
+		base := row * blockCount
+		var total float64
+		for entry := 0; entry < blockCount; entry++ {
+			if !inPool[entry] {
+				scores.Data[base+entry] = float32(math.Inf(-1))
+				target.Data[base+entry] = 0
+				continue
+			}
+			total += float64(target.Data[base+entry])
+		}
+		if total > 0 {
+			for entry := range inPool {
+				target.Data[base+entry] = float32(float64(target.Data[base+entry]) / total)
+			}
+		}
+	}
+}
+
 // maskedIndexerSoftmax returns the indexer softmax restricted to each token's
 // allowed blocks (others are zero).
 func maskedIndexerSoftmax(scores *tensors.Tensor, ratio int) []float32 {
@@ -192,6 +234,11 @@ func maskedIndexerSoftmax(scores *tensors.Tensor, ratio int) []float32 {
 			if scores.Data[token*blockCount+block] > maximum {
 				maximum = scores.Data[token*blockCount+block]
 			}
+		}
+		// A row fully masked by the candidate pool has no finite score; leave
+		// its probabilities at zero instead of producing NaN.
+		if math.IsInf(float64(maximum), -1) {
+			continue
 		}
 		var total float64
 		for block := 0; block < allowed; block++ {

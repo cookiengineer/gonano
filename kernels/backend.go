@@ -89,10 +89,15 @@ type Indexer interface {
 	// IndexerScores computes the per-(row, block) index scores. weight must
 	// have headCount elements.
 	IndexerScores(destination, query, key, weight []float32, rowCount, blockCount, headCount, dim int)
-	// PooledMean averages consecutive non-overlapping groups of `groupSize`
-	// rows of source [blockCount, width] into destination [ceil(blockCount/
-	// groupSize), width]. The trailing group keeps its actual row count.
-	PooledMean(destination, source []float32, blockCount, groupSize, width int)
+	// IndexerBlockMax reduces consecutive non-overlapping groups of
+	// `groupSize` score columns: destination[row, g] is the maximum of
+	// scores[row, g*groupSize:(g+1)*groupSize]. scores is
+	// [rowCount, blockCount] and destination is [rowCount, groups] with
+	// groups = ceil(blockCount/groupSize). The trailing group keeps its
+	// actual column count. It implements the hierarchical indexer's block
+	// score, where a block's score is the maximum index score among its
+	// entries (DeepSeek-V4.1 §2.3.2).
+	IndexerBlockMax(destination, scores []float32, rowCount, blockCount, groupSize int)
 }
 
 // Rows is the contract for fused operations that normalize each row of a

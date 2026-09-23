@@ -29,6 +29,7 @@ func main() {
 	numIterations := flag.Int("num-iterations", 200, "trunk distillation steps")
 	headSteps := flag.Int("head-steps", 100, "head training steps")
 	headLR := flag.Float64("head-lr", 1e-3, "head learning rate")
+	draftPositions := flag.Int("draft-positions", model.DefaultDraftPositions(), "semi-autoregressive draft positions trained in parallel")
 	deviceBatchSize := flag.Int("device-batch-size", 1, "per-step batch size")
 	distillTemperature := flag.Float64("distill-temperature", 1.0, "distillation softmax temperature")
 	outPath := flag.String("out", "", "output drafter checkpoint path")
@@ -111,7 +112,7 @@ func main() {
 	headOptimizer := optimizer.NewMuonAdamW(dspark.SetupHeadOptimizer(float32(*headLR), 0))
 	for step := 0; step < *headSteps; step++ {
 		inputs, targets, _ := loader.Next()
-		loss := dspark.TrainHeadsStep(inputs, targets)
+		loss := dspark.TrainHeadsStep(inputs, targets, *draftPositions)
 		headOptimizer.Step()
 		if step%20 == 0 {
 			logger.Info("dspark-heads", "step", step, "loss", fmt.Sprintf("%.4f", loss))

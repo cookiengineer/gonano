@@ -429,26 +429,26 @@ func TestIndexerScoresParity(t *testing.T) {
 	}
 }
 
-// TestPooledMeanParity verifies the indexer's pooled-mean kernel against the
-// scalar reference, including a partial trailing group.
-func TestPooledMeanParity(t *testing.T) {
+// TestIndexerBlockMaxParity verifies the indexer's block-max reduction kernel
+// against the scalar reference, including a partial trailing group.
+func TestIndexerBlockMaxParity(t *testing.T) {
 	simdBackend := simdbackend.New()
 	scalarBackend := scalar.New()
 
-	cases := []struct{ blocks, groupSize, width int }{
+	cases := []struct{ rows, blocks, groupSize int }{
 		{1, 1, 1},
-		{3, 2, 5},
-		{64, 8, 13},
-		{129, 7, 64},
-		{200, 16, 128},
+		{3, 5, 2},
+		{8, 64, 8},
+		{17, 129, 7},
+		{40, 200, 16},
 	}
 	for _, testCase := range cases {
 		groups := (testCase.blocks + testCase.groupSize - 1) / testCase.groupSize
-		source := kerneltest.Data(testCase.blocks * testCase.width)
-		got := make([]float32, groups*testCase.width)
-		want := make([]float32, groups*testCase.width)
-		simdBackend.PooledMean(got, source, testCase.blocks, testCase.groupSize, testCase.width)
-		scalarBackend.PooledMean(want, source, testCase.blocks, testCase.groupSize, testCase.width)
+		source := kerneltest.Data(testCase.rows * testCase.blocks)
+		got := make([]float32, testCase.rows*groups)
+		want := make([]float32, testCase.rows*groups)
+		simdBackend.IndexerBlockMax(got, source, testCase.rows, testCase.blocks, testCase.groupSize)
+		scalarBackend.IndexerBlockMax(want, source, testCase.rows, testCase.blocks, testCase.groupSize)
 		kerneltest.AssertSlicesClose(t, got, want, 1e-5, 1e-6)
 	}
 }

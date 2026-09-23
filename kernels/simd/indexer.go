@@ -1,6 +1,7 @@
 package simdbackend
 
 import (
+	"math"
 	"simd"
 
 	"github.com/cookiengineer/gonano/internal/parallel"
@@ -31,48 +32,46 @@ func (backend *Backend) IndexerScores(destination, query, key, weight []float32,
 	})
 }
 
-// PooledMean averages consecutive non-overlapping groups of `groupSize` rows of
-// source [blockCount, width] into destination [ceil(blockCount/groupSize),
-// width]. The trailing group keeps its actual row count.
-func (backend *Backend) PooledMean(destination, source []float32, blockCount, groupSize, width int) {
-	pooledMeanCore(destination, source, blockCount, groupSize, width)
+// IndexerBlockMax reduces consecutive non-overlapping groups of `groupSize`
+// score columns of source [rowCount, blockCount] into destination
+// [rowCount, ceil(blockCount/groupSize)]: destination[row, g] is the maximum of
+// source[row, g*groupSize:(g+1)*groupSize]. The trailing group keeps its actual
+// column count. It implements the hierarchical indexer's block score, where a
+// block's score is the maximum index score among its entries (DeepSeek-V4.1
+// §2.3.2).
+func (backend *Backend) IndexerBlockMax(destination, scores []float32, rowCount, blockCount, groupSize int) {
+	indexerBlockMaxCore(destination, scores, rowCount, blockCount, groupSize)
 }
 
-// pooledMeanCore holds the vectorized body of PooledMean.
-func pooledMeanCore(destination, source []float32, blockCount, groupSize, width int) {
+// indexerBlockMaxCore holds the vectorized body of IndexerBlockMax, for the
+// same compiler reason as addCore in elementwise.go.
+func indexerBlockMaxCore(destination, scores []float32, rowCount, blockCount, groupSize int) {
 	if groupSize < 1 {
 		groupSize = 1
 	}
 	groups := (blockCount + groupSize - 1) / groupSize
-	for group := 0; group < groups; group++ {
-		start := group * groupSize
-		end := min(start+groupSize, blockCount)
-		count := end - start
-		if count <= 0 {
-			continue
-		}
-		destinationRow := destination[group*width : (group+1)*width]
-		clear(destinationRow)
-		for entry := start; entry < end; entry++ {
-			sourceRow := source[entry*width : (entry+1)*width]
-			column := 0
-			for ; column+float32LaneCount <= width; column += float32LaneCount {
-				accumulator := simd.LoadFloat32s(destinationRow[column:])
-				accumulator = accumulator.Add(simd.LoadFloat32s(sourceRow[column:]))
-				accumulator.Store(destinationRow[column:])
+	parallel.KernelPool().For(0, rowCount, func(row int) {
+		sourceRow := scores[row*blockCount : (row+1)*blockCount]
+		destinationRow := destination[row*groups : (row+1)*groups]
+		for group := 0; group < groups; group++ {
+			start := group * groupSize
+			end := min(start+groupSize, blockCount)
+			maximum := float32(math.Inf(-1))
+			column := start
+			if end-start >= float32LaneCount {
+				accumulator := simd.LoadFloat32s(sourceRow[column:])
+				column += float32LaneCount
+				for ; column+float32LaneCount <= end; column += float32LaneCount {
+					accumulator = accumulator.Max(simd.LoadFloat32s(sourceRow[column:]))
+				}
+				maximum = horizontalMax(accumulator)
 			}
-			for ; column < width; column++ {
-				destinationRow[column] += sourceRow[column]
+			for ; column < end; column++ {
+				if sourceRow[column] > maximum {
+					maximum = sourceRow[column]
+				}
 			}
+			destinationRow[group] = maximum
 		}
-		inverse := float32(1) / float32(count)
-		inverseVector := simd.BroadcastFloat32s(inverse)
-		column := 0
-		for ; column+float32LaneCount <= width; column += float32LaneCount {
-			simd.LoadFloat32s(destinationRow[column:]).Mul(inverseVector).Store(destinationRow[column:])
-		}
-		for ; column < width; column++ {
-			destinationRow[column] *= inverse
-		}
-	}
+	})
 }

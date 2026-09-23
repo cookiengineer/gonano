@@ -343,6 +343,58 @@ func TestHierarchicalSelectMatchesFullWhenUnbounded(t *testing.T) {
 	}
 }
 
+// TestHierarchicalPoolUsesBlockMax verifies the coarse stage scores a
+// super-block by the maximum index score among its entries, not by a pooled
+// mean. Row {4,0,3,3} with super-blocks of two entries gives block maxima
+// [4,3], so the first block is selected even though the second has a higher
+// mean (3 vs 2).
+func TestHierarchicalPoolUsesBlockMax(t *testing.T) {
+	indexer := NewSparseIndexer(4, 5, 2, 2)
+	scores := tensors.NewWithData([]int{1, 4}, []float32{4, 0, 3, 3})
+	// sequenceLength 1, positionOffset 4, ratio 1 -> allowed = 4.
+	selection, pool := indexer.selectFromScoreMatrix(scores.Data, 1, 1, 4, 4, 1, 1, 2, 2)
+	if len(pool[0]) != 2 || pool[0][0] != 0 || pool[0][1] != 1 {
+		t.Fatalf("pool = %v, want [0 1] (block-max, not mean)", pool[0])
+	}
+	if len(selection[0]) != 1 || selection[0][0] != 0 {
+		t.Fatalf("selection = %v, want [0]", selection[0])
+	}
+}
+
+// TestReindexDistillationRestrictedToPool verifies that masking an indexer's
+// scores and targets to a candidate pool zeroes everything outside the pool and
+// renormalizes the target inside it.
+func TestReindexDistillationRestrictedToPool(t *testing.T) {
+	scores := tensors.NewWithData([]int{2, 4}, []float32{
+		1, 2, 3, 4,
+		5, 6, 7, 8,
+	})
+	target := tensors.NewWithData([]int{2, 4}, []float32{
+		0.1, 0.2, 0.3, 0.4,
+		0.25, 0.25, 0.25, 0.25,
+	})
+	pool := [][]int{{1, 3}, {0, 2}}
+	restrictIndexerToPool(scores, target, pool)
+
+	for _, entry := range []int{0, 2} {
+		if !math.IsInf(float64(scores.Data[entry]), -1) {
+			t.Fatalf("row 0 entry %d score = %v, want -inf", entry, scores.Data[entry])
+		}
+		if target.Data[entry] != 0 {
+			t.Fatalf("row 0 entry %d target = %v, want 0", entry, target.Data[entry])
+		}
+	}
+	if math.Abs(float64(target.Data[1])-1.0/3.0) > 1e-6 || math.Abs(float64(target.Data[3])-2.0/3.0) > 1e-6 {
+		t.Fatalf("row 0 in-pool target = [%v %v], want [1/3 2/3]", target.Data[1], target.Data[3])
+	}
+	if scores.Data[1] != 2 || scores.Data[3] != 4 {
+		t.Fatalf("row 0 in-pool scores changed: %v %v", scores.Data[1], scores.Data[3])
+	}
+	if !math.IsInf(float64(scores.Data[5]), -1) || scores.Data[4] != 5 || scores.Data[6] != 7 {
+		t.Fatalf("row 1 scores = %v, want [5 -inf 7 -inf]", scores.Data[4:8])
+	}
+}
+
 func TestHierarchicalSelectRespectsCausality(t *testing.T) {
 	indexer, hidden, compressed := testIndexer()
 	selection := indexer.HierarchicalSelect(hidden, compressed, 0, 2, 2, 2, 2)

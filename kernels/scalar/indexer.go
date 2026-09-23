@@ -1,5 +1,7 @@
 package scalar
 
+import "math"
+
 // IndexerScores computes the lightning indexer's per-(row, block) scores:
 //
 //	destination[row, block] = sum_h weight[h] * max(0, dot(query[row,h], key[block,h]))
@@ -29,32 +31,31 @@ func (backend *Backend) IndexerScores(destination, query, key, weight []float32,
 	}
 }
 
-// PooledMean averages consecutive non-overlapping groups of `groupSize` rows of
-// source [blockCount, width] into destination [ceil(blockCount/groupSize),
-// width]. The trailing group keeps its actual row count.
-func (backend *Backend) PooledMean(destination, source []float32, blockCount, groupSize, width int) {
+// IndexerBlockMax reduces consecutive non-overlapping groups of `groupSize`
+// score columns of source [rowCount, blockCount] into destination
+// [rowCount, ceil(blockCount/groupSize)]: destination[row, g] is the maximum of
+// source[row, g*groupSize:(g+1)*groupSize]. The trailing group keeps its actual
+// column count. It implements the hierarchical indexer's block score, where a
+// block's score is the maximum index score among its entries (DeepSeek-V4.1
+// §2.3.2).
+func (backend *Backend) IndexerBlockMax(destination, scores []float32, rowCount, blockCount, groupSize int) {
 	if groupSize < 1 {
 		groupSize = 1
 	}
 	groups := (blockCount + groupSize - 1) / groupSize
-	for group := 0; group < groups; group++ {
-		start := group * groupSize
-		end := min(start+groupSize, blockCount)
-		count := end - start
-		if count <= 0 {
-			continue
-		}
-		destinationRow := destination[group*width : (group+1)*width]
-		clear(destinationRow)
-		for entry := start; entry < end; entry++ {
-			sourceRow := source[entry*width : (entry+1)*width]
-			for element := 0; element < width; element++ {
-				destinationRow[element] += sourceRow[element]
+	for row := 0; row < rowCount; row++ {
+		sourceRow := scores[row*blockCount : (row+1)*blockCount]
+		destinationRow := destination[row*groups : (row+1)*groups]
+		for group := 0; group < groups; group++ {
+			start := group * groupSize
+			end := min(start+groupSize, blockCount)
+			maximum := float32(math.Inf(-1))
+			for entry := start; entry < end; entry++ {
+				if sourceRow[entry] > maximum {
+					maximum = sourceRow[entry]
+				}
 			}
-		}
-		inverse := float32(1) / float32(count)
-		for element := 0; element < width; element++ {
-			destinationRow[element] *= inverse
+			destinationRow[group] = maximum
 		}
 	}
 }

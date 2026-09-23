@@ -13,11 +13,17 @@ const defaultDraftLength = 5
 const defaultConfidenceThreshold = 0.5
 
 // scheduledLength returns how many candidates to verify: the first candidate
-// plus the leading drafts whose confidence meets the threshold, at least one.
+// plus the leading drafts while the estimated prefix survival probability (the
+// product of the per-position conditional acceptance confidences) stays at or
+// above the threshold, at least one. Combining the confidences multiplicatively
+// follows the paper's prefix-survival estimate for the DSpark scheduler
+// (DeepSeek-V4.1 §2.4.3), rather than testing each confidence in isolation.
 func scheduledLength(confidences []float32, threshold float32) int {
 	limit := 1
+	survival := float32(1)
 	for _, confidence := range confidences {
-		if confidence < threshold {
+		survival *= confidence
+		if survival < threshold {
 			break
 		}
 		limit++

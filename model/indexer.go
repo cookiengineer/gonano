@@ -1,6 +1,7 @@
 package model
 
 import (
+	"math"
 	"sort"
 
 	"github.com/cookiengineer/gonano/model/layers"
@@ -327,9 +328,14 @@ func (indexer *SparseIndexer) SelectProjected(hidden *tensors.Tensor, keyProject
 // candidate block pool that was fully scored after the coarse stage, one slice
 // per query row. Publishing this pool lets later Reindex layers skip the coarse
 // scoring pass and score only the pool (DeepSeek-V4.1 §2.3.2).
+//
+// The coarse stage assigns every super-block of `pool` compressed entries the
+// maximum index score among its entries, selects the best super-blocks, and
+// collects their entries into the candidate pool (DeepSeek-V4.1 §2.3.2). The
+// final top-k is then taken over those entries' scores.
 func (indexer *SparseIndexer) SelectProjectedWithCandidates(hidden *tensors.Tensor, keyProjections []float32, blockCount, positionOffset, ratio, topK, pool, candidateBudget int) (selection, candidatePool [][]int) {
 	query := indexer.query.Forward(hidden) // [B*T, H, dim]
-	return indexer.selectHierarchical(query.Data, keyProjections, hidden.Shape[0], hidden.Shape[1], blockCount, positionOffset, ratio, topK, pool, candidateBudget)
+	return indexer.selectProjectedScores(query.Data, keyProjections, hidden.Shape[0], hidden.Shape[1], blockCount, positionOffset, ratio, topK, pool, candidateBudget)
 }
 
 // SelectWithinPool selects the top-k blocks for every query row from a
@@ -341,97 +347,196 @@ func (indexer *SparseIndexer) SelectWithinPool(hidden *tensors.Tensor, keyProjec
 	return indexer.selectWithinPool(query.Data, keyProjections, hidden.Shape[0], hidden.Shape[1], blockCount, positionOffset, ratio, topK, candidatePool)
 }
 
-// selectHierarchical is the core coarse-to-fine selection. queryData has shape
-// [batch*sequence, headCount, dim] and keyData [batch*blockCount, headCount,
-// dim], both flattened. It returns the top-k selection and the coarse-stage
-// candidate pool for every query row.
-func (indexer *SparseIndexer) selectHierarchical(queryData, keyData []float32, batchSize, sequenceLength, blockCount, positionOffset, ratio, topK, pool, candidateBudget int) (selection, candidatePool [][]int) {
+// indexerScoreChunkRows bounds how many query rows are scored at once when the
+// hierarchical selector materializes per-entry scores. It keeps peak scratch
+// memory independent of sequence length.
+const indexerScoreChunkRows = 256
+
+// selectFromScoreMatrix runs the block-max hierarchical selection against a
+// precomputed score matrix [batch*sequence, blockCount]. It is used by training,
+// which already materializes the full index scores for the distillation loss.
+func (indexer *SparseIndexer) selectFromScoreMatrix(scores []float32, batchSize, sequenceLength, blockCount, positionOffset, ratio, topK, pool, candidateBudget int) (selection, candidatePool [][]int) {
 	if pool < 1 {
 		pool = 1
 	}
-	dim := indexer.Dim
-	headCount := indexer.HeadCount
-	weightData := indexer.headWeights.Data
-	headWidth := headCount * dim
-
-	groupsPerToken := (candidateBudget + pool - 1) / pool
-	if groupsPerToken < 1 {
-		groupsPerToken = 1
-	}
-
-	selection = make([][]int, batchSize*sequenceLength)
-	candidatePool = make([][]int, batchSize*sequenceLength)
-	backend := tensors.KernelBackend()
-	// For a whole sequence of queries the coarse scoring is a batched GEMM and
-	// the fused kernel wins; for single-token decode (sequenceLength == 1) it
-	// would just add per-row goroutine overhead, so the scalar loop is used.
-	useKernelCoarse := sequenceLength >= indexerKernelCoarseMinRows
-	for batch := 0; batch < batchSize; batch++ {
-		batchKeyBase := batch * blockCount * headWidth
-		groups := (blockCount + pool - 1) / pool
-		pooled := make([]float32, groups*headWidth)
-		backend.PooledMean(pooled, keyData[batchKeyBase:batchKeyBase+blockCount*headWidth], blockCount, pool, headWidth)
-
-		var coarseAll []float32
-		if useKernelCoarse {
-			coarseAll = make([]float32, sequenceLength*groups)
-			queryBatch := queryData[batch*sequenceLength*headWidth : (batch+1)*sequenceLength*headWidth]
-			backend.IndexerScores(coarseAll, queryBatch, pooled, weightData, sequenceLength, groups, headCount, dim)
+	rowCount := batchSize * sequenceLength
+	selection = make([][]int, rowCount)
+	candidatePool = make([][]int, rowCount)
+	if blockCount == 0 {
+		for row := 0; row < rowCount; row++ {
+			selection[row] = []int{}
+			candidatePool[row] = []int{}
 		}
+		return selection, candidatePool
+	}
+	groups := (blockCount + pool - 1) / pool
+	blockMax := make([]float32, rowCount*groups)
+	tensors.KernelBackend().IndexerBlockMax(blockMax, scores, rowCount, blockCount, pool)
+	indexer.selectRows(scores, blockMax, selection, candidatePool, batchSize, sequenceLength, blockCount, groups, positionOffset, ratio, topK, pool, candidateBudget)
+	return selection, candidatePool
+}
 
+// selectProjectedScores computes the full per-entry index scores from the query
+// and key projections, in row chunks, and runs the block-max selection. The
+// chunking bounds peak scratch memory while the fused IndexerScores kernel still
+// handles the arithmetic.
+func (indexer *SparseIndexer) selectProjectedScores(queryData, keyData []float32, batchSize, sequenceLength, blockCount, positionOffset, ratio, topK, pool, candidateBudget int) (selection, candidatePool [][]int) {
+	if pool < 1 {
+		pool = 1
+	}
+	rowCount := batchSize * sequenceLength
+	selection = make([][]int, rowCount)
+	candidatePool = make([][]int, rowCount)
+	if blockCount == 0 {
+		for row := 0; row < rowCount; row++ {
+			selection[row] = []int{}
+			candidatePool[row] = []int{}
+		}
+		return selection, candidatePool
+	}
+	groups := (blockCount + pool - 1) / pool
+	headWidth := indexer.HeadCount * indexer.Dim
+	weight := indexer.headWeights.Data
+	backend := tensors.KernelBackend()
+	useKernel := sequenceLength >= indexerKernelCoarseMinRows
+
+	chunkRows := min(indexerScoreChunkRows, sequenceLength)
+	scoreChunk := make([]float32, chunkRows*blockCount)
+	blockMaxChunk := make([]float32, chunkRows*groups)
+
+	for batch := 0; batch < batchSize; batch++ {
+		keyBatch := keyData[batch*blockCount*headWidth : (batch+1)*blockCount*headWidth]
+		queryBatch := queryData[batch*sequenceLength*headWidth : (batch+1)*sequenceLength*headWidth]
+		for chunkStart := 0; chunkStart < sequenceLength; chunkStart += chunkRows {
+			chunkEnd := min(chunkStart+chunkRows, sequenceLength)
+			rows := chunkEnd - chunkStart
+			scores := scoreChunk[:rows*blockCount]
+			queryChunk := queryBatch[chunkStart*headWidth : chunkEnd*headWidth]
+			if useKernel {
+				backend.IndexerScores(scores, queryChunk, keyBatch, weight, rows, blockCount, indexer.HeadCount, indexer.Dim)
+			} else {
+				indexerScoresScalar(scores, queryChunk, keyBatch, weight, rows, blockCount, indexer.HeadCount, indexer.Dim)
+			}
+			blockMax := blockMaxChunk[:rows*groups]
+			backend.IndexerBlockMax(blockMax, scores, rows, blockCount, pool)
+
+			// The rows within a chunk are contiguous positions, so their
+			// causality limits advance together; selectRows recomputes each
+			// row's allowed range and patches the partial trailing group.
+			selectBatch := make([][]int, rows)
+			poolBatch := make([][]int, rows)
+			indexer.selectRows(scores, blockMax, selectBatch, poolBatch, 1, rows, blockCount, groups, positionOffset+chunkStart, ratio, topK, pool, candidateBudget)
+			for row := 0; row < rows; row++ {
+				absolute := batch*sequenceLength + chunkStart + row
+				selection[absolute] = selectBatch[row]
+				candidatePool[absolute] = poolBatch[row]
+			}
+		}
+	}
+	return selection, candidatePool
+}
+
+// selectRows applies the block-max selection to each query row of a score
+// matrix whose rows start at positionOffset. It patches the causal boundary of
+// the partial trailing super-block before choosing the top groups.
+func (indexer *SparseIndexer) selectRows(scores, blockMax []float32, selection, candidatePool [][]int, batchSize, sequenceLength, blockCount, groups, positionOffset, ratio, topK, pool, candidateBudget int) {
+	for batch := 0; batch < batchSize; batch++ {
 		for token := 0; token < sequenceLength; token++ {
 			row := batch*sequenceLength + token
 			allowed := (positionOffset + token) / ratio
 			if allowed > blockCount {
 				allowed = blockCount
 			}
-			if allowed <= 0 || topK <= 0 {
-				selection[row] = []int{}
-				candidatePool[row] = []int{}
-				continue
-			}
-			queryBase := row * headWidth
-
-			allowedGroups := (allowed + pool - 1) / pool
-			var coarse []float32
-			if useKernelCoarse {
-				coarse = coarseAll[token*groups : token*groups+allowedGroups]
-			} else {
-				coarse = make([]float32, allowedGroups)
-				for group := 0; group < allowedGroups; group++ {
-					var total float32
-					for head := 0; head < headCount; head++ {
-						var dot float32
-						queryHead := queryData[queryBase+head*dim:]
-						pooledHead := pooled[group*headWidth+head*dim:]
-						for dimension := 0; dimension < dim; dimension++ {
-							dot += queryHead[dimension] * pooledHead[dimension]
-						}
-						if dot > 0 {
-							total += weightData[head] * dot
-						}
-					}
-					coarse[group] = total
-				}
-			}
-
-			chosenGroups := topKIndices(coarse, groupsPerToken)
-			candidates := make([]int, 0, groupsPerToken*pool)
-			for _, group := range chosenGroups {
-				start := group * pool
-				end := min(start+pool, allowed)
-				for entry := start; entry < end; entry++ {
-					candidates = append(candidates, entry)
-				}
-			}
-			candidatePool[row] = candidates
-			selection[row] = indexer.fineSelect(queryData, keyData, row, batchKeyBase, headWidth, candidates, topK, allowed)
+			scoreRow := scores[row*blockCount : (row+1)*blockCount]
+			blockMaxRow := blockMax[row*groups : (row+1)*groups]
+			selection[row], candidatePool[row] = selectRowBlockMax(scoreRow, blockMaxRow, allowed, topK, pool, candidateBudget)
 		}
 	}
-	return selection, candidatePool
 }
 
-// indexerKernelCoarseMinRows is the query-row count at which the batched coarse
+// selectRowBlockMax returns the top-k selection and candidate pool for one query
+// row. blockMaxRow holds the maximum score of every super-block; its partial
+// trailing group is recomputed over the causally allowed entries so that future
+// entries cannot influence the choice.
+func selectRowBlockMax(scoreRow, blockMaxRow []float32, allowed, topK, pool, candidateBudget int) (selection, candidatePool []int) {
+	if allowed <= 0 || topK <= 0 {
+		return []int{}, []int{}
+	}
+	if pool < 1 {
+		pool = 1
+	}
+	groupsPerToken := (candidateBudget + pool - 1) / pool
+	if groupsPerToken < 1 {
+		groupsPerToken = 1
+	}
+	allowedGroups := (allowed + pool - 1) / pool
+	if allowed%pool != 0 && allowedGroups > 0 {
+		group := allowedGroups - 1
+		maximum := float32(math.Inf(-1))
+		for entry := group * pool; entry < allowed; entry++ {
+			if scoreRow[entry] > maximum {
+				maximum = scoreRow[entry]
+			}
+		}
+		blockMaxRow[group] = maximum
+	}
+	chosen := topKIndices(blockMaxRow[:allowedGroups], groupsPerToken)
+	candidates := make([]int, 0, groupsPerToken*pool)
+	for _, group := range chosen {
+		start := group * pool
+		end := min(start+pool, allowed)
+		for entry := start; entry < end; entry++ {
+			candidates = append(candidates, entry)
+		}
+	}
+	return topKFromScoreRow(scoreRow, candidates, topK), candidates
+}
+
+// topKFromScoreRow returns the top-k candidate entries by their precomputed
+// scores, in descending score order with ties broken toward the smaller entry.
+func topKFromScoreRow(scoreRow []float32, candidates []int, topK int) []int {
+	if len(candidates) == 0 || topK <= 0 {
+		return []int{}
+	}
+	fine := make([]float32, len(candidates))
+	for index, entry := range candidates {
+		fine[index] = scoreRow[entry]
+	}
+	order := topKIndices(fine, topK)
+	selected := make([]int, len(order))
+	for index, position := range order {
+		selected[index] = candidates[position]
+	}
+	return selected
+}
+
+// indexerScoresScalar is the non-vectorized fallback for single-token decode,
+// where the fused kernel's per-row goroutine overhead dominates.
+func indexerScoresScalar(destination, query, key, weight []float32, rowCount, blockCount, headCount, dim int) {
+	headWidth := headCount * dim
+	for row := 0; row < rowCount; row++ {
+		queryRow := query[row*headWidth:]
+		outRow := destination[row*blockCount:]
+		for block := 0; block < blockCount; block++ {
+			keyBlock := key[block*headWidth:]
+			var total float32
+			for head := 0; head < headCount; head++ {
+				queryHead := queryRow[head*dim:]
+				keyHead := keyBlock[head*dim:]
+				var dot float32
+				for element := 0; element < dim; element++ {
+					dot += queryHead[element] * keyHead[element]
+				}
+				if dot > 0 {
+					total += weight[head] * dot
+				}
+			}
+			outRow[block] = total
+		}
+	}
+}
+
+// indexerKernelCoarseMinRows is the query-row count at which the batched
 // scoring kernel beats the per-row scalar loop.
 const indexerKernelCoarseMinRows = 16
 

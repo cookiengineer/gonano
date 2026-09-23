@@ -26,21 +26,21 @@ layout.
 | HCA dense KV compression | 2.3 | `model/compress.go` `ChannelCompressor` | `--compression-ratio N` |
 | CSA sparse attention | 2.3 | `model/indexer.go` `SparseIndexer` | `--sparse-topk K` |
 | Cross-layer KV + index reuse (Full/Reindex/Reuse) | 2.3.1 | `model/config.go` `ReusePattern`, `model/share.go`, `forwardCompressedSparse`, `sparseTrainingPlan` | `--reuse-pattern FRUU` |
-| Hierarchical sparse indexer | 2.3.2 | `model/indexer.go` `SelectProjected`, shared candidate pool | `--indexer-pool P` |
+| Hierarchical sparse indexer | 2.3.2 | `model/indexer.go` `SelectProjectedWithCandidates`, block-max candidate pool | `--indexer-pool P` |
 | Local sliding-window branch (SWA) | 2.2 | `model/compress_attention.go` `mergeAttentionBranches` | `--swa-window W` |
 | Grouped-query attention | 2.1 | `model/attention.go`, `Config.NumKVHead` | `--kv-head-ratio R` |
 | Partial rotary embedding | 2.1 | `model/rotary.go`, `Config.RotaryDims` | `Config.RotaryDims` (default 64) |
 | Head-wise Muon for Q/K | 2.5 | `model/optimizer.go` `headWiseViews` | `--head-wise-muon` |
 | Sinkhorn-balanced embeddings / lm_head | 2.5 | `optimizer/sinkhorn.go`, `model/optimizer.go` `sinkhornGroup` | `--sinkhorn-embeddings` |
 | Full-vocabulary on-policy distillation (OPD) | 5.2.4 | `tensors/loss.go` (`DistillationLossPerPosition`), `trainer/distill.go` | `cmd/chat_opd` |
-| DSpark speculative decoding + confidence scheduler | 2.4.3 | `model/dspark.go` (`DSpark`), `inference/speculative.go` | `--drafter` + `--speculative` |
+| DSpark semi-autoregressive drafting + survival scheduler | 2.4.3 | `model/dspark.go` (`DSpark`), `inference/speculative.go` | `--drafter` + `--speculative` |
 | MLA low-rank query / KV latent | 2.3, 4.2.1 | `model/attention.go` `projectQuery`/`projectKeyValue` | `--query-compression-dim`, `--kv-latent-dim` |
 | Absorbed MLA latent cache | 2.3, 4.2.1 | `model/mla.go`, `KVBuffer.EnableMLA` | `--mla-latent`, `--mla-rotary-dims` |
 | Global-KV prefix reuse + SWA replay | 3.2.1, 3.2.2 | `inference/prefix.go` `PrefixCache`, `Engine.Prefix` | `Engine.Prefix = NewPrefixCache(...)` |
 | Persistent multi-entry KV cache (LRU/TTL/disk) | 3.2.1 | `inference/cache.go` `CacheManager`, `model/kvcache_codec.go` | `Engine.Cache = NewCacheManager(...)` |
 | SWA pool + bounded replay (global-only persistence) | 3.2.1, 3.2.2 | `KVBuffer.StripRaw`, `Transformer.ReplaySWA`, `Engine.SWACache` | `CacheOptions.StripSWA`, `Engine.SWACache` |
 | FP4 main KV cache / FP4 indexer QAT | 2.4.4 | **not implemented** (float32-only) | — |
-| Engram, MoE, DSpark, Single-Pass mHC | 2.1, 2.4 | **not applicable / not implemented** | — |
+| Engram, MoE, Single-Pass mHC | 2.1, 2.4 | **not applicable / not implemented** | — |
 
 ---
 
@@ -132,7 +132,9 @@ rather than linear in context length.
 gonano's coarse-to-fine selection lives in `SparseIndexer`:
 
 - `Config.IndexerPool` (`--indexer-pool P`) groups compressed entries into
-  super-blocks; the query is scored against pooled key representations first.
+  super-blocks; each super-block's score is the **maximum** index score among its
+  entries (`kernels.Backend.IndexerBlockMax`), and the best super-blocks are
+  selected, exactly as in the paper.
 - `Config.IndexerCandidates` (`--indexer-candidates`, default
   `IndexerCandidateBudget()` = `max(8*SparseTopK, 64)`) bounds how many entries
   are fully scored.
@@ -140,6 +142,10 @@ gonano's coarse-to-fine selection lives in `SparseIndexer`:
   coarse candidate pool; the pool is published in `compressionShare.candidatePool`
   and consumed by later Reindex layers through `SelectWithinPool`. This is the
   "constant-cost deeper indexer" property from the paper.
+- In training (`sparseTrainingPlan`) a Reindex layer's indexer distillation is
+  restricted to the shared candidate pool (its scores are masked outside the
+  pool and the target is renormalized within it), so deeper indexers are
+  optimized under the same search domain they use at inference.
 
 The **reindex path also uses the cached indexer-key projections**
 (`KVBuffer.IndexerKey`), so decode does not re-project every compressed key on
@@ -198,19 +204,25 @@ the same work with vectorization and parallelism instead:
     computes the ReLU-weighted multi-head score matrix with a vectorized dot
     product, parallelized across query rows (`kernels/simd/indexer.go`,
     `kernels/scalar/indexer.go`).
-  - `PooledMean(destination, source, blockCount, groupSize, width)` computes the
-    coarse super-block means with SIMD.
+  - `IndexerBlockMax(destination, scores, rows, blocks, groupSize)` reduces the
+    score matrix to per-super-block maxima with SIMD; it replaced the earlier
+    pooled-mean coarse stage so the hierarchical indexer matches the paper's
+    block score (DeepSeek-V4.1 §2.3.2).
+- The coarse stage materializes per-entry scores in bounded row chunks
+  (`selectProjectedScores`), so peak scratch memory is independent of context
+  length while `IndexerBlockMax` still handles the reduction.
 - **Bounded top-k** (`topKIndices` in `model/indexer.go`) replaces the full
   `sort.SliceStable` in `TopK`, `SelectBlocks`, and the fine selection with a
   size-`k` heap when `k` is small, preserving the exact tie-break (larger score,
   then smaller index).
-- The coarse scoring uses the batched kernel for whole-sequence queries and the
-  scalar loop for single-token decode (below `indexerKernelCoarseMinRows`),
-  where per-row goroutine overhead would dominate.
+- The batched scoring kernel is used for whole-sequence queries and the scalar
+  loop for single-token decode (below `indexerKernelCoarseMinRows`), where
+  per-row goroutine overhead would dominate.
 
 Units: `kernels/simd/parity_test.go` (`TestIndexerScoresParity`,
-`TestPooledMeanParity`), `model/indexer_test.go` (`TestTopKIndicesMatchesFullSort`,
-`TestTopKIndicesTieBreak`).
+`TestIndexerBlockMaxParity`), `model/indexer_test.go`
+(`TestTopKIndicesMatchesFullSort`, `TestTopKIndicesTieBreak`,
+`TestHierarchicalPoolUsesBlockMax`, `TestReindexDistillationRestrictedToPool`).
 
 ---
 
@@ -376,20 +388,32 @@ Units: `TestDistillationMatchesCrossEntropyForOneHotTeacher`,
 **DSpark speculative decoding.** `cmd/dspark_train` builds a `model.DSpark`: a
 small trunk (3 blocks, context capped at 128 tokens) distilled from a frozen,
 uncompressed backbone, plus a low-rank **Markov head** and a **confidence head**
-trained on top of the frozen trunk. `DSpark.Draft` biases each drafted token on
-the previous token through the Markov head and returns a per-token confidence;
+trained on top of the frozen trunk. `DSpark.Draft` is **semi-autoregressive**
+(DeepSeek-V4.1 §2.4.3): it runs a *single* trunk forward over the context
+followed by `count-1` learned **draft-mask positions**
+(`Transformer.ForwardHiddenSuffix` + `dspark.draft_mask.embedding`) and reads
+the parallel next-token logits of the last `count` positions, then biases each
+drafted token on the previous one through the Markov head and returns a
+per-token confidence. The number of positions is constant
+(`model.DefaultDraftPositions()` = 5, overridable with `--draft-positions`).
 `Engine.DSpark` + `Engine.Speculative` then enable **exact greedy** speculative
 decoding in `inference/speculative.go`: each round the drafter proposes up to
-`DraftLength` (default 5) tokens, the **confidence scheduler** trims the block to
-the leading tokens whose confidence meets `ConfidenceThreshold` (default 0.5),
-the target model verifies the whole block in a single forward, and the longest
-matching prefix is accepted. Output is bit-for-bit identical to greedy decoding
-regardless of the scheduler (verified by `TestSpeculativeMatchesGreedy` and
-`TestSpeculativeWithDSparkMatchesGreedy`). It is limited to single-row, greedy
-(`--temperature 0`), uncompressed models and does not run the tool-call state
-machine; other requests transparently use the normal path. `cmd/infer_bench`
-(`--drafter ... --speculative`) and `cmd/chat_cli` expose it, and a DSpark
-checkpoint is detected via `checkpoint.IsDSpark`.
+`DraftLength` (default 5) tokens, the **confidence scheduler** trims the block
+using the estimated **prefix-survival probability** (the product of the
+per-position conditional acceptance confidences) against
+`ConfidenceThreshold` (default 0.5), the target model verifies the whole block
+in a single forward, and the longest matching prefix is accepted. Output is
+bit-for-bit identical to greedy decoding regardless of the scheduler (verified
+by `TestSpeculativeMatchesGreedy` and `TestSpeculativeWithDSparkMatchesGreedy`).
+It is limited to single-row, greedy (`--temperature 0`), uncompressed models and
+does not run the tool-call state machine; other requests transparently use the
+normal path. `cmd/infer_bench` (`--drafter ... --speculative`) and `cmd/chat_cli`
+expose it, and a DSpark checkpoint is detected via `checkpoint.IsDSpark`.
+
+The draft-mask embedding is a checkpointed but fixed input representation: the
+Markov and confidence heads are trained under the same placeholder forward they
+see at inference, but fully training the mask embedding/trunk for semi-AR
+generation is left as future work.
 
 This feature required fixing a pre-existing smear-recurrence inconsistency:
 `smearAdd` chained the *post-smear* activation of the previous token while the
@@ -406,6 +430,7 @@ Units: `TestDrafterConfigBounded`, `TestDraftTokensLengthAndRange`,
 `TestBackpropDirectionalGradientCheckSmear`, `TestSpeculativeMatchesGreedy`,
 `TestSpeculativeMatchesGreedyWithLongDraft`, `TestLoadedDrafterSpeculation`,
 `TestSpeculativeEligibility`, `TestDSparkDraftAndConfidence`,
+`TestDraftFirstTokenMatchesTrunk`, `TestDSparkDraftBoundedByContext`,
 `TestDSparkTrainHeadsStepFinite`, `TestDSparkRoundTrip`,
 `TestSpeculativeWithDSparkMatchesGreedy`, `TestScheduledLength`.
 
@@ -510,9 +535,11 @@ For completeness, the paper components that are out of scope here:
 - **MoE backbone, Engram conditional memory, and Single-Pass mHC.** gonano is a
   dense single-residual-stream model; these are architectural components of the
   552B model and do not map onto it.
-- **DSpark semi-autoregressive parallel drafting.** gonano drafts
-  autoregressively with the Markov and confidence heads; the paper's single-pass
-  parallel draft is a further throughput refinement left as future work.
+- **End-to-end semi-autoregressive DSpark training.** The single-pass parallel
+  draft and the survival scheduler are implemented, and the Markov/confidence
+  heads are trained under the same placeholder forward as inference, but the
+  draft-mask embedding is a fixed checkpointed input rather than being optimized
+  jointly with the trunk.
 - **EPD disaggregation and the GPU kernel fusions** (Mega-* kernels, FlashMLA):
   single-process CPU serving only.
 

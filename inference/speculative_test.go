@@ -162,4 +162,10 @@ func TestScheduledLength(t *testing.T) {
 	if got := scheduledLength([]float32{0.1, 0.9}, 0.5); got != 1 {
 		t.Fatalf("length = %d, want 1", got)
 	}
+	// Prefix survival is multiplicative: 0.8*0.8 = 0.64 drops below 0.7, so the
+	// second draft is excluded even though each confidence individually clears
+	// the threshold.
+	if got := scheduledLength([]float32{0.8, 0.8, 0.8}, 0.7); got != 2 {
+		t.Fatalf("length = %d, want 2", got)
+	}
 }

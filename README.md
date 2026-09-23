@@ -53,9 +53,10 @@ Architectural features that reduce memory rather than latency:
   traffic is reduced proportionally).
 - **Partial RoPE** (`RotaryDims`, default 64): DeepSeek-style rotary embedding
   applied only to the trailing head dimensions, with no throughput cost.
-- **Hierarchical sparse indexer**: coarse-to-fine block selection bounds the
-  number of entries scored per query, making deeper indexing constant-cost in
-  context length.
+- **Hierarchical sparse indexer**: coarse-to-fine block selection scores each
+  super-block by the maximum index score among its entries and bounds the number
+  of entries scored per query, making deeper indexing constant-cost in context
+  length.
 
 ### Local sliding-window attention
 
@@ -246,7 +247,7 @@ step-by-step training, export, deployment, and debugging guides. The long-contex
 attention design and the DeepSeek-V4.1-Flash optimizations (CED, CSA2 reuse, the
 hierarchical sparse indexer, low-rank query/KV, the KV prefix cache, the persistent
 multi-entry KV cache tier, head-wise Muon, Sinkhorn-balanced embeddings, on-policy
-distillation, DSpark speculative decoding with a confidence scheduler, and an absorbed MLA latent KV cache) are documented in `guides/05-deepseek-v4.1-optimizations.md`.
+distillation, DSpark semi-autoregressive drafting with a prefix-survival scheduler, and an absorbed MLA latent KV cache) are documented in `guides/05-deepseek-v4.1-optimizations.md`.
 
 ## Packages
 

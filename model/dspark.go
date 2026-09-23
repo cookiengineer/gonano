@@ -12,6 +12,19 @@ import (
 // (DeepSeek-V4.1 §2.4.3).
 const DrafterLayers = 3
 
+// dsparkDraftPositions is the default number of draft positions a single
+// semi-autoregressive forward predicts (DeepSeek-V4.1 §2.4.3 uses five).
+const dsparkDraftPositions = 5
+
+// DefaultDraftPositions returns the semi-autoregressive draft count DSpark uses
+// when none is configured.
+func DefaultDraftPositions() int { return dsparkDraftPositions }
+
+// dsparkPlaceholderToken is the input id used for draft-mask positions. Its
+// token embedding is replaced by draftMaskEmbedding before the trunk runs, so
+// the concrete id only needs to be a valid vocabulary index.
+const dsparkPlaceholderToken = 0
+
 // DrafterConfig derives the drafter configuration from a backbone config. The
 // drafter shares the backbone's tokenizer, so it keeps the vocabulary and head
 // geometry, but it is a small standalone transformer with its own embedding and
@@ -124,6 +137,9 @@ type DSpark struct {
 	markovUp   *layers.Linear // [VocabSize, markovRank]
 	confHidden *layers.Linear // [confHidden, EmbedDim]
 	confOut    *layers.Linear // [1, confHidden]
+	// draftMaskEmbedding [1, EmbedDim] replaces the embeddings of the draft
+	// positions in the semi-autoregressive forward pass (DeepSeek-V4.1 §2.4.3).
+	draftMaskEmbedding *tensors.Tensor
 }
 
 // dsparkMarkovRank and dsparkConfHidden cap the head widths for small models.
@@ -153,11 +169,12 @@ func NewDSparkFromConfig(config Config) *DSpark {
 		confHidden = dsparkConfHiddenCap
 	}
 	return &DSpark{
-		Drafter:    drafter,
-		markovDown: layers.NewLinear(config.EmbedDim, rank),
-		markovUp:   layers.NewLinear(rank, config.VocabSize),
-		confHidden: layers.NewLinear(config.EmbedDim, confHidden),
-		confOut:    layers.NewLinear(confHidden, 1),
+		Drafter:            drafter,
+		markovDown:         layers.NewLinear(config.EmbedDim, rank),
+		markovUp:           layers.NewLinear(rank, config.VocabSize),
+		confHidden:         layers.NewLinear(config.EmbedDim, confHidden),
+		confOut:            layers.NewLinear(confHidden, 1),
+		draftMaskEmbedding: tensors.New(1, config.EmbedDim),
 	}
 }
 
@@ -170,12 +187,13 @@ func (d *DSpark) InitWeights(rng *tensors.RNG) {
 	layers.InitZeros(d.markovUp.Weight)
 	layers.InitNormal(d.confHidden.Weight, rng, 0.02)
 	layers.InitZeros(d.confOut.Weight)
+	layers.InitNormal(d.draftMaskEmbedding, rng, 0.02)
 }
 
 // Parameters returns the trunk and head parameters.
 func (d *DSpark) Parameters() []*tensors.Tensor {
 	parameters := d.Drafter.Parameters()
-	parameters = append(parameters, d.markovDown.Weight, d.markovUp.Weight, d.confHidden.Weight, d.confOut.Weight)
+	parameters = append(parameters, d.markovDown.Weight, d.markovUp.Weight, d.confHidden.Weight, d.confOut.Weight, d.draftMaskEmbedding)
 	return parameters
 }
 
@@ -190,6 +208,7 @@ func (d *DSpark) NamedParameters() map[string]*tensors.Tensor {
 	parameters["dspark.markov_up.weight"] = d.markovUp.Weight
 	parameters["dspark.conf_hidden.weight"] = d.confHidden.Weight
 	parameters["dspark.conf_out.weight"] = d.confOut.Weight
+	parameters["dspark.draft_mask.embedding"] = d.draftMaskEmbedding
 	return parameters
 }
 
@@ -212,84 +231,148 @@ func (d *DSpark) SetupHeadOptimizer(learningRate, weightDecay float32) []optimiz
 	}}
 }
 
-// Draft greedily proposes up to count tokens after the context and returns a
-// confidence for each, using the trunk, the Markov head, and the confidence
-// head. It only sees the last SequenceLen tokens.
+// Draft proposes up to count tokens after the context and returns a confidence
+// for each, using the trunk, the Markov head, and the confidence head. It runs
+// a single semi-autoregressive trunk forward over the context followed by
+// count-1 draft-mask positions and reads the next-token logits of those
+// positions in parallel (DeepSeek-V4.1 §2.4.3); the Markov head then chains the
+// drafted tokens. It only sees the last SequenceLen tokens.
 func (d *DSpark) Draft(context []int, count int) ([]int, []float32) {
 	if count <= 0 || len(context) == 0 {
 		return nil, nil
 	}
 	config := d.Drafter.Config
-	if len(context) > config.SequenceLen {
-		context = context[len(context)-config.SequenceLen:]
+	if count > config.SequenceLen {
+		count = config.SequenceLen
 	}
+	placeholderCount := count - 1
+	maxPrefix := config.SequenceLen - placeholderCount
+	if maxPrefix < 1 {
+		maxPrefix = 1
+	}
+	if len(context) > maxPrefix {
+		context = context[len(context)-maxPrefix:]
+	}
+	prefixLength := len(context)
+
+	input := make([]int32, 0, prefixLength+placeholderCount)
+	for _, token := range context {
+		input = append(input, int32(token))
+	}
+	for index := 0; index < placeholderCount; index++ {
+		input = append(input, dsparkPlaceholderToken)
+	}
+
+	cache := NewKVBuffer(1, len(input), config.NumLayer, config.NumKVHead, config.HeadDim())
+	indexes := tensors.NewInt32sWithData([]int{1, len(input)}, input)
+	logits, hidden := d.Drafter.ForwardHiddenSuffix(indexes, cache, d.draftMaskEmbedding, prefixLength)
+
 	vocab := config.VocabSize
 	dim := config.EmbedDim
-
-	cache := NewKVBuffer(1, len(context)+count, config.NumLayer, config.NumKVHead, config.HeadDim())
-	indexes := tensors.NewInt32sWithData([]int{1, len(context)}, toInt32(context))
-	logits, hidden := d.Drafter.ForwardHidden(indexes, cache)
-
+	firstBase := logits.Shape[1] - count
 	previous := context[len(context)-1]
 	tokens := make([]int, 0, count)
 	confidences := make([]float32, 0, count)
-	for len(tokens) < count {
-		rows := logits.Shape[1]
-		lastLogits := logits.Data[(rows-1)*vocab : rows*vocab]
-		lastHidden := hidden.Data[(rows-1)*dim : rows*dim]
+	for index := 0; index < count; index++ {
+		row := firstBase + index
+		baseLogits := logits.Data[row*vocab : (row+1)*vocab]
+		rowHidden := hidden.Data[row*dim : (row+1)*dim]
 
-		biased := append([]float32(nil), lastLogits...)
-		emb := d.Drafter.tokenEmbedding.Forward(tensors.NewInt32sWithData([]int{1, 1}, []int32{int32(previous)}))
-		bias := d.markovUp.Forward(d.markovDown.Forward(emb))
-		for index := range biased {
-			biased[index] += bias.Data[index]
+		biased := append([]float32(nil), baseLogits...)
+		embedded := d.Drafter.tokenEmbedding.Forward(tensors.NewInt32sWithData([]int{1, 1}, []int32{int32(previous)}))
+		bias := d.markovUp.Forward(d.markovDown.Forward(embedded))
+		for element := range biased {
+			biased[element] += bias.Data[element]
 		}
 
 		token := argmaxValues(biased)
-		confidenceInput := tensors.NewWithData([]int{1, 1, dim}, lastHidden)
+		confidenceInput := tensors.NewWithData([]int{1, 1, dim}, rowHidden)
 		confidence := sigmoidFloat(d.confOut.Forward(d.confHidden.Forward(confidenceInput)).Data[0])
 		tokens = append(tokens, token)
 		confidences = append(confidences, confidence)
 		previous = token
-		if len(tokens) == count {
-			break
-		}
-		next := tensors.NewInt32sWithData([]int{1, 1}, []int32{int32(token)})
-		logits, hidden = d.Drafter.ForwardHidden(next, cache)
 	}
 	return tokens, confidences
 }
 
 // TrainHeadsStep updates the Markov and confidence heads on one batch with the
 // trunk frozen. inputs/targets are shifted next-token pairs (shape [B,T]);
-// targets of -1 are ignored. It returns the mean cross-entropy plus the
-// confidence binary cross-entropy.
-func (d *DSpark) TrainHeadsStep(inputs, targets *tensors.Int32s) float32 {
-	rows := inputs.Numel()
+// targets of -1 are ignored. It runs the same semi-autoregressive placeholder
+// forward as Draft so the heads are trained under the distribution they see at
+// inference, and returns the mean cross-entropy plus the confidence binary
+// cross-entropy. count is the number of parallel draft positions.
+func (d *DSpark) TrainHeadsStep(inputs, targets *tensors.Int32s, count int) float32 {
+	if count < 1 {
+		count = 1
+	}
 	config := d.Drafter.Config
 	vocab := config.VocabSize
 	dim := config.EmbedDim
+	batchSize := inputs.Shape[0]
+	sequenceLength := inputs.Shape[1]
+	if count > sequenceLength {
+		count = sequenceLength
+	}
+	placeholderCount := count - 1
+	prefixLength := sequenceLength - placeholderCount
+	if prefixLength < 1 {
+		prefixLength = 1
+	}
+	supervised := batchSize * count
+
+	masked := make([]int32, batchSize*sequenceLength)
+	for batch := 0; batch < batchSize; batch++ {
+		for position := 0; position < sequenceLength; position++ {
+			index := batch*sequenceLength + position
+			if position >= prefixLength {
+				masked[index] = dsparkPlaceholderToken
+			} else {
+				masked[index] = inputs.Data[index]
+			}
+		}
+	}
+	maskedInputs := tensors.NewInt32sWithData([]int{batchSize, sequenceLength}, masked)
 
 	d.ZeroGrad()
-	// The trunk is frozen: ForwardHidden allocates no gradients.
-	logits, hidden := d.Drafter.ForwardHidden(inputs, nil)
-	flatLogits := logits.Reshape(rows, vocab)
-	flatHidden := hidden.Reshape(rows, dim)
-	flatTargets := targets.Reshape(rows)
+	// The trunk is frozen: the suffix forward allocates no parameter gradients.
+	logits, hidden := d.Drafter.ForwardHiddenSuffix(maskedInputs, nil, d.draftMaskEmbedding, prefixLength)
+	flatLogits := logits.Reshape(batchSize*sequenceLength, vocab)
+	flatHidden := hidden.Reshape(batchSize*sequenceLength, dim)
 
-	embeddings := d.Drafter.tokenEmbedding.Forward(inputs).Reshape(rows, dim)
-	markovHidden := d.markovDown.Forward(embeddings)
-	markovBias := d.markovUp.Forward(markovHidden).Reshape(rows, vocab)
-	total := tensors.New(rows, vocab)
+	total := tensors.New(supervised, vocab)
+	confidenceInput := tensors.New(supervised, dim)
+	previousEmbeddings := tensors.New(supervised, dim)
+	flatTargets := make([]int32, supervised)
+	rowIndex := 0
+	for batch := 0; batch < batchSize; batch++ {
+		for index := 0; index < count; index++ {
+			source := batch*sequenceLength + prefixLength - 1 + index
+			target := targets.Data[source]
+			flatTargets[rowIndex] = target
+			copy(total.Data[rowIndex*vocab:(rowIndex+1)*vocab], flatLogits.Data[source*vocab:(source+1)*vocab])
+			copy(confidenceInput.Data[rowIndex*dim:(rowIndex+1)*dim], flatHidden.Data[source*dim:(source+1)*dim])
+			previous := inputs.Data[batch*sequenceLength+prefixLength-1]
+			if index > 0 {
+				previous = targets.Data[source-1]
+			}
+			embedded := d.Drafter.tokenEmbedding.Forward(tensors.NewInt32sWithData([]int{1, 1}, []int32{previous}))
+			copy(previousEmbeddings.Data[rowIndex*dim:(rowIndex+1)*dim], embedded.Data)
+			rowIndex++
+		}
+	}
+	targetTensor := tensors.NewInt32sWithData([]int{supervised}, flatTargets)
+
+	markovHidden := d.markovDown.Forward(previousEmbeddings)
+	markovBias := d.markovUp.Forward(markovHidden).Reshape(supervised, vocab)
 	for index := range total.Data {
-		total.Data[index] = flatLogits.Data[index] + markovBias.Data[index]
+		total.Data[index] += markovBias.Data[index]
 	}
 
-	loss := tensors.CrossEntropy(total, flatTargets, -1)
+	loss := tensors.CrossEntropy(total, targetTensor, -1)
 	probabilities := tensors.SoftmaxLastDim(total)
-	gradTotal := tensors.New(rows, vocab)
-	for row := 0; row < rows; row++ {
-		target := flatTargets.Data[row]
+	gradTotal := tensors.New(supervised, vocab)
+	for row := 0; row < supervised; row++ {
+		target := flatTargets[row]
 		if target == -1 {
 			continue
 		}
@@ -298,20 +381,20 @@ func (d *DSpark) TrainHeadsStep(inputs, targets *tensors.Int32s) float32 {
 			if int32(index) == target {
 				gradient -= 1
 			}
-			gradTotal.Data[row*vocab+index] = gradient / float32(rows)
+			gradTotal.Data[row*vocab+index] = gradient / float32(supervised)
 		}
 	}
 	gradMarkovHidden := d.markovUp.Backward(markovHidden, gradTotal)
-	d.markovDown.Backward(embeddings, gradMarkovHidden)
+	d.markovDown.Backward(previousEmbeddings, gradMarkovHidden)
 
 	// Confidence head: label a position as accepted when the biased argmax
 	// matches the target.
-	confidenceInput := d.confHidden.Forward(flatHidden)
-	confidenceLogit := d.confOut.Forward(confidenceInput).Reshape(rows, 1)
-	gradConfidence := tensors.New(rows, 1)
+	scores := d.confHidden.Forward(confidenceInput)
+	confidenceLogit := d.confOut.Forward(scores).Reshape(supervised, 1)
+	gradConfidence := tensors.New(supervised, 1)
 	var binaryCrossEntropy float64
-	for row := 0; row < rows; row++ {
-		target := flatTargets.Data[row]
+	for row := 0; row < supervised; row++ {
+		target := flatTargets[row]
 		if target == -1 {
 			continue
 		}
@@ -323,14 +406,14 @@ func (d *DSpark) TrainHeadsStep(inputs, targets *tensors.Int32s) float32 {
 		if label == 1 {
 			binaryCrossEntropy += -math.Log(float64(probability) + 1e-9)
 		} else {
-			binaryCrossEntropy += -math.Log(1-float64(probability) + 1e-9)
+			binaryCrossEntropy += -math.Log(1 - float64(probability) + 1e-9)
 		}
-		gradConfidence.Data[row] = (probability - label) / float32(rows)
+		gradConfidence.Data[row] = (probability - label) / float32(supervised)
 	}
-	gradConfidenceInput := d.confOut.Backward(confidenceInput.Reshape(rows, d.confHidden.OutFeatures), gradConfidence)
-	d.confHidden.Backward(flatHidden, gradConfidenceInput)
+	gradConfidenceInput := d.confOut.Backward(scores, gradConfidence)
+	d.confHidden.Backward(confidenceInput, gradConfidenceInput)
 
-	return loss + float32(binaryCrossEntropy)/float32(rows)
+	return loss + float32(binaryCrossEntropy)/float32(supervised)
 }
 
 // LoadDSpark reconstructs a DSpark from a checkpoint's config and parameters.
