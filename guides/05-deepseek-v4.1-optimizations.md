@@ -247,7 +247,9 @@ attention-weighted latent sum. This is a genuine architectural change trained
 from scratch; it is incompatible with compression, CED, sparsity, cross-layer
 reuse, the low-rank settings, head-wise Muon, and value embeddings, and
 `Config.Validate` rejects those combinations. `KVBytesPerToken`/`KVReadBytes`
-report the reduced footprint.
+report the reduced footprint. A cache-less `Forward` (used by evaluation and
+distillation) allocates a scratch latent cache, so an MLA model also works as a
+frozen teacher.
 
 Units: `TestBackpropDirectionalGradientCheckLowRank` (query, kv, both),
 `TestBackpropPerElementLowRankCED`, `TestLowRankReducesParameters`,
@@ -256,7 +258,11 @@ Units: `TestBackpropDirectionalGradientCheckLowRank` (query, kv, both),
 `TestMLATrainStepFinite`, `TestBackpropDirectionalGradientCheckMLA`,
 `TestBackpropPerElementMLA`, `TestMLATrainOverfitsTiny`,
 `TestMLAInferenceMatchesTraining`, `TestMLADecodeMatchesPrefill`,
-`TestMLACacheCodecRoundTrip`, `TestMLAKVBytesReduced`.
+`TestMLACacheCodecRoundTrip`, `TestMLAKVBytesReduced`,
+`TestMLAWithGroupedQueryAttention`, `TestMLAForwardNilCache`,
+`TestSaveLoadRoundtripMLA`, `TestEngineMatchesNaiveGenerateMLA`,
+`TestMLACacheManagerGenerationMatchesFullPrefill`,
+`TestMLAPrefixCacheGenerationMatchesFullPrefill`, `TestDistillWithMLATeacher`.
 
 ---
 
