@@ -32,6 +32,7 @@ layout.
 | Partial rotary embedding | 2.1 | `model/rotary.go`, `Config.RotaryDims` | `Config.RotaryDims` (default 64) |
 | Head-wise Muon for Q/K | 2.5 | `model/optimizer.go` `headWiseViews` | `--head-wise-muon` |
 | Sinkhorn-balanced embeddings / lm_head | 2.5 | `optimizer/sinkhorn.go`, `model/optimizer.go` `sinkhornGroup` | `--sinkhorn-embeddings` |
+| Full-vocabulary on-policy distillation (OPD) | 5.2.4 | `tensors/loss.go` (`DistillationLossPerPosition`), `trainer/distill.go` | `cmd/chat_opd` |
 | MLA low-rank query / KV latent | 2.3, 4.2.1 | `model/attention.go` `projectQuery`/`projectKeyValue` | `--query-compression-dim`, `--kv-latent-dim` |
 | Global-KV prefix reuse + SWA replay | 3.2.1, 3.2.2 | `inference/prefix.go` `PrefixCache`, `Engine.Prefix` | `Engine.Prefix = NewPrefixCache(...)` |
 | FP4 main KV cache / FP4 indexer QAT | 2.4.4 | **not implemented** (float32-only) | — |
@@ -291,6 +292,23 @@ training-only; the checkpoint layout is unchanged.
 Units: `TestSinkhornSingleRowNormalization`, `TestSinkhornMasksNearZeroRows`,
 `TestSinkhornRowsHaveUnitRMS`, `TestSinkhornStateAllocatedAndFinite`,
 `TestSetupOptimizerSinkhornRoutesEmbeddings`, `TestSinkhornTrainStepFinite`.
+
+**Full-vocabulary on-policy distillation.** `cmd/chat_opd` runs the paper's
+final post-training stage (§5.2.4): the student generates rollouts, a frozen
+teacher checkpoint scores them, and the student is trained to match the teacher's
+full next-token distribution. The objective is the forward KL from the student
+to the teacher (equivalently the cross-entropy of the teacher distribution under
+the student), computed by `tensors.DistillationLossPerPosition` /
+`tensors.DistillationGrad` with an optional softmax temperature and a loss mask
+that supervises only the sampled completion tokens. `trainer.DistillStep` is the
+per-micro-batch update and `trainer.Distill` the loop; the teacher can be any
+checkpoint whose vocabulary matches the student's.
+
+Units: `TestDistillationMatchesCrossEntropyForOneHotTeacher`,
+`TestDistillationGradMatchesNumeric`, `TestDistillationSelfIsZeroGrad`,
+`TestDistillationMaskZeroesPositions`, `TestDistillationTemperatureSoftensGrad`,
+`TestDistillStepReducesLoss`, `TestDistillSelfZeroGradient`,
+`TestDistillMaskRestrictsGradient`, `TestDistillLoop`.
 
 ---
 
