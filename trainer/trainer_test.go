@@ -5,8 +5,44 @@ import (
 	"testing"
 
 	"github.com/cookiengineer/gonano/model"
+	"github.com/cookiengineer/gonano/optimizer"
 	"github.com/cookiengineer/gonano/tensors"
 )
+
+// TestStepOptimizerSchedulesSinkhorn verifies that the learning-rate schedule
+// applies to Sinkhorn groups and that they receive the Muon momentum schedule
+// with no weight decay (DeepSeek-V4.1 §2.5).
+func TestStepOptimizerSchedulesSinkhorn(tester *testing.T) {
+	config := model.Config{
+		SequenceLen: 8, VocabSize: 16, NumLayer: 1, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L",
+	}
+	transformer := model.NewTransformer(config)
+	transformer.InitWeights(tensors.NewRNG(0))
+	groups := transformer.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, true)
+	trainer := NewTrainer(transformer, groups, 1)
+	trainer.StepOptimizer(500, 1000)
+
+	sinkhornGroups := 0
+	for _, group := range trainer.Optim.Groups {
+		if group.Kind != optimizer.KindSinkhorn {
+			continue
+		}
+		sinkhornGroups++
+		if group.WeightDecay != 0 {
+			tester.Fatalf("Sinkhorn group weight decay = %v, want 0", group.WeightDecay)
+		}
+		if group.Momentum <= 0 || group.Momentum > 1 {
+			tester.Fatalf("Sinkhorn group momentum = %v, want in (0,1]", group.Momentum)
+		}
+		if group.LR <= 0 {
+			tester.Fatalf("Sinkhorn group LR = %v, want > 0", group.LR)
+		}
+	}
+	if sinkhornGroups != 3 {
+		tester.Fatalf("Sinkhorn groups = %d, want 3 (lm_head, embedding, value embeds)", sinkhornGroups)
+	}
+}
 
 func TestLRMultiplier(tester *testing.T) {
 	// warmup 10, warmdown ratio 0.5, numIterations 100.
