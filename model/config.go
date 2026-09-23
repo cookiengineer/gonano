@@ -294,6 +294,9 @@ const defaultRotaryDims = 64
 // RoPE. It validates that the value is even and does not exceed the head
 // dimension.
 func (config Config) RotaryDimension() int {
+	if config.MLAEnabled() {
+		return config.MLARotaryDimension()
+	}
 	if config.RotaryDims <= 0 {
 		return config.HeadDim()
 	}

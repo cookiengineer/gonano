@@ -5,6 +5,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/cookiengineer/gonano/optimizer"
 	"github.com/cookiengineer/gonano/tensors"
 )
 
@@ -140,5 +141,129 @@ func TestMLAParameterShapes(t *testing.T) {
 				t.Fatal("non-finite MLA parameter after init")
 			}
 		}
+	}
+}
+
+func mlaTinyModel() *Transformer {
+	transformer := NewTransformer(mlaTestConfig())
+	transformer.InitWeights(tensors.NewRNG(42))
+	perturb := tensors.NewRNG(123)
+	for _, parameter := range transformer.Parameters() {
+		for index := range parameter.Data {
+			parameter.Data[index] += perturb.NormFloat32() * 0.1
+		}
+	}
+	return transformer
+}
+
+func TestMLATrainStepFinite(t *testing.T) {
+	transformer := mlaTinyModel()
+	indexes, targets := tinyData()
+	transformer.ZeroGrad()
+	logits, context := transformer.TrainForward(indexes)
+	for _, value := range logits.Data {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			t.Fatalf("non-finite MLA logit %v", value)
+		}
+	}
+	flattened := logits.Reshape(indexes.Numel(), transformer.Config.VocabSize)
+	_, valid := tensors.CrossEntropyPerPosition(flattened, targets.Reshape(indexes.Numel()), -1)
+	gradLogits := tensors.CrossEntropyGrad(flattened, targets.Reshape(indexes.Numel()), -1, 1/float32(valid))
+	transformer.TrainBackward(context, gradLogits.Reshape(indexes.Shape[0], indexes.Shape[1], transformer.Config.VocabSize))
+
+	nonZero := false
+	for _, parameter := range transformer.Parameters() {
+		for _, value := range parameter.Grad {
+			if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+				t.Fatal("non-finite MLA gradient")
+			}
+			if value != 0 {
+				nonZero = true
+			}
+		}
+	}
+	if !nonZero {
+		t.Fatal("MLA backward produced no gradients")
+	}
+}
+
+func TestBackpropDirectionalGradientCheckMLA(t *testing.T) {
+	runDirectionalGradientCheck(t, mlaTinyModel())
+}
+
+func TestBackpropPerElementMLA(t *testing.T) {
+	transformer := mlaTinyModel()
+	indexes, targets := tinyData()
+	analyticGrads(transformer, indexes, targets)
+
+	checks := []struct {
+		name         string
+		parameter    *tensors.Tensor
+		elementIndex int
+	}{
+		{"mla_q_down", transformer.blocks[0].attention.mla.QueryDown.Weight, 3},
+		{"mla_q_up", transformer.blocks[0].attention.mla.QueryUp.Weight, 5},
+		{"mla_q_rope", transformer.blocks[0].attention.mla.QueryRope.Weight, 7},
+		{"mla_kv_down", transformer.blocks[0].attention.mla.KVDown.Weight, 1},
+		{"mla_k_up", transformer.blocks[0].attention.mla.KeyUp.Weight, 9},
+		{"mla_v_up", transformer.blocks[0].attention.mla.ValueUp.Weight, 2},
+		{"mla_k_rope", transformer.blocks[0].attention.mla.KeyRope.Weight, 4},
+	}
+
+	epsilon := float32(1e-3)
+	for _, check := range checks {
+		analytic := check.parameter.Grad[check.elementIndex]
+		original := check.parameter.Data[check.elementIndex]
+		check.parameter.Data[check.elementIndex] = original + epsilon
+		lossPlus := meanLoss(transformer, indexes, targets)
+		check.parameter.Data[check.elementIndex] = original - epsilon
+		lossMinus := meanLoss(transformer, indexes, targets)
+		check.parameter.Data[check.elementIndex] = original
+		numeric := (lossPlus - lossMinus) / (2 * epsilon)
+
+		scale := math.Abs(float64(analytic))
+		if math.Abs(float64(numeric)) > scale {
+			scale = math.Abs(float64(numeric))
+		}
+		scale = math.Max(scale, 1e-3)
+		if math.Abs(float64(numeric-analytic)) > 0.5*scale {
+			t.Errorf("%s[%d]: analytic=%v numeric=%v", check.name, check.elementIndex, analytic, numeric)
+		}
+	}
+}
+
+func TestMLATrainOverfitsTiny(t *testing.T) {
+	transformer := mlaTinyModel()
+	groups := transformer.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, false)
+	optimizerImpl := optimizer.NewMuonAdamW(groups)
+
+	indexes, targets := tinyData()
+	vocabulary := transformer.Config.VocabSize
+	step := func() float32 {
+		transformer.ZeroGrad()
+		logits, context := transformer.TrainForward(indexes)
+		flat := logits.Reshape(indexes.Numel(), vocabulary)
+		targetFlat := targets.Reshape(indexes.Numel())
+		loss := tensors.CrossEntropy(flat, targetFlat, -1)
+		_, valid := tensors.CrossEntropyPerPosition(flat, targetFlat, -1)
+		gradient := tensors.CrossEntropyGrad(flat, targetFlat, -1, 1/float32(valid))
+		transformer.TrainBackward(context, gradient.Reshape(indexes.Shape[0], indexes.Shape[1], vocabulary))
+		return loss
+	}
+
+	first := step()
+	optimizerImpl.Step()
+	optimizerImpl.ZeroGrad()
+	var last float32
+	for stepIndex := 0; stepIndex < 60; stepIndex++ {
+		last = step()
+		optimizerImpl.Step()
+		optimizerImpl.ZeroGrad()
+	}
+	if math.IsNaN(float64(last)) || math.IsInf(float64(last), 0) {
+		t.Fatalf("MLA loss became non-finite: %v", last)
+	}
+	if last >= first {
+		t.Fatalf("MLA loss did not decrease: %v -> %v", first, last)
 	}
 }

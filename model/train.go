@@ -40,22 +40,27 @@ type attentionContext struct {
 
 	compression *compressedContext // non-nil on HCA-style compressed layers
 	share       *compressionShare  // non-nil on compressed layers (cross-layer reuse)
+
+	// MLA latent activations saved for the projection backward.
+	mlaQueryLatent *tensors.Tensor // [B,T,queryRank]
+	mlaKVLatent    *tensors.Tensor // [B,T,latent]
 }
 
 // forwardTraining runs the attention forward while saving activations. The
 // attention itself is computed by the flash-attention kernel, which returns the
 // per-query log-sum-exp instead of the full probability matrix.
 func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, share *compressionShare) (*tensors.Tensor, *attentionContext) {
-	if attention.mla != nil {
-		panic("model: MLA attention is not implemented")
-	}
 	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
-	query := attention.projectQuery(input).Reshape(batchSize, sequenceLength, attention.queryHeadCount, attention.headDimension)
-	keyProjected, valueProjected := attention.projectKeyValue(input)
-	key := keyProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
-	value := valueProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
-
+	var query, key, value *tensors.Tensor
 	context := &attentionContext{window: window[0]}
+	if attention.mla != nil {
+		query, key, value, context.mlaQueryLatent, context.mlaKVLatent = attention.mlaProjectHeads(input)
+	} else {
+		query = attention.projectQuery(input).Reshape(batchSize, sequenceLength, attention.queryHeadCount, attention.headDimension)
+		keyProjected, valueProjected := attention.projectKeyValue(input)
+		key = keyProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+		value = valueProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+	}
 	if valueEmbedding != nil {
 		valueEmbeddingHeads := valueEmbedding.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
 		preGate := attention.valueEmbeddingGate.Forward(sliceChannels(input, 0, sequenceLength, veGateChannels)) // [B,T,Hkv]
@@ -71,8 +76,10 @@ func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cos
 	context.queryRotary = query
 	context.keyRotary = key
 
-	query = tensors.Scale(normalizeLastDim(query), qkScale)
-	key = tensors.Scale(normalizeLastDim(key), qkScale)
+	if attention.mla == nil {
+		query = tensors.Scale(normalizeLastDim(query), qkScale)
+		key = tensors.Scale(normalizeLastDim(key), qkScale)
+	}
 
 	queryHeadMajor := toBatchHeadLayout(query)
 	keyHeadMajor := toBatchHeadLayout(key)
@@ -182,9 +189,6 @@ func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cos
 // input. Key and value gradients accumulate across query heads that share a
 // key/value head (grouped-query attention).
 func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, outputGradient *tensors.Tensor, context *attentionContext, cosine, sine *tensors.Tensor, positionOffset int) *tensors.Tensor {
-	if attention.mla != nil {
-		panic("model: MLA attention is not implemented")
-	}
 	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
 	headDimension := attention.headDimension
 	headRatio := attention.queryHeadCount / attention.keyValueHeadCount
@@ -311,30 +315,50 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 		}
 	}
 
-	// Unscale QK (qkScale) and back through QK norm.
-	gradientQuery = tensors.Scale(gradientQuery, qkScale)
-	gradientKey = tensors.Scale(gradientKey, qkScale)
-	gradientQuerySequence := toBatchSequenceLayout(gradientQuery)
-	gradientKeySequence := toBatchSequenceLayout(gradientKey)
-
-	gradientQueryPreNorm := normalizeLastDimBackward(context.queryRotary, gradientQuerySequence)
-	gradientKeyPreNorm := normalizeLastDimBackward(context.keyRotary, gradientKeySequence)
-
-	// Rotary backward: transpose the rotation (negate the sine table).
-	negatedSine := negateSineTable(sine)
-	gradientQueryProjected := ApplyRotary(gradientQueryPreNorm, cosine, negatedSine, positionOffset)
-	gradientKeyProjected := ApplyRotary(gradientKeyPreNorm, cosine, negatedSine, positionOffset)
-
-	// Accumulate into the input via the projection layers (low-rank aware).
-	gradientQueryOutput := gradientQueryProjected.Reshape(batchSize, sequenceLength, attention.queryHeadCount*attention.headDimension)
-	gradientKeyOutput := gradientKeyProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount*attention.headDimension)
 	var gradientInput *tensors.Tensor
-	if attention.queryDown != nil {
-		queryLatent := attention.queryDown.Forward(input)
-		gradientQueryLatent := attention.queryProjection.Backward(queryLatent, gradientQueryOutput)
-		gradientInput = attention.queryDown.Backward(input, gradientQueryLatent)
-	} else {
-		gradientInput = attention.queryProjection.Backward(input, gradientQueryOutput)
+	if attention.mla == nil {
+		// Unscale QK (qkScale) and back through QK norm.
+		gradientQuery = tensors.Scale(gradientQuery, qkScale)
+		gradientKey = tensors.Scale(gradientKey, qkScale)
+		gradientQuerySequence := toBatchSequenceLayout(gradientQuery)
+		gradientKeySequence := toBatchSequenceLayout(gradientKey)
+
+		gradientQueryPreNorm := normalizeLastDimBackward(context.queryRotary, gradientQuerySequence)
+		gradientKeyPreNorm := normalizeLastDimBackward(context.keyRotary, gradientKeySequence)
+
+		// Rotary backward: transpose the rotation (negate the sine table).
+		negatedSine := negateSineTable(sine)
+		gradientQueryProjected := ApplyRotary(gradientQueryPreNorm, cosine, negatedSine, positionOffset)
+		gradientKeyProjected := ApplyRotary(gradientKeyPreNorm, cosine, negatedSine, positionOffset)
+
+		// Accumulate into the input via the projection layers (low-rank aware).
+		gradientQueryOutput := gradientQueryProjected.Reshape(batchSize, sequenceLength, attention.queryHeadCount*attention.headDimension)
+		gradientKeyOutput := gradientKeyProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount*attention.headDimension)
+		if attention.queryDown != nil {
+			queryLatent := attention.queryDown.Forward(input)
+			gradientQueryLatent := attention.queryProjection.Backward(queryLatent, gradientQueryOutput)
+			gradientInput = attention.queryDown.Backward(input, gradientQueryLatent)
+		} else {
+			gradientInput = attention.queryProjection.Backward(input, gradientQueryOutput)
+		}
+
+		// Key/value projection gradients. With a shared low-rank latent both
+		// gradients flow through one down-projection so its parameter gradient
+		// is accumulated once from the combined latent gradient.
+		gradientValueOutput := toBatchSequenceLayout(gradientValue).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount*attention.headDimension)
+		if attention.kvDown != nil {
+			kvLatent := attention.kvDown.Forward(input)
+			gradientKvLatent := attention.keyProjection.Backward(kvLatent, gradientKeyOutput)
+			gradientKvLatent = tensors.Add(gradientKvLatent, attention.valueProjection.Backward(kvLatent, gradientValueOutput))
+			gradientInput = tensors.Add(gradientInput, attention.kvDown.Backward(input, gradientKvLatent))
+		} else {
+			gradientInput = tensors.Add(gradientInput, attention.keyProjection.Backward(input, gradientKeyOutput))
+			gradientInput = tensors.Add(gradientInput, attention.valueProjection.Backward(input, gradientValueOutput))
+		}
+	}
+
+	if attention.mla != nil {
+		gradientInput = tensors.New(batchSize, sequenceLength, attention.embeddingDimension)
 	}
 
 	// Value embedding gate backward.
@@ -373,18 +397,14 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 		gradientInput = tensors.Add(gradientInput, scattered)
 	}
 
-	// Key/value projection gradients. With a shared low-rank latent both
-	// gradients flow through one down-projection so its parameter gradient is
-	// accumulated once from the combined latent gradient.
-	gradientValueOutput := gradientValueSequence.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount*attention.headDimension)
-	if attention.kvDown != nil {
-		kvLatent := attention.kvDown.Forward(input)
-		gradientKvLatent := attention.keyProjection.Backward(kvLatent, gradientKeyOutput)
-		gradientKvLatent = tensors.Add(gradientKvLatent, attention.valueProjection.Backward(kvLatent, gradientValueOutput))
-		gradientInput = tensors.Add(gradientInput, attention.kvDown.Backward(input, gradientKvLatent))
-	} else {
-		gradientInput = tensors.Add(gradientInput, attention.keyProjection.Backward(input, gradientKeyOutput))
-		gradientInput = tensors.Add(gradientInput, attention.valueProjection.Backward(input, gradientValueOutput))
+	// MLA projection gradients: split the query/key gradient into the content
+	// and rope parts, accumulate the latent gradients from both the key and
+	// value up-projections, and backpropagate through the shared down-projections.
+	if attention.mla != nil {
+		negatedSine := negateSineTable(sine)
+		gradientQueryRotary := ApplyRotary(toBatchSequenceLayout(gradientQuery), cosine, negatedSine, positionOffset)
+		gradientKeyRotary := ApplyRotary(toBatchSequenceLayout(gradientKey), cosine, negatedSine, positionOffset)
+		gradientInput = tensors.Add(gradientInput, attention.mlaProjectBackward(context, gradientQueryRotary, gradientKeyRotary, gradientValueSequence, input))
 	}
 
 	// The compressor logit projection reads the attention input directly.
