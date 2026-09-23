@@ -77,6 +77,18 @@ type Config struct {
 	// stores the full per-head keys/values, so this reduces projection compute
 	// and parameters, not cache bytes.
 	KVLatentDim int `json:"kv_latent_dim,omitempty"`
+	// MLALatent enables absorbed Multi-head Latent Attention: content keys and
+	// values are up-projected from a shared latent of this width, a decoupled
+	// rotary key is stored alongside it, and the up-projections are absorbed
+	// into the query and output so attention reads the latent directly
+	// (DeepSeek-V4.1 §2.3/§4.2.1). It reduces both parameters and KV-cache
+	// bytes. It is a genuine architectural change and must be trained from
+	// scratch; the full-rank, low-rank, compressed, and CED paths are separate
+	// modes. Zero disables it.
+	MLALatent int `json:"mla_latent,omitempty"`
+	// MLARotaryDims is the decoupled rotary width of the MLA key/query. Zero
+	// uses RotaryDimension.
+	MLARotaryDims int `json:"mla_rotary_dims,omitempty"`
 }
 
 // CEDEnabled reports whether the causal encoder-decoder split is active.
@@ -98,6 +110,39 @@ func (config Config) KVRank() int {
 		return 0
 	}
 	return config.KVLatentDim
+}
+
+// MLAEnabled reports whether absorbed Multi-head Latent Attention is active.
+func (config Config) MLAEnabled() bool { return config.MLALatent > 0 }
+
+// MLARank returns the MLA shared latent width.
+func (config Config) MLARank() int { return config.MLALatent }
+
+// MLAContentDim returns the non-rotary content width, the part of the head that
+// is up-projected from the shared latent.
+func (config Config) MLAContentDim() int { return config.HeadDim() - config.MLARotaryDimension() }
+
+// MLARotaryDimension returns the decoupled rotary width of the MLA key/query.
+// Zero defaults to half the head dimension (capped at the standard 64), so the
+// content width is always positive.
+func (config Config) MLARotaryDimension() int {
+	if config.MLARotaryDims <= 0 {
+		width := config.HeadDim() / 2
+		if width > defaultRotaryDims {
+			width = defaultRotaryDims
+		}
+		if width%2 != 0 {
+			width--
+		}
+		return width
+	}
+	if config.MLARotaryDims > config.HeadDim() {
+		panic(fmt.Sprintf("model: MLARotaryDims %d exceeds head dim %d", config.MLARotaryDims, config.HeadDim()))
+	}
+	if config.MLARotaryDims%2 != 0 {
+		panic(fmt.Sprintf("model: MLARotaryDims %d must be even", config.MLARotaryDims))
+	}
+	return config.MLARotaryDims
 }
 
 // CEDSplit returns the first decoder layer index, or 0 when CED is disabled.
@@ -291,6 +336,35 @@ func (config Config) Validate() {
 	}
 	if config.KVLatentDim < 0 {
 		panic(fmt.Sprintf("model: KVLatentDim %d must be >= 0", config.KVLatentDim))
+	}
+	if config.MLALatent < 0 {
+		panic(fmt.Sprintf("model: MLALatent %d must be >= 0", config.MLALatent))
+	}
+	if config.MLARotaryDims < 0 {
+		panic(fmt.Sprintf("model: MLARotaryDims %d must be >= 0", config.MLARotaryDims))
+	}
+	if config.MLAEnabled() {
+		if config.Compression() > 1 {
+			panic("model: MLA is not supported with compression")
+		}
+		if config.CED {
+			panic("model: MLA is not supported with CED")
+		}
+		if config.SparseTopK > 0 {
+			panic("model: MLA is not supported with sparse attention")
+		}
+		if config.ReusePattern != "" {
+			panic("model: MLA is not supported with cross-layer reuse")
+		}
+		if config.QueryCompressionDim > 0 || config.KVLatentDim > 0 {
+			panic("model: MLA is incompatible with QueryCompressionDim/KVLatentDim")
+		}
+		if config.HeadWiseMuon {
+			panic("model: MLA is not supported with head-wise Muon")
+		}
+		if config.MLAContentDim() <= 0 {
+			panic("model: MLA content dimension must be positive")
+		}
 	}
 	if config.ReusePattern != "" {
 		if config.Compression() <= 1 {

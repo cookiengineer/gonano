@@ -46,6 +46,9 @@ type attentionContext struct {
 // attention itself is computed by the flash-attention kernel, which returns the
 // per-query log-sum-exp instead of the full probability matrix.
 func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, share *compressionShare) (*tensors.Tensor, *attentionContext) {
+	if attention.mla != nil {
+		panic("model: MLA attention is not implemented")
+	}
 	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
 	query := attention.projectQuery(input).Reshape(batchSize, sequenceLength, attention.queryHeadCount, attention.headDimension)
 	keyProjected, valueProjected := attention.projectKeyValue(input)
@@ -179,6 +182,9 @@ func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cos
 // input. Key and value gradients accumulate across query heads that share a
 // key/value head (grouped-query attention).
 func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, outputGradient *tensors.Tensor, context *attentionContext, cosine, sine *tensors.Tensor, positionOffset int) *tensors.Tensor {
+	if attention.mla != nil {
+		panic("model: MLA attention is not implemented")
+	}
 	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
 	headDimension := attention.headDimension
 	headRatio := attention.queryHeadCount / attention.keyValueHeadCount

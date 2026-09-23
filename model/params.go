@@ -16,14 +16,25 @@ func (model *Transformer) NamedParameters() map[string]*tensors.Tensor {
 	parameters["transformer.wte.weight"] = model.tokenEmbedding.Weight
 	parameters["lm_head.weight"] = model.lmHead.Weight
 	for layerIndex, block := range model.blocks {
-		parameters[fmt.Sprintf("transformer.h.%d.attn.c_q.weight", layerIndex)] = block.attention.queryProjection.Weight
-		parameters[fmt.Sprintf("transformer.h.%d.attn.c_k.weight", layerIndex)] = block.attention.keyProjection.Weight
-		parameters[fmt.Sprintf("transformer.h.%d.attn.c_v.weight", layerIndex)] = block.attention.valueProjection.Weight
-		if block.attention.queryDown != nil {
-			parameters[fmt.Sprintf("transformer.h.%d.attn.q_down.weight", layerIndex)] = block.attention.queryDown.Weight
-		}
-		if block.attention.kvDown != nil {
-			parameters[fmt.Sprintf("transformer.h.%d.attn.kv_down.weight", layerIndex)] = block.attention.kvDown.Weight
+		if mlattention := block.attention.mla; mlattention != nil {
+			prefix := fmt.Sprintf("transformer.h.%d.attn.", layerIndex)
+			parameters[prefix+"mla_q_down.weight"] = mlattention.QueryDown.Weight
+			parameters[prefix+"mla_q_up.weight"] = mlattention.QueryUp.Weight
+			parameters[prefix+"mla_q_rope.weight"] = mlattention.QueryRope.Weight
+			parameters[prefix+"mla_kv_down.weight"] = mlattention.KVDown.Weight
+			parameters[prefix+"mla_k_up.weight"] = mlattention.KeyUp.Weight
+			parameters[prefix+"mla_v_up.weight"] = mlattention.ValueUp.Weight
+			parameters[prefix+"mla_k_rope.weight"] = mlattention.KeyRope.Weight
+		} else {
+			parameters[fmt.Sprintf("transformer.h.%d.attn.c_q.weight", layerIndex)] = block.attention.queryProjection.Weight
+			parameters[fmt.Sprintf("transformer.h.%d.attn.c_k.weight", layerIndex)] = block.attention.keyProjection.Weight
+			parameters[fmt.Sprintf("transformer.h.%d.attn.c_v.weight", layerIndex)] = block.attention.valueProjection.Weight
+			if block.attention.queryDown != nil {
+				parameters[fmt.Sprintf("transformer.h.%d.attn.q_down.weight", layerIndex)] = block.attention.queryDown.Weight
+			}
+			if block.attention.kvDown != nil {
+				parameters[fmt.Sprintf("transformer.h.%d.attn.kv_down.weight", layerIndex)] = block.attention.kvDown.Weight
+			}
 		}
 		parameters[fmt.Sprintf("transformer.h.%d.attn.c_proj.weight", layerIndex)] = block.attention.outputProjection.Weight
 		if block.attention.valueEmbeddingGate != nil {

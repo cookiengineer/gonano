@@ -23,6 +23,16 @@ func (model *Transformer) SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, w
 	var matrixParameters []*tensors.Tensor
 	headWise := model.Config.HeadWiseMuon
 	for _, block := range model.blocks {
+		if block.attention.mla != nil {
+			matrixParameters = append(matrixParameters, block.attention.mla.parameters()...)
+			matrixParameters = append(matrixParameters,
+				block.attention.outputProjection.Weight,
+				block.mlp.inputProjection.Weight, block.mlp.outputProjection.Weight)
+			if block.attention.valueEmbeddingGate != nil {
+				matrixParameters = append(matrixParameters, block.attention.valueEmbeddingGate.Weight)
+			}
+			continue
+		}
 		if headWise {
 			// Split Q and K by attention head so each head is orthogonalized
 			// independently (DeepSeek-V4.1 §2.5). The views share storage with

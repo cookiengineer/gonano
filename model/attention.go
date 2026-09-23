@@ -120,6 +120,10 @@ type CausalSelfAttention struct {
 	// layer's own hidden state; the local sliding-window branch still reads the
 	// layer's own hidden state.
 	ced bool
+
+	// mla, when non-nil, replaces the standard query/key/value projections with
+	// the absorbed Multi-head Latent Attention parameters.
+	mla *MLAttention
 }
 
 // usesCompression reports whether the layer takes the compressed-attention
@@ -181,6 +185,13 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool, layer 
 		producer:           configuration.ReuseProducer(layer),
 		ced:                configuration.IsDecoderLayer(layer),
 	}
+	if hasValueEmbedding {
+		attention.valueEmbeddingGate = layers.NewLinear(veGateChannels, configuration.NumKVHead)
+	}
+	if configuration.MLAEnabled() {
+		attention.mla = newMLAttention(configuration)
+		return attention
+	}
 	if rank := configuration.QueryRank(); rank > 0 {
 		attention.queryDown = layers.NewLinear(configuration.EmbedDim, rank)
 		attention.queryProjection = layers.NewLinear(rank, configuration.NumHead*headDimension)
@@ -194,9 +205,6 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool, layer 
 	} else {
 		attention.keyProjection = layers.NewLinear(configuration.EmbedDim, configuration.NumKVHead*headDimension)
 		attention.valueProjection = layers.NewLinear(configuration.EmbedDim, configuration.NumKVHead*headDimension)
-	}
-	if hasValueEmbedding {
-		attention.valueEmbeddingGate = layers.NewLinear(veGateChannels, configuration.NumKVHead)
 	}
 	if ratio := configuration.Compression(); ratio > 1 {
 		attention.compressionRatio = ratio
@@ -225,6 +233,9 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool, layer 
 // (left, right) sliding window; cache, when non-nil, stores and reads KV. The
 // result has shape [batch, sequence, embedding].
 func (attention *CausalSelfAttention) Forward(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, cache *KVBuffer, layer int, share *compressionShare) *tensors.Tensor {
+	if attention.mla != nil {
+		panic("model: MLA attention is not implemented")
+	}
 	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
 	query := attention.projectQuery(input).Reshape(batchSize, sequenceLength, attention.queryHeadCount, attention.headDimension)
 	keyProjected, valueProjected := attention.projectKeyValue(input)

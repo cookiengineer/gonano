@@ -9,6 +9,16 @@ package model
 func (model *Transformer) MatmulParams() int {
 	total := 0
 	for _, block := range model.blocks {
+		if block.attention.mla != nil {
+			total += block.attention.mla.numParameters()
+			total += block.attention.outputProjection.Weight.Numel()
+			if block.attention.valueEmbeddingGate != nil {
+				total += block.attention.valueEmbeddingGate.Weight.Numel()
+			}
+			total += block.mlp.inputProjection.Weight.Numel()
+			total += block.mlp.outputProjection.Weight.Numel()
+			continue
+		}
 		total += block.attention.queryProjection.Weight.Numel()
 		total += block.attention.keyProjection.Weight.Numel()
 		total += block.attention.valueProjection.Weight.Numel()
@@ -243,6 +253,9 @@ func ScalingParamsForConfig(config Config) int64 {
 		kvParams = 3 * embeddingDimension * rank
 	}
 	perBlock := queryParams + kvParams + embeddingDimension*embeddingDimension + 8*embeddingDimension*embeddingDimension
+	if config.MLAEnabled() {
+		perBlock = mlaParamsForConfig(config) + embeddingDimension*embeddingDimension + 8*embeddingDimension*embeddingDimension
+	}
 	numValueEmbeddings := (config.NumLayer + 1) / 2
 	transformerMatrices := int64(config.NumLayer)*int64(perBlock) + int64(numValueEmbeddings)*int64(12*config.NumKVHead)
 	lmHead := int64(config.EmbedDim) * int64(config.PaddedVocab())
@@ -263,6 +276,9 @@ func EstimateFlopsPerTokenForConfig(config Config) float64 {
 		kvParams = 3 * embeddingDimension * rank
 	}
 	perBlock := queryParams + kvParams + embeddingDimension*embeddingDimension + 8*embeddingDimension*embeddingDimension
+	if config.MLAEnabled() {
+		perBlock = mlaParamsForConfig(config) + embeddingDimension*embeddingDimension + 8*embeddingDimension*embeddingDimension
+	}
 	numValueEmbeddings := (config.NumLayer + 1) / 2
 	matmulParameters := int64(config.NumLayer)*int64(perBlock) +
 		int64(numValueEmbeddings)*int64(12*config.NumKVHead) +
@@ -292,6 +308,16 @@ func (model *Transformer) NumScalingParams() ScalingParams {
 	}
 	scalingParams.LMHead = model.lmHead.Weight.Numel()
 	for _, block := range model.blocks {
+		if block.attention.mla != nil {
+			scalingParams.TransformerMatrices += block.attention.mla.numParameters()
+			scalingParams.TransformerMatrices += block.attention.outputProjection.Weight.Numel()
+			if block.attention.valueEmbeddingGate != nil {
+				scalingParams.TransformerMatrices += block.attention.valueEmbeddingGate.Weight.Numel()
+			}
+			scalingParams.TransformerMatrices += block.mlp.inputProjection.Weight.Numel()
+			scalingParams.TransformerMatrices += block.mlp.outputProjection.Weight.Numel()
+			continue
+		}
 		scalingParams.TransformerMatrices += block.attention.queryProjection.Weight.Numel()
 		scalingParams.TransformerMatrices += block.attention.keyProjection.Weight.Numel()
 		scalingParams.TransformerMatrices += block.attention.valueProjection.Weight.Numel()

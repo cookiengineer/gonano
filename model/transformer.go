@@ -92,14 +92,20 @@ func (model *Transformer) InitWeights(rng *tensors.RNG) {
 	layers.InitNormal(model.lmHead.Weight, rng, 0.001)
 
 	for _, block := range model.blocks {
-		layers.InitUniform(block.attention.queryProjection.Weight, rng, -bound, bound)
-		layers.InitUniform(block.attention.keyProjection.Weight, rng, -bound, bound)
-		layers.InitUniform(block.attention.valueProjection.Weight, rng, -bound, bound)
-		if block.attention.queryDown != nil {
-			layers.InitUniform(block.attention.queryDown.Weight, rng, -bound, bound)
-		}
-		if block.attention.kvDown != nil {
-			layers.InitUniform(block.attention.kvDown.Weight, rng, -bound, bound)
+		if block.attention.mla != nil {
+			for _, weight := range block.attention.mla.parameters() {
+				layers.InitUniform(weight, rng, -bound, bound)
+			}
+		} else {
+			layers.InitUniform(block.attention.queryProjection.Weight, rng, -bound, bound)
+			layers.InitUniform(block.attention.keyProjection.Weight, rng, -bound, bound)
+			layers.InitUniform(block.attention.valueProjection.Weight, rng, -bound, bound)
+			if block.attention.queryDown != nil {
+				layers.InitUniform(block.attention.queryDown.Weight, rng, -bound, bound)
+			}
+			if block.attention.kvDown != nil {
+				layers.InitUniform(block.attention.kvDown.Weight, rng, -bound, bound)
+			}
 		}
 		layers.InitZeros(block.attention.outputProjection.Weight)
 		layers.InitUniform(block.mlp.inputProjection.Weight, rng, -0.4*bound, 0.4*bound)
