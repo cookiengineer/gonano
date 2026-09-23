@@ -17,7 +17,7 @@ import (
 // it back, and generate from it.
 func TestEndToEnd(t *testing.T) {
 	cfg := model.Config{
-		SequenceLen: 16, VocabSize: 265, NumLayer: 1, NumHead: 2, NumKVHead: 2,
+		SequenceLen: 16, VocabSize: 256 + len(tokenizer.SpecialTokens), NumLayer: 1, NumHead: 2, NumKVHead: 2,
 		EmbedDim: 32, WindowPattern: "L",
 	}
 	m := model.NewTransformer(cfg)
@@ -68,7 +68,7 @@ func TestEndToEnd(t *testing.T) {
 // train a tiny MoE model, save it, load it back, and generate from it.
 func TestEndToEndMoE(t *testing.T) {
 	cfg := model.Config{
-		SequenceLen: 16, VocabSize: 265, NumLayer: 2, NumHead: 2, NumKVHead: 2,
+		SequenceLen: 16, VocabSize: 256 + len(tokenizer.SpecialTokens), NumLayer: 2, NumHead: 2, NumKVHead: 2,
 		EmbedDim: 32, WindowPattern: "L",
 		NumExperts: 4, NumExpertsPerToken: 2, ExpertHiddenDim: 16, SharedExpertHiddenDim: 16,
 	}

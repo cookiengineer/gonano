@@ -4,13 +4,18 @@
 package tokenizer
 
 // SpecialTokens are the control tokens used to delimit documents, render
-// conversations, and mark tool calls. They are assigned ids in this order,
-// appended after the mergeable vocabulary.
+// conversations, mark tool calls, and delimit an explicit reasoning trace. They
+// are assigned ids in this order, appended after the mergeable vocabulary.
 //
 // The tool-call vocabulary is language-agnostic: the assistant emits
 // <|tool_start|> … <|tool_end|> to invoke a tool, and the runtime replies with
 // <|tool_output_start|> … <|tool_output_end|>. The tool itself is executed by
 // Go code (see package inference), not by any particular scripting language.
+//
+// The thinking tokens delimit the optional reasoning trace that precedes an
+// assistant answer: <|assistant_start|> <|think_start|> … <|think_end|>
+// …answer… <|assistant_end|>. They are appended last so that adding them does
+// not renumber any existing token.
 var SpecialTokens = []string{
 	"<|bos|>",
 	"<|user_start|>",
@@ -21,6 +26,8 @@ var SpecialTokens = []string{
 	"<|tool_end|>",
 	"<|tool_output_start|>",
 	"<|tool_output_end|>",
+	"<|think_start|>",
+	"<|think_end|>",
 }
 
 // splitPattern is the GPT-4/tiktoken split pattern, described in prose because

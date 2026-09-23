@@ -122,6 +122,77 @@ func naiveGenerate(transformer *model.Transformer, tokens []int, maxTokens int, 
 	return ids
 }
 
+// testThinkingModel builds a tiny zero-weight model whose logits are uniform,
+// so argmax decoding always emits token 0 (a byte token, never a special).
+func testThinkingModel() (*model.Transformer, *tokenizer.Tokenizer) {
+	config := model.Config{
+		SequenceLen: 32, VocabSize: 32, NumLayer: 1, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L",
+	}
+	transformer := model.NewTransformer(config) // zero-initialized weights
+	ranks := make(map[string]int, 8)
+	for index := 0; index < 8; index++ {
+		ranks[string([]byte{byte(index)})] = index
+	}
+	return transformer, tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
+}
+
+// TestEngineThinkingBudgetForcesThinkEnd checks that, once the reasoning budget
+// is exhausted, the engine forces a <|think_end|> token instead of letting the
+// trace run unbounded.
+func TestEngineThinkingBudgetForcesThinkEnd(test *testing.T) {
+	transformer, tokenizerImpl := testThinkingModel()
+	engine := NewEngine(transformer, tokenizerImpl)
+	prompt := []int{
+		tokenizerImpl.BOSTokenID(),
+		tokenizerImpl.EncodeSpecial("<|assistant_start|>"),
+		tokenizerImpl.EncodeSpecial("<|think_start|>"),
+	}
+	thinkEnd := tokenizerImpl.EncodeSpecial("<|think_end|>")
+
+	var columns, masks [][]int
+	generate := engine.GenerateWith(prompt, 1, 6, 0, 0, 1, GenerateOptions{Thinking: true, ThinkingBudget: 2})
+	generate(func(column, mask []int) bool {
+		columns = append(columns, append([]int(nil), column...))
+		masks = append(masks, append([]int(nil), mask...))
+		return true
+	})
+	if len(columns) < 3 {
+		test.Fatalf("generated %d steps, want at least 3", len(columns))
+	}
+	// Steps 1 and 2 are reasoning tokens; step 3 is the forced think_end.
+	if columns[2][0] != thinkEnd || masks[2][0] != 0 {
+		test.Fatalf("step 3 = token %d mask %d, want forced think_end %d mask 0 (columns=%v)",
+			columns[2][0], masks[2][0], thinkEnd, columns)
+	}
+}
+
+// TestEngineThinkingDisabledPassthrough checks that without thinking options
+// the engine performs no trace handling and emits no closing token.
+func TestEngineThinkingDisabledPassthrough(test *testing.T) {
+	transformer, tokenizerImpl := testThinkingModel()
+	engine := NewEngine(transformer, tokenizerImpl)
+	prompt := []int{
+		tokenizerImpl.BOSTokenID(),
+		tokenizerImpl.EncodeSpecial("<|assistant_start|>"),
+		tokenizerImpl.EncodeSpecial("<|think_start|>"),
+	}
+	thinkEnd := tokenizerImpl.EncodeSpecial("<|think_end|>")
+	thinkStart := tokenizerImpl.EncodeSpecial("<|think_start|>")
+
+	var columns [][]int
+	generate := engine.GenerateWith(prompt, 1, 6, 0, 0, 1, GenerateOptions{})
+	generate(func(column, mask []int) bool {
+		columns = append(columns, append([]int(nil), column...))
+		return true
+	})
+	for step, column := range columns {
+		if column[0] == thinkEnd || column[0] == thinkStart {
+			test.Fatalf("step %d emitted special %d without thinking enabled", step, column[0])
+		}
+	}
+}
+
 func testGQAEngineModel() (*model.Transformer, *tokenizer.Tokenizer) {
 	config := model.Config{
 		SequenceLen: 16, VocabSize: 32, NumLayer: 2, NumHead: 4, NumKVHead: 1,

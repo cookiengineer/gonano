@@ -86,7 +86,7 @@ Implementation: `model/checkpoint/gguf.go` (`ExportGGUF`).
 | `nanochat.window_pattern` | string | e.g. `"SSSL"` |
 | `nanochat.step` | uint32 | training step |
 | `nanochat.value_embedding_layers` | uint32 | number of ResFormer layers |
-| `nanochat.special_tokens` | array[string] | the 9 special tokens |
+| `nanochat.special_tokens` | array[string] | the special tokens (including `<|think_start|>`/`<|think_end|>`) |
 | `tokenizer.ggml.model` | string | `"gpt2"` (byte-level BPE) |
 | `tokenizer.ggml.bos_token_id` | uint32 | `<|bos|>` id |
 

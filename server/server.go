@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cookiengineer/gonano/inference"
 	"github.com/cookiengineer/gonano/model"
@@ -38,42 +39,88 @@ func NewServer(transformer *model.Transformer, tokenizerImpl *tokenizer.Tokenize
 // rowResult is the parsed output of one generated sample.
 type rowResult struct {
 	content    string
+	reasoning  string
 	toolCalls  []ToolCall
 	finish     string
 	promptLen  int
 	completion int
 }
 
+// thinkingOptions is the resolved thinking configuration of a request.
+type thinkingOptions struct {
+	enabled bool
+	budget  int
+}
+
+// resolveThinking resolves the thinking enable flag and budget from a request.
+func resolveThinking(chatRequest ChatCompletionRequest) thinkingOptions {
+	options := thinkingOptions{}
+	if chatRequest.Thinking != nil {
+		options.enabled = *chatRequest.Thinking
+	}
+	if chatRequest.ThinkingBudget != nil && *chatRequest.ThinkingBudget > 0 {
+		options.budget = *chatRequest.ThinkingBudget
+		options.enabled = true
+	}
+	return options
+}
+
 // generate runs n samples of autoregressive generation and parses each row
-// into its natural-language content, tool calls, and finish reason.
-func (server *Server) generate(prompt []int, temperature float32, topK, maxTokens, numSamples int, seed uint64) []rowResult {
+// into its natural-language content, reasoning trace, tool calls, and finish
+// reason.
+func (server *Server) generate(prompt []int, temperature float32, topK, maxTokens, numSamples int, seed uint64, thinking thinkingOptions) []rowResult {
 	tokenizerImpl := server.Tokenizer
 	results := make([]rowResult, numSamples)
 
 	toolStart := tokenizerImpl.EncodeSpecial("<|tool_start|>")
 	toolEnd := tokenizerImpl.EncodeSpecial("<|tool_end|>")
 	assistantEnd := tokenizerImpl.EncodeSpecial("<|assistant_end|>")
+	thinkStart := tokenizerImpl.EncodeSpecial("<|think_start|>")
+	thinkEnd := tokenizerImpl.EncodeSpecial("<|think_end|>")
 	bosToken := tokenizerImpl.BOSTokenID()
 
 	var sampled [][]int
 	var callArgs [][]int
+	var reasoningTokens [][]int
 	inToolCall := make([]bool, numSamples)
+	inThinking := make([]bool, numSamples)
 	finished := make([]bool, numSamples)
 	sampled = make([][]int, numSamples)
 	callArgs = make([][]int, numSamples)
+	reasoningTokens = make([][]int, numSamples)
 	callCounter := 0
 
-	generate := server.Engine.Generate(prompt, numSamples, maxTokens, temperature, topK, seed)
+	// A prompt primed with <|think_start|> (thinking enabled) starts inside the
+	// reasoning trace.
+	primedThinking := len(prompt) > 0 && prompt[len(prompt)-1] == thinkStart
+	for index := 0; index < numSamples; index++ {
+		inThinking[index] = primedThinking
+	}
+
+	generate := server.Engine.GenerateWith(prompt, numSamples, maxTokens, temperature, topK, seed,
+		inference.GenerateOptions{Thinking: thinking.enabled || thinking.budget > 0, ThinkingBudget: thinking.budget})
 	generate(func(column, mask []int) bool {
 		for index := 0; index < numSamples; index++ {
 			if finished[index] {
 				continue
 			}
-			if mask[index] == 0 {
-				// Forced tokens are tool outputs; the model already saw them.
+			token := column[index]
+			// Thinking delimiters matter even when forced by the budget, so
+			// process them before the forced-token filter below.
+			switch token {
+			case thinkStart:
+				inThinking[index] = true
+				reasoningTokens[index] = nil
+				continue
+			case thinkEnd:
+				inThinking[index] = false
 				continue
 			}
-			token := column[index]
+			if mask[index] == 0 {
+				// Remaining forced tokens are tool outputs; the model already
+				// saw them, so they must not appear in the response.
+				continue
+			}
 			switch token {
 			case toolStart:
 				inToolCall[index] = true
@@ -97,9 +144,12 @@ func (server *Server) generate(prompt []int, temperature float32, topK, maxToken
 			case assistantEnd, bosToken:
 				finished[index] = true
 			default:
-				if inToolCall[index] {
+				switch {
+				case inToolCall[index]:
 					callArgs[index] = append(callArgs[index], token)
-				} else {
+				case inThinking[index]:
+					reasoningTokens[index] = append(reasoningTokens[index], token)
+				default:
 					sampled[index] = append(sampled[index], token)
 				}
 			}
@@ -114,12 +164,13 @@ func (server *Server) generate(prompt []int, temperature float32, topK, maxToken
 
 	for index := 0; index < numSamples; index++ {
 		results[index].content = tokenizerImpl.Decode(sampled[index])
+		results[index].reasoning = tokenizerImpl.Decode(reasoningTokens[index])
 		results[index].finish = "stop"
 		if !finished[index] {
 			results[index].finish = "length"
 		}
 		results[index].promptLen = len(prompt)
-		results[index].completion = len(sampled[index])
+		results[index].completion = len(sampled[index]) + len(reasoningTokens[index])
 		for _, toolCall := range results[index].toolCalls {
 			results[index].completion += len(tokenizerImpl.Encode(toolCall.Function.Arguments))
 		}
@@ -128,13 +179,22 @@ func (server *Server) generate(prompt []int, temperature float32, topK, maxToken
 }
 
 // renderMessages converts OpenAI messages into a prompt token sequence primed
-// for the assistant to complete.
-func (server *Server) renderMessages(messages []ChatMessage, tools []ToolDef, reasoningEffort *int) []int {
+// for the assistant to complete. thinking is the optional request field: when
+// non-nil it selects the thinking-mode instruction, and when enabled the
+// assistant turn is primed with <|think_start|>.
+func (server *Server) renderMessages(messages []ChatMessage, tools []ToolDef, reasoningEffort *int, thinking *bool) []int {
 	tokenizerImpl := server.Tokenizer
 	ids := []int{tokenizerImpl.BOSTokenID()}
 
+	var instructions []string
 	if reasoningEffort != nil {
-		messages = append([]ChatMessage{{Role: "system", Content: tokenizer.ReasoningEffortInstruction(*reasoningEffort)}}, messages...)
+		instructions = append(instructions, tokenizer.ReasoningEffortInstruction(*reasoningEffort))
+	}
+	if thinking != nil {
+		instructions = append(instructions, tokenizer.ThinkingInstruction(*thinking))
+	}
+	if len(instructions) > 0 {
+		messages = append([]ChatMessage{{Role: "system", Content: strings.Join(instructions, "\n")}}, messages...)
 	}
 	messages = mergeSystemMessage(messages)
 	if len(tools) > 0 {
@@ -155,6 +215,8 @@ func (server *Server) renderMessages(messages []ChatMessage, tools []ToolDef, re
 	toolEnd := tokenizerImpl.EncodeSpecial("<|tool_end|>")
 	toolOutputStart := tokenizerImpl.EncodeSpecial("<|tool_output_start|>")
 	toolOutputEnd := tokenizerImpl.EncodeSpecial("<|tool_output_end|>")
+	thinkStart := tokenizerImpl.EncodeSpecial("<|think_start|>")
+	thinkEnd := tokenizerImpl.EncodeSpecial("<|think_end|>")
 
 	for _, message := range messages {
 		switch message.Role {
@@ -164,6 +226,11 @@ func (server *Server) renderMessages(messages []ChatMessage, tools []ToolDef, re
 			ids = append(ids, userEnd)
 		case "assistant":
 			ids = append(ids, assistantStart)
+			if message.ReasoningContent != "" {
+				ids = append(ids, thinkStart)
+				ids = append(ids, tokenizerImpl.Encode(message.ReasoningContent)...)
+				ids = append(ids, thinkEnd)
+			}
 			if message.Content != "" {
 				ids = append(ids, tokenizerImpl.Encode(message.Content)...)
 			}
@@ -180,6 +247,9 @@ func (server *Server) renderMessages(messages []ChatMessage, tools []ToolDef, re
 		}
 	}
 	ids = append(ids, assistantStart)
+	if thinking != nil && *thinking {
+		ids = append(ids, thinkStart)
+	}
 	return ids
 }
 

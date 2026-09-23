@@ -200,8 +200,21 @@ Endpoints:
 
 - `POST /v1/chat/completions` — non-streaming and streaming (`"stream": true`).
   Accepts `model`, `messages` (roles `system`/`user`/`assistant`/`tool`),
-  `temperature`, `top_k`, `max_tokens`, `n`, `seed`, `tools`.
+  `temperature`, `top_k`, `max_tokens`, `n`, `seed`, `tools`, `reasoning_effort`,
+  `thinking` (enable/disable the reasoning trace) and `thinking_budget` (cap the
+  reasoning tokens). Responses carry the trace in the `reasoning_content` field
+  of the assistant message (and of each streamed delta); `thinking_budget`
+  forces a closing `<|think_end|>` once the budget is exhausted.
 - `GET /v1/models` — lists the served model.
+
+Example with thinking enabled and a 64-token budget:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gonano","thinking":true,"thinking_budget":64,
+       "messages":[{"role":"user","content":"why is the sky blue?"}]}'
+```
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \

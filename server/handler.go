@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/cookiengineer/gonano/inference"
 )
 
 // Handler returns the HTTP handler for the OpenAI-compatible API.
@@ -47,7 +49,7 @@ func (server *Server) handleChatCompletions(writer http.ResponseWriter, request 
 		return
 	}
 
-	prompt := server.renderMessages(chatRequest.Messages, chatRequest.Tools, chatRequest.ReasoningEffort)
+	prompt := server.renderMessages(chatRequest.Messages, chatRequest.Tools, chatRequest.ReasoningEffort, chatRequest.Thinking)
 	genOptions := resolveOptions(chatRequest, server.Model.Config.SequenceLen)
 
 	if chatRequest.Stream {
@@ -59,14 +61,15 @@ func (server *Server) handleChatCompletions(writer http.ResponseWriter, request 
 
 // complete writes a single non-streaming chat completion response.
 func (server *Server) complete(writer http.ResponseWriter, prompt []int, chatRequest ChatCompletionRequest, genOptions generationOptions) {
-	rows := server.generate(prompt, genOptions.temperature, genOptions.topK, genOptions.maxTokens, genOptions.numSamples, genOptions.seed)
+	thinking := resolveThinking(chatRequest)
+	rows := server.generate(prompt, genOptions.temperature, genOptions.topK, genOptions.maxTokens, genOptions.numSamples, genOptions.seed, thinking)
 
 	choices := make([]Choice, len(rows))
 	var totalPrompt, totalCompletion int
 	for index, row := range rows {
 		choices[index] = Choice{
 			Index:        index,
-			Message:      ResponseMessage{Role: "assistant", Content: row.content, ToolCalls: row.toolCalls},
+			Message:      ResponseMessage{Role: "assistant", Content: row.content, ReasoningContent: row.reasoning, ToolCalls: row.toolCalls},
 			FinishReason: row.finish,
 		}
 		totalPrompt += row.promptLen
@@ -97,6 +100,8 @@ func (server *Server) streamCompletion(writer http.ResponseWriter, prompt []int,
 	toolStart := tokenizerImpl.EncodeSpecial("<|tool_start|>")
 	toolEnd := tokenizerImpl.EncodeSpecial("<|tool_end|>")
 	assistantEnd := tokenizerImpl.EncodeSpecial("<|assistant_end|>")
+	thinkStart := tokenizerImpl.EncodeSpecial("<|think_start|>")
+	thinkEnd := tokenizerImpl.EncodeSpecial("<|think_end|>")
 	bosToken := tokenizerImpl.BOSTokenID()
 
 	id := chatID()
@@ -111,20 +116,37 @@ func (server *Server) streamCompletion(writer http.ResponseWriter, prompt []int,
 		Choices: []StreamChoice{{Index: 0, Delta: StreamDelta{Role: "assistant"}}},
 	})
 
+	thinking := resolveThinking(chatRequest)
 	inToolCall := make([]bool, genOptions.numSamples)
+	inThinking := make([]bool, genOptions.numSamples)
+	primedThinking := len(prompt) > 0 && prompt[len(prompt)-1] == thinkStart
+	for index := range inThinking {
+		inThinking[index] = primedThinking
+	}
 	finished := make([]bool, genOptions.numSamples)
 	completion := 0
 
-	generate := server.Engine.Generate(prompt, genOptions.numSamples, genOptions.maxTokens, genOptions.temperature, genOptions.topK, genOptions.seed)
+	generate := server.Engine.GenerateWith(prompt, genOptions.numSamples, genOptions.maxTokens, genOptions.temperature, genOptions.topK, genOptions.seed,
+		inference.GenerateOptions{Thinking: thinking.enabled || thinking.budget > 0, ThinkingBudget: thinking.budget})
 	generate(func(column, mask []int) bool {
 		for index := 0; index < genOptions.numSamples; index++ {
 			if finished[index] {
 				continue
 			}
+			token := column[index]
+			// Thinking delimiters are meaningful even when forced by the
+			// budget, so handle them before the forced-token filter.
+			switch token {
+			case thinkStart:
+				inThinking[index] = true
+				continue
+			case thinkEnd:
+				inThinking[index] = false
+				continue
+			}
 			if mask[index] == 0 {
 				continue // forced tool output; hidden from the stream
 			}
-			token := column[index]
 			switch token {
 			case toolStart:
 				inToolCall[index] = true
@@ -138,12 +160,16 @@ func (server *Server) streamCompletion(writer http.ResponseWriter, prompt []int,
 				}
 				text := tokenizerImpl.Decode([]int{token})
 				completion++
+				delta := StreamDelta{Content: text}
+				if inThinking[index] {
+					delta = StreamDelta{ReasoningContent: text}
+				}
 				writeSSE(writer, flusher, ChatCompletionChunk{
 					ID:      id,
 					Object:  "chat.completion.chunk",
 					Created: created,
 					Model:   server.ModelName,
-					Choices: []StreamChoice{{Index: index, Delta: StreamDelta{Content: text}}},
+					Choices: []StreamChoice{{Index: index, Delta: delta}},
 				})
 			}
 		}

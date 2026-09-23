@@ -15,7 +15,7 @@ import (
 func testServer(test *testing.T) *Server {
 	test.Helper()
 	config := model.Config{
-		SequenceLen: 32, VocabSize: 265, NumLayer: 1, NumHead: 2, NumKVHead: 2,
+		SequenceLen: 32, VocabSize: 256 + len(tokenizer.SpecialTokens), NumLayer: 1, NumHead: 2, NumKVHead: 2,
 		EmbedDim: 32, WindowPattern: "L",
 	}
 	transformer := model.NewTransformer(config)
@@ -33,7 +33,7 @@ func TestRenderMessagesSystemMerge(test *testing.T) {
 	ids := srv.renderMessages([]ChatMessage{
 		{Role: "system", Content: "You are helpful"},
 		{Role: "user", Content: "hi"},
-	}, nil, nil)
+	}, nil, nil, nil)
 	got := srv.Tokenizer.Decode(ids)
 	want := "<|bos|><|user_start|>You are helpful\n\nhi<|user_end|><|assistant_start|>"
 	if got != want {
@@ -46,7 +46,7 @@ func TestRenderMessagesSystemMerge(test *testing.T) {
 func TestRenderMessagesReasoningEffort(test *testing.T) {
 	srv := testServer(test)
 	effort := 75
-	ids := srv.renderMessages([]ChatMessage{{Role: "user", Content: "hi"}}, nil, &effort)
+	ids := srv.renderMessages([]ChatMessage{{Role: "user", Content: "hi"}}, nil, &effort, nil)
 	got := srv.Tokenizer.Decode(ids)
 	want := "<|bos|><|user_start|>Reasoning Effort: 75 (range 1--100; higher values request more thorough reasoning)\n\nhi<|user_end|><|assistant_start|>"
 	if got != want {
@@ -60,13 +60,114 @@ func TestRenderMessagesToolRoundTrip(test *testing.T) {
 		{Role: "user", Content: "what is 2+2"},
 		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_0", Type: "function", Function: FunctionCall{Name: "calculator", Arguments: "2+2"}}}},
 		{Role: "tool", Content: "4"},
-	}, nil, nil)
+	}, nil, nil, nil)
 	got := srv.Tokenizer.Decode(ids)
 	want := "<|bos|><|user_start|>what is 2+2<|user_end|>" +
 		"<|assistant_start|><|tool_start|>2+2<|tool_end|><|assistant_end|>" +
 		"<|tool_output_start|>4<|tool_output_end|><|assistant_start|>"
 	if got != want {
 		test.Fatalf("decoded = %q, want %q", got, want)
+	}
+}
+
+// testThinkingServer builds a zero-weight model whose argmax decoding always
+// emits token 0, so reasoning/content splitting is deterministic.
+func testThinkingServer(test *testing.T) *Server {
+	test.Helper()
+	config := model.Config{
+		SequenceLen: 256, VocabSize: 256 + len(tokenizer.SpecialTokens), NumLayer: 1, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L",
+	}
+	transformer := model.NewTransformer(config)
+	ranks := make(map[string]int, 256)
+	for index := 0; index < 256; index++ {
+		ranks[string([]byte{byte(index)})] = index
+	}
+	tokenizerImpl := tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
+	return NewServer(transformer, tokenizerImpl, nil, "gonano")
+}
+
+func TestRenderMessagesThinking(test *testing.T) {
+	srv := testThinkingServer(test)
+	enabled := true
+	got := srv.Tokenizer.Decode(srv.renderMessages([]ChatMessage{{Role: "user", Content: "hi"}}, nil, nil, &enabled))
+	if !strings.HasSuffix(got, "<|assistant_start|><|think_start|>") {
+		test.Fatalf("enabled decoded = %q, want think_start suffix", got)
+	}
+	if !strings.Contains(got, "Thinking mode: enabled") {
+		test.Fatalf("missing enabled instruction: %q", got)
+	}
+	disabled := false
+	gotDisabled := srv.Tokenizer.Decode(srv.renderMessages([]ChatMessage{{Role: "user", Content: "hi"}}, nil, nil, &disabled))
+	if strings.Contains(gotDisabled, "<|think_start|>") {
+		test.Fatalf("disabled render primed think_start: %q", gotDisabled)
+	}
+	if !strings.Contains(gotDisabled, "Thinking mode: disabled") {
+		test.Fatalf("missing disabled instruction: %q", gotDisabled)
+	}
+}
+
+func TestRenderMessagesReasoningContentReplay(test *testing.T) {
+	srv := testThinkingServer(test)
+	got := srv.Tokenizer.Decode(srv.renderMessages([]ChatMessage{
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", ReasoningContent: "thinking", Content: "answer"},
+	}, nil, nil, nil))
+	want := "<|assistant_start|><|think_start|>thinking<|think_end|>answer<|assistant_end|>"
+	if !strings.Contains(got, want) {
+		test.Fatalf("decoded = %q, want it to contain %q", got, want)
+	}
+}
+
+func TestGenerateSplitsReasoningAndContent(test *testing.T) {
+	srv := testThinkingServer(test)
+	prompt := []int{
+		srv.Tokenizer.BOSTokenID(),
+		srv.Tokenizer.EncodeSpecial("<|assistant_start|>"),
+		srv.Tokenizer.EncodeSpecial("<|think_start|>"),
+	}
+	rows := srv.generate(prompt, 0, 0, 6, 1, 1, thinkingOptions{enabled: true, budget: 2})
+	if len(rows) != 1 {
+		test.Fatalf("rows = %d, want 1", len(rows))
+	}
+	if len(rows[0].reasoning) != 2 {
+		test.Fatalf("reasoning length = %d, want 2", len(rows[0].reasoning))
+	}
+	if len(rows[0].content) != 3 {
+		test.Fatalf("content length = %d, want 3", len(rows[0].content))
+	}
+	if rows[0].completion != len(rows[0].reasoning)+len(rows[0].content) {
+		test.Fatalf("completion = %d, want %d", rows[0].completion, len(rows[0].reasoning)+len(rows[0].content))
+	}
+}
+
+func TestChatCompletionsReasoningContent(test *testing.T) {
+	srv := testThinkingServer(test)
+	body := `{"model":"gonano","messages":[{"role":"user","content":"hello"}],"max_tokens":6,"temperature":0.0,"thinking":true,"thinking_budget":2}`
+	recorder := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	if recorder.Code != http.StatusOK {
+		test.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var resp ChatCompletionResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		test.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Choices) != 1 || len(resp.Choices[0].Message.ReasoningContent) != 2 {
+		test.Fatalf("reasoning = %q", resp.Choices[0].Message.ReasoningContent)
+	}
+}
+
+func TestChatCompletionsStreamingReasoningContent(test *testing.T) {
+	srv := testThinkingServer(test)
+	body := `{"model":"gonano","messages":[{"role":"user","content":"hello"}],"max_tokens":6,"temperature":0.0,"stream":true,"thinking":true,"thinking_budget":2}`
+	recorder := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	if recorder.Code != http.StatusOK {
+		test.Fatalf("status = %d", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), `"reasoning_content"`) {
+		test.Fatalf("no reasoning_content in stream: %s", recorder.Body.String())
 	}
 }
 

@@ -27,6 +27,8 @@ func main() {
 	numSamples := flag.Int("num-samples", 4, "rollouts per example")
 	effortLevels := flag.String("efforts", "50,75,100", "comma-separated reasoning-effort levels b in [1,100] (empty disables effort conditioning)")
 	samplesPerEffort := flag.Int("samples-per-effort", 4, "rollouts per effort level per example")
+	thinking := flag.Bool("thinking", false, "roll out an explicit <|think_start|> reasoning trace")
+	thinkingBudget := flag.Int("thinking-budget", 0, "cap reasoning tokens per rollout (0 lets the model decide)")
 	penaltyK0 := flag.Float64("penalty-k0", 0.1, "basic length-penalty coefficient at the minimum effort")
 	penaltyLambda := flag.Float64("penalty-lambda", 1.0, "rate of exponential penalty decay")
 	penaltyCap := flag.Float64("penalty-cap", 0.5, "maximum length deduction per trajectory")
@@ -87,9 +89,18 @@ func main() {
 		var promptLengths []int
 		var rewards []float32
 		var groupSizes []int
+		generateOptions := inference.GenerateOptions{Thinking: *thinking, ThinkingBudget: *thinkingBudget}
+		reasoningLength := func(rollout []int, promptLength int) int {
+			if *thinking {
+				return tokenizer.ReasoningTokenCount(rollout)
+			}
+			return len(rollout) - promptLength
+		}
 		if len(efforts) == 0 {
-			prompt := tokenizer.RenderForCompletion(conversation)
-			rollouts, _ := engine.GenerateBatch(prompt, *numSamples, 32, 1.0, 50, uint64(step))
+			convCopy := *conversation
+			convCopy.Extra = map[string]any{"thinking": *thinking}
+			prompt := tokenizer.RenderForCompletion(&convCopy)
+			rollouts, _ := engine.GenerateBatchWith(prompt, *numSamples, 32, 1.0, 50, uint64(step), generateOptions)
 			for _, rollout := range rollouts {
 				completion := tokenizer.Decode(rollout[len(prompt):])
 				rewards = append(rewards, gsm8k.Reward(conversation, completion))
@@ -100,13 +111,13 @@ func main() {
 		} else {
 			for groupIndex, effort := range efforts {
 				convCopy := *conversation
-				convCopy.Extra = map[string]any{"effort": effort}
+				convCopy.Extra = map[string]any{"effort": effort, "thinking": *thinking}
 				prompt := tokenizer.RenderForCompletion(&convCopy)
-				rollouts, _ := engine.GenerateBatch(prompt, *samplesPerEffort, 32, 1.0, 50, uint64(step*1000+groupIndex))
+				rollouts, _ := engine.GenerateBatchWith(prompt, *samplesPerEffort, 32, 1.0, 50, uint64(step*1000+groupIndex), generateOptions)
 				for _, rollout := range rollouts {
 					completion := tokenizer.Decode(rollout[len(prompt):])
 					reward := gsm8k.Reward(conversation, completion)
-					reward += trainer.ExponentialTokenPenalty(effort, len(rollout)-len(prompt), penaltyConfig)
+					reward += trainer.ExponentialTokenPenalty(effort, reasoningLength(rollout, len(prompt)), penaltyConfig)
 					rewards = append(rewards, reward)
 					results = append(results, rollout)
 					promptLengths = append(promptLengths, len(prompt))

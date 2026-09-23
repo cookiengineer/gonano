@@ -13,7 +13,7 @@ import (
 
 func newSFTModel() (*model.Transformer, *tokenizer.Tokenizer) {
 	config := model.Config{
-		SequenceLen: 32, VocabSize: 265, NumLayer: 1, NumHead: 2, NumKVHead: 2,
+		SequenceLen: 32, VocabSize: 256 + len(tokenizer.SpecialTokens), NumLayer: 1, NumHead: 2, NumKVHead: 2,
 		EmbedDim: 32, WindowPattern: "L",
 	}
 	transformer := model.NewTransformer(config)

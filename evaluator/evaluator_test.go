@@ -11,7 +11,7 @@ import (
 
 func evalModel() *model.Transformer {
 	config := model.Config{
-		SequenceLen: 128, VocabSize: 265, NumLayer: 2, NumHead: 2, NumKVHead: 2,
+		SequenceLen: 128, VocabSize: 256 + len(tokenizer.SpecialTokens), NumLayer: 2, NumHead: 2, NumKVHead: 2,
 		EmbedDim: 32, WindowPattern: "L",
 	}
 	transformer := model.NewTransformer(config)

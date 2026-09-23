@@ -5607,6 +5607,8 @@
     "\u003c|tool_start|\u003e",
     "\u003c|tool_end|\u003e",
     "\u003c|tool_output_start|\u003e",
-    "\u003c|tool_output_end|\u003e"
+    "\u003c|tool_output_end|\u003e",
+    "\u003c|think_start|\u003e",
+    "\u003c|think_end|\u003e"
   ]
 }

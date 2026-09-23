@@ -11,6 +11,9 @@ type ChatMessage struct {
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	Name       string     `json:"name,omitempty"`
+	// ReasoningContent replays a prior assistant reasoning trace for
+	// multi-turn conversations; it maps to the <|think_start|> block.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 // ToolCall is a structured tool invocation.
@@ -56,6 +59,12 @@ type ChatCompletionRequest struct {
 	// by prepending the effort instruction to the system prompt
 	// (DeepSeek-V4.1 §5.1.4).
 	ReasoningEffort *int `json:"reasoning_effort,omitempty"`
+	// Thinking enables or disables the explicit <|think_start|>...<|think_end|>
+	// reasoning trace. When nil, the model's default behavior is used.
+	Thinking *bool `json:"thinking,omitempty"`
+	// ThinkingBudget caps the number of reasoning tokens. Zero or negative
+	// lets the model decide when to stop.
+	ThinkingBudget *int `json:"thinking_budget,omitempty"`
 }
 
 // Usage reports token counts.
@@ -67,9 +76,10 @@ type Usage struct {
 
 // ResponseMessage is the assistant message in a chat completion response.
 type ResponseMessage struct {
-	Role      string     `json:"role"`
-	Content   string     `json:"content"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role             string     `json:"role"`
+	Content          string     `json:"content"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // Choice is one completion choice.
@@ -91,9 +101,10 @@ type ChatCompletionResponse struct {
 
 // StreamDelta is one delta in a streamed chunk.
 type StreamDelta struct {
-	Role      string     `json:"role,omitempty"`
-	Content   string     `json:"content,omitempty"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role             string     `json:"role,omitempty"`
+	Content          string     `json:"content,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // StreamChoice is one choice in a streamed chunk.

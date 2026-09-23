@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cookiengineer/gonano/data"
 	"github.com/cookiengineer/gonano/inference"
@@ -27,6 +28,8 @@ func main() {
 	speculative := flag.Bool("speculative", false, "use exact greedy speculative decoding (requires --temperature 0 and --drafter)")
 	draftLength := flag.Int("draft-length", 5, "tokens drafted per speculative round")
 	effort := flag.Int("effort", 0, "reasoning-effort level 1..100 (0 disables the instruction)")
+	thinking := flag.Bool("thinking", false, "enable the explicit <|think_start|> reasoning trace")
+	thinkingBudget := flag.Int("thinking-budget", 0, "cap reasoning tokens (0 lets the model decide)")
 	baseDir := flag.String("base-dir", "", "tokenizer directory (default ~/.cache/gonano)")
 	flag.Parse()
 
@@ -73,22 +76,56 @@ func main() {
 	assistantStart := tokenizer.EncodeSpecial("<|assistant_start|>")
 	assistantEnd := tokenizer.EncodeSpecial("<|assistant_end|>")
 
+	var instructions []string
+	if *effort > 0 {
+		instructions = append(instructions, tokenizer.ReasoningEffortInstruction(*effort))
+	}
+	if *thinking {
+		instructions = append(instructions, tokenizer.ThinkingInstruction(true))
+	}
+
+	thinkStart := tokenizer.EncodeSpecial("<|think_start|>")
+	thinkEnd := tokenizer.EncodeSpecial("<|think_end|>")
+
 	respond := func(text string) {
 		conversation := []int{bos, userStart}
-		if *effort > 0 {
-			conversation = append(conversation, tokenizer.Encode(tokenizer.ReasoningEffortInstruction(*effort))...)
+		if len(instructions) > 0 {
+			conversation = append(conversation, tokenizer.Encode(strings.Join(instructions, "\n"))...)
 			conversation = append(conversation, tokenizer.Encode("\n\n")...)
 		}
 		conversation = append(conversation, tokenizer.Encode(text)...)
 		conversation = append(conversation, userEnd, assistantStart)
+		if *thinking {
+			conversation = append(conversation, thinkStart)
+		}
 		fmt.Print("Assistant: ")
-		generator := engine.Generate(conversation, 1, *maxTokens, float32(*temperature), *topK, 42)
+		inThinking := *thinking
+		generator := engine.GenerateWith(conversation, 1, *maxTokens, float32(*temperature), *topK, 42,
+			inference.GenerateOptions{Thinking: *thinking, ThinkingBudget: *thinkingBudget})
 		generator(func(column, mask []int) bool {
 			token := column[0]
 			if token == assistantEnd {
 				return false
 			}
-			fmt.Print(tokenizer.Decode([]int{token}))
+			switch token {
+			case thinkStart:
+				inThinking = true
+				fmt.Fprint(os.Stderr, "[thinking] ")
+				return true
+			case thinkEnd:
+				inThinking = false
+				fmt.Fprintln(os.Stderr)
+				return true
+			}
+			if mask[0] == 0 {
+				return true
+			}
+			text := tokenizer.Decode([]int{token})
+			if inThinking {
+				fmt.Fprint(os.Stderr, text)
+			} else {
+				fmt.Print(text)
+			}
 			return true
 		})
 		fmt.Println()

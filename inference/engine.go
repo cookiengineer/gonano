@@ -7,13 +7,30 @@ import (
 )
 
 // RowState tracks the state of one generation row, including forced tokens
-// (tool use) and completion status.
+// (tool use and the thinking budget) and completion status.
 type RowState struct {
 	currentTokens  []int
 	forcedTokens   []int
 	inToolCall     bool
 	toolCallTokens []int
+	// inThinking is true while the model is inside a
+	// <|think_start|>...<|think_end|> reasoning trace; thinkingTokens counts
+	// the reasoning tokens emitted so far so the budget can be enforced.
+	inThinking     bool
+	thinkingTokens int
 	completed      bool
+}
+
+// GenerateOptions controls optional decoding behaviors.
+type GenerateOptions struct {
+	// Thinking enables explicit reasoning-trace handling: the engine tracks
+	// the <|think_start|>...<|think_end|> block and enforces ThinkingBudget.
+	// When false, the engine performs no thinking-specific handling and passes
+	// tokens through unchanged (the caller selects the mode via the prompt).
+	Thinking bool
+	// ThinkingBudget caps the number of reasoning tokens. Zero or negative
+	// lets the model decide when to stop.
+	ThinkingBudget int
 }
 
 // Engine performs batched autoregressive generation with a KV cache and a
@@ -85,6 +102,14 @@ func NewEngine(transformer *model.Transformer, tokenizerImpl *tokenizer.Tokenize
 // prompt tokens. It yields (tokenColumn, tokenMask) for each decode step,
 // where tokenMask is 1 for sampled tokens and 0 for forced (tool) tokens.
 func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperature float32, topK int, seed uint64) func(yield func([]int, []int) bool) {
+	return engine.GenerateWith(tokens, numSamples, maxTokens, temperature, topK, seed, GenerateOptions{})
+}
+
+// GenerateWith is Generate with optional thinking-mode handling. When
+// options.Thinking is set, the engine tracks the <|think_start|>...<|think_end|>
+// reasoning trace and, once options.ThinkingBudget reasoning tokens have been
+// emitted, forces the closing <|think_end|> token so it cannot run unbounded.
+func (engine *Engine) GenerateWith(tokens []int, numSamples, maxTokens int, temperature float32, topK int, seed uint64, options GenerateOptions) func(yield func([]int, []int) bool) {
 	return func(yield func([]int, []int) bool) {
 		if engine.speculativeEligible(numSamples, temperature) {
 			engine.speculativeGenerate(tokens, maxTokens, yield)
@@ -197,7 +222,18 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 		toolOutputStart := specialToken("<|tool_output_start|>")
 		toolOutputEnd := specialToken("<|tool_output_end|>")
 		assistantEnd := specialToken("<|assistant_end|>")
+		thinkStart := specialToken("<|think_start|>")
+		thinkEnd := specialToken("<|think_end|>")
 		bosToken := engine.Tokenizer.BOSTokenID()
+
+		// A prompt that already primes <|think_start|> (for example
+		// RenderForCompletion with thinking enabled) starts inside the trace,
+		// so the budget counts from the first generated token.
+		if (options.Thinking || options.ThinkingBudget > 0) && len(tokens) > 0 && tokens[len(tokens)-1] == thinkStart {
+			for _, state := range states {
+				state.inThinking = true
+			}
+		}
 
 		randomGenerator := tensors.NewRNG(seed)
 
@@ -259,6 +295,22 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 				case state.inToolCall:
 					state.toolCallTokens = append(state.toolCallTokens, nextToken)
 				}
+				// Thinking-trace tracking (budget enforcement only when the
+				// caller opted in; otherwise it is a no-op passthrough).
+				if options.Thinking || options.ThinkingBudget > 0 {
+					switch {
+					case nextToken == thinkStart:
+						state.inThinking = true
+						state.thinkingTokens = 0
+					case nextToken == thinkEnd && state.inThinking:
+						state.inThinking = false
+					case state.inThinking:
+						state.thinkingTokens++
+						if options.ThinkingBudget > 0 && state.thinkingTokens >= options.ThinkingBudget {
+							state.forcedTokens = append(state.forcedTokens, thinkEnd)
+						}
+					}
+				}
 			}
 
 			if !yield(tokenColumn, tokenMask) {
@@ -277,6 +329,11 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 // GenerateBatch runs non-streaming generation and returns the final token
 // sequences (excluding terminal tokens) and their masks.
 func (engine *Engine) GenerateBatch(tokens []int, numSamples, maxTokens int, temperature float32, topK int, seed uint64) ([][]int, [][]int) {
+	return engine.GenerateBatchWith(tokens, numSamples, maxTokens, temperature, topK, seed, GenerateOptions{})
+}
+
+// GenerateBatchWith is GenerateBatch with optional thinking-mode handling.
+func (engine *Engine) GenerateBatchWith(tokens []int, numSamples, maxTokens int, temperature float32, topK int, seed uint64, options GenerateOptions) ([][]int, [][]int) {
 	assistantEnd := engine.Tokenizer.EncodeSpecial("<|assistant_end|>")
 	bosToken := engine.Tokenizer.BOSTokenID()
 
@@ -288,7 +345,7 @@ func (engine *Engine) GenerateBatch(tokens []int, numSamples, maxTokens int, tem
 	}
 	completed := make([]bool, numSamples)
 
-	generate := engine.Generate(tokens, numSamples, maxTokens, temperature, topK, seed)
+	generate := engine.GenerateWith(tokens, numSamples, maxTokens, temperature, topK, seed, options)
 	generate(func(column, mask []int) bool {
 		for index := range column {
 			if completed[index] {

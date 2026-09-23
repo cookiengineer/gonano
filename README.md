@@ -252,8 +252,12 @@ curl http://localhost:8080/v1/chat/completions \
 ```
 
 Tool calls are executed server-side in Go via the `server` package (the built-in
-calculator, plus any tools you register in `cmd/server`). See
-`guides/03-deployment.md` for the Go library usage.
+calculator, plus any tools you register in `cmd/server`). The API also supports
+an explicit reasoning trace: send `"thinking": true` (and an optional
+`"thinking_budget"`) and the answer's reasoning is returned in the
+`reasoning_content` field, non-streaming or as streamed deltas. On the command
+line, `chat_cli --thinking [--thinking-budget N]` streams the trace to stderr.
+See `guides/03-deployment.md` for the Go library usage.
 
 See `guides/00-quickstart.md` for a copy-pasteable ArchLinux setup, and `guides/` for the
 step-by-step training, export, deployment, and debugging guides. The long-context
@@ -264,7 +268,8 @@ distillation, DSpark semi-autoregressive drafting with a prefix-survival schedul
 The same guide covers the training-side features: the sequence-level MoE
 balance loss (paper §4.2.2), sample-level attention masking for packed
 documents (`--sample-masking`, on by default), joint semi-autoregressive DSpark
-training, reasoning-effort conditioning (`--effort` / `reasoning_effort`), and
+training, reasoning-effort conditioning (`--effort` / `reasoning_effort`),
+explicit thinking traces (`--thinking` / `thinking` / `reasoning_content`), and
 checkpoint merging for RL re-initialization (`cmd/model_merge`).
 
 ## Packages

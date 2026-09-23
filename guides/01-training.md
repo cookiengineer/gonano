@@ -167,9 +167,11 @@ The tokenizer is saved to `$GONANO_BASE_DIR/tokenizer/tokenizer.json` (default
 > **Vocabulary note.** nanochat special tokens are fixed:
 > `<|bos|>`, `<|user_start|>`, `<|user_end|>`, `<|assistant_start|>`,
 > `<|assistant_end|>`, `<|tool_start|>`, `<|tool_end|>`,
-> `<|tool_output_start|>`, `<|tool_output_end|>`.
+> `<|tool_output_start|>`, `<|tool_output_end|>`, `<|think_start|>`,
+> `<|think_end|>`.
 > They are appended *after* the mergeable vocabulary, so
-> `vocab_size = num_merges + 256 + 9`.
+> `vocab_size = num_merges + 256 + 11`. The thinking tokens are appended last,
+> so adding them does not renumber the existing tokens.
 
 ---
 

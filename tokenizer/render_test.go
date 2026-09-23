@@ -78,6 +78,100 @@ func TestReasoningEffortInstruction(t *testing.T) {
 	}
 }
 
+// TestRenderConversationThinking checks an assistant reasoning trace is
+// rendered as a supervised <|think_start|>...<|think_end|> block.
+func TestRenderConversationThinking(tests *testing.T) {
+	ranks := TrainBPE([]string{"hello world", "reasoning here"}, 30)
+	tok := NewTokenizer(ranks, SpecialTokens)
+	conv := &Conversation{Messages: []Message{
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", Thinking: "reasoning here", Content: "hello world"},
+	}}
+	ids, mask := tok.RenderConversation(conv, 2048)
+	thinkStart := tok.EncodeSpecial("<|think_start|>")
+	thinkEnd := tok.EncodeSpecial("<|think_end|>")
+	startIdx, endIdx := -1, -1
+	for index, tokenID := range ids {
+		if tokenID == thinkStart {
+			startIdx = index
+		}
+		if tokenID == thinkEnd {
+			endIdx = index
+		}
+	}
+	if startIdx < 0 || endIdx < 0 || endIdx <= startIdx {
+		tests.Fatalf("think markers not found: %d..%d", startIdx, endIdx)
+	}
+	for index := startIdx; index <= endIdx; index++ {
+		if mask[index] != 1 {
+			tests.Fatalf("thinking token at %d mask = %d, want 1", index, mask[index])
+		}
+	}
+	// The reasoning text must be between the markers.
+	between := tok.Decode(ids[startIdx+1 : endIdx])
+	if between != "reasoning here" {
+		tests.Fatalf("reasoning = %q", between)
+	}
+}
+
+// TestThinkingInstruction checks the instruction enables and disables the mode.
+func TestThinkingInstruction(t *testing.T) {
+	if got := ThinkingInstruction(true); got == "" || got == ThinkingInstruction(false) {
+		t.Fatalf("enabled instruction = %q", got)
+	}
+	if got := ThinkingInstruction(false); got == "" {
+		t.Fatalf("disabled instruction is empty")
+	}
+	ranks := TrainBPE([]string{"hello"}, 5)
+	tok := NewTokenizer(ranks, SpecialTokens)
+	base := &Conversation{Messages: []Message{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "world"},
+	}}
+	withThinking := &Conversation{Messages: base.Messages, Extra: map[string]any{"thinking": true}}
+	baseIDs, _ := tok.RenderConversation(base, 2048)
+	thinkIDs, _ := tok.RenderConversation(withThinking, 2048)
+	if len(thinkIDs) <= len(baseIDs) {
+		t.Fatalf("thinking render should be longer: %d vs %d", len(thinkIDs), len(baseIDs))
+	}
+}
+
+// TestReasoningTokenCount checks only the tokens inside the think block count.
+func TestReasoningTokenCount(t *testing.T) {
+	ranks := TrainBPE([]string{"a b c d"}, 20)
+	tok := NewTokenizer(ranks, SpecialTokens)
+	ids, _ := tok.RenderConversation(&Conversation{Messages: []Message{
+		{Role: "user", Content: "a"},
+		{Role: "assistant", Thinking: "b c", Content: "d"},
+	}}, 2048)
+	got := tok.ReasoningTokenCount(ids)
+	want := len(tok.Encode("b c"))
+	if got != want {
+		t.Fatalf("reasoning token count = %d, want %d", got, want)
+	}
+	if tok.ReasoningTokenCount(tok.Encode("no think block")) != 0 {
+		t.Fatal("expected zero for no think block")
+	}
+}
+
+// TestRenderForCompletionThinking checks the think-start token is primed.
+func TestRenderForCompletionThinking(t *testing.T) {
+	ranks := TrainBPE([]string{"question answer"}, 10)
+	tok := NewTokenizer(ranks, SpecialTokens)
+	conv := &Conversation{
+		Messages: []Message{
+			{Role: "user", Content: "question"},
+			{Role: "assistant", Content: "answer"},
+		},
+		Extra: map[string]any{"thinking": true},
+	}
+	ids := tok.RenderForCompletion(conv)
+	last := ids[len(ids)-1]
+	if last != tok.EncodeSpecial("<|think_start|>") {
+		t.Fatalf("last id = %d, want think_start", last)
+	}
+}
+
 func TestRenderConversationAssistantMasked(tests *testing.T) {
 	ranks := TrainBPE([]string{"hello"}, 5)
 	tok := NewTokenizer(ranks, SpecialTokens)

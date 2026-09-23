@@ -40,6 +40,7 @@ preset (or runtime API) that turns each concept on.
 | Sequence-level balance loss | 4.2.2 | `MoE.sequenceBalance`, `Config.MoEBalanceWeight` | MoE (default 1e-4) |
 | Sample-level attention masking | 4.2.2 | `data` `NextSegments`, `model.TrainForwardSegments`, `kernels` `SegmentIDs` | `--sample-masking` (pretrain/SFT) |
 | Reasoning-effort control | 5.1.4 | `tokenizer.ReasoningEffortInstruction`, `trainer.ExponentialTokenPenalty`, `cmd/chat_rl` | `--efforts` |
+| Explicit thinking trace | — | `tokenizer/special.go`, `tokenizer/render.go`, `inference/engine.go`, `server/` | `--thinking`, `thinking_budget` |
 | Model merging for RL re-init | 5.1.2 | `model/checkpoint` `MergeParameters`/`MergeFiles`, `cmd/model_merge` | `--models`/`--weights` |
 | Head-wise Muon for Q/K | 2.5 | `model/optimizer.go` `headWiseViews` | `flash` |
 | Sinkhorn-balanced embeddings / lm_head | 2.5 | `optimizer/sinkhorn.go`, `model/optimizer.go` `sinkhornGroup` | all presets except `dense` |
@@ -588,6 +589,35 @@ length penalty to the task reward, and mean-centers advantages within each
 Units: `tokenizer.TestReasoningEffortInstruction`,
 `trainer.TestEffortPenaltyCoefficientDecreasesWithEffort`,
 `TestExponentialTokenPenalty`, `server.TestRenderMessagesReasoningEffort`.
+
+**Explicit thinking trace.** On top of the scalar effort interface, gonano
+supports a first-class reasoning trace delimited by two special tokens,
+`<|think_start|>` and `<|think_end|>`, appended last in `tokenizer.SpecialTokens`
+so existing token ids are unchanged:
+
+```
+<|assistant_start|> <|think_start|> …reasoning… <|think_end|> …answer… <|assistant_end|>
+```
+
+`tokenizer.Message.Thinking` and the `"thinking"` `MessagePart` render the block
+(supervised by the SFT loss mask), and a conversation's `Extra["thinking"]`
+injects the mode instruction. At inference `inference.GenerateWith` tracks the
+trace and, when given a `ThinkingBudget`, forces the closing `<|think_end|>`
+once the budget is exhausted; the trace is hidden from the answer and returned
+separately. The server exposes it as the request fields `thinking` /
+`thinking_budget` and the response field `reasoning_content` (including
+streamed deltas). `cmd/chat_cli --thinking [--thinking-budget N]` prints the
+reasoning to standard error while streaming the answer to standard output.
+`cmd/chat_rl --thinking` rolls out a trace and uses
+`tokenizer.ReasoningTokenCount` (the ℓ of the effort penalty) instead of the
+full completion length.
+
+Units: `tokenizer.TestRenderConversationThinking`,
+`TestThinkingInstruction`, `TestReasoningTokenCount`,
+`TestRenderForCompletionThinking`, `inference.TestEngineThinkingBudgetForcesThinkEnd`,
+`TestEngineThinkingDisabledPassthrough`, `server.TestRenderMessagesThinking`,
+`TestGenerateSplitsReasoningAndContent`, `TestChatCompletionsReasoningContent`,
+`TestChatCompletionsStreamingReasoningContent`.
 
 **Model merging for RL re-initialization.** Successive RL runs can be
 reinitialized by merging checkpoints from different runs (paper §5.1.2).
