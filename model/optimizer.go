@@ -18,9 +18,17 @@ func (model *Transformer) SetupOptimizer(unembeddingLR, embeddingLR, matrixLR, w
 	var matrixParameters []*tensors.Tensor
 	for _, block := range model.blocks {
 		matrixParameters = append(matrixParameters,
-			block.attention.queryProjection.Weight, block.attention.keyProjection.Weight, block.attention.valueProjection.Weight, block.attention.outputProjection.Weight,
+			block.attention.queryProjection.Weight, block.attention.keyProjection.Weight)
+		matrixParameters = append(matrixParameters,
+			block.attention.valueProjection.Weight, block.attention.outputProjection.Weight,
 			block.mlp.inputProjection.Weight, block.mlp.outputProjection.Weight,
 		)
+		if block.attention.queryDown != nil {
+			matrixParameters = append(matrixParameters, block.attention.queryDown.Weight)
+		}
+		if block.attention.kvDown != nil {
+			matrixParameters = append(matrixParameters, block.attention.kvDown.Weight)
+		}
 		if block.attention.valueEmbeddingGate != nil {
 			matrixParameters = append(matrixParameters, block.attention.valueEmbeddingGate.Weight)
 		}

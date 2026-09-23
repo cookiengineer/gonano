@@ -31,6 +31,8 @@ func main() {
 	reusePattern := flag.String("reuse-pattern", "", "cross-layer reuse pattern of F/R/U per layer (empty = all full)")
 	swaWindow := flag.Int("swa-window", 0, "local sliding-window branch width on compressed layers (0 disables)")
 	ced := flag.Bool("ced", false, "causal encoder-decoder split (decoder global KV from the encoder hidden state; requires --compression-ratio and --swa-window)")
+	queryCompressionDim := flag.Int("query-compression-dim", 0, "low-rank query bottleneck width (0 = full-rank)")
+	kvLatentDim := flag.Int("kv-latent-dim", 0, "shared low-rank KV latent width (0 = full-rank)")
 	vocabSize := flag.Int("vocab-size", 32768, "vocabulary size")
 	numIterations := flag.Int("num-iterations", 50, "optimization steps")
 	deviceBatchSize := flag.Int("device-batch-size", 1, "per-step batch size")
@@ -70,6 +72,8 @@ func main() {
 	configuration.ReusePattern = *reusePattern
 	configuration.SWAWindow = *swaWindow
 	configuration.CED = *ced
+	configuration.QueryCompressionDim = *queryCompressionDim
+	configuration.KVLatentDim = *kvLatentDim
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 

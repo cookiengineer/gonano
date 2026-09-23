@@ -83,6 +83,12 @@ type CausalSelfAttention struct {
 	valueProjection  *layers.Linear
 	outputProjection *layers.Linear
 
+	// queryDown, when non-nil, is the low-rank down-projection feeding the
+	// query up-projection (MLA-style query compression). kvDown, when non-nil,
+	// is the shared latent from which key and value are up-projected.
+	queryDown *layers.Linear
+	kvDown    *layers.Linear
+
 	valueEmbeddingGate *layers.Linear // nil on layers without value embeddings
 
 	// compressor is non-nil when HCA-style dense KV compression is enabled;
@@ -123,6 +129,26 @@ func (attention *CausalSelfAttention) usesCompression() bool {
 	return attention.compressionRatio > 1
 }
 
+// projectQuery computes the query from the attention input, applying the
+// low-rank query bottleneck when configured (MLA-style query compression).
+func (attention *CausalSelfAttention) projectQuery(input *tensors.Tensor) *tensors.Tensor {
+	if attention.queryDown != nil {
+		return attention.queryProjection.Forward(attention.queryDown.Forward(input))
+	}
+	return attention.queryProjection.Forward(input)
+}
+
+// projectKeyValue computes the key and value from the attention input. When a
+// low-rank KV latent is configured both are up-projected from one shared
+// latent, otherwise they are projected directly from the input.
+func (attention *CausalSelfAttention) projectKeyValue(input *tensors.Tensor) (key, value *tensors.Tensor) {
+	if attention.kvDown != nil {
+		latent := attention.kvDown.Forward(input)
+		return attention.keyProjection.Forward(latent), attention.valueProjection.Forward(latent)
+	}
+	return attention.keyProjection.Forward(input), attention.valueProjection.Forward(input)
+}
+
 // cedGlobalKeyValue projects a decoder layer's encoder-hidden state into its
 // global keys and values using the layer's own projections, applying RoPE and
 // the QK norm to the key. It returns head-major key/value tensors plus the
@@ -131,8 +157,9 @@ func (attention *CausalSelfAttention) usesCompression() bool {
 // hidden state.
 func (attention *CausalSelfAttention) cedGlobalKeyValue(encoderHidden, cosine, sine *tensors.Tensor, positionOffset int) (keyHeadMajor, valueHeadMajor, keyRotary *tensors.Tensor) {
 	batchSize, sequenceLength := encoderHidden.Shape[0], encoderHidden.Shape[1]
-	key := attention.keyProjection.Forward(encoderHidden).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
-	value := attention.valueProjection.Forward(encoderHidden).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+	key, value := attention.projectKeyValue(encoderHidden)
+	key = key.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+	value = value.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
 	key = ApplyRotary(key, cosine, sine, positionOffset)
 	keyRotary = key
 	key = tensors.Scale(normalizeLastDim(key), qkScale)
@@ -149,13 +176,24 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool, layer 
 		keyValueHeadCount:  configuration.NumKVHead,
 		embeddingDimension: configuration.EmbedDim,
 		headDimension:      headDimension,
-		queryProjection:    layers.NewLinear(configuration.EmbedDim, configuration.NumHead*headDimension),
-		keyProjection:      layers.NewLinear(configuration.EmbedDim, configuration.NumKVHead*headDimension),
-		valueProjection:    layers.NewLinear(configuration.EmbedDim, configuration.NumKVHead*headDimension),
 		outputProjection:   layers.NewLinear(configuration.EmbedDim, configuration.EmbedDim),
 		reuseMode:          configuration.ReuseModeAt(layer),
 		producer:           configuration.ReuseProducer(layer),
 		ced:                configuration.IsDecoderLayer(layer),
+	}
+	if rank := configuration.QueryRank(); rank > 0 {
+		attention.queryDown = layers.NewLinear(configuration.EmbedDim, rank)
+		attention.queryProjection = layers.NewLinear(rank, configuration.NumHead*headDimension)
+	} else {
+		attention.queryProjection = layers.NewLinear(configuration.EmbedDim, configuration.NumHead*headDimension)
+	}
+	if rank := configuration.KVRank(); rank > 0 {
+		attention.kvDown = layers.NewLinear(configuration.EmbedDim, rank)
+		attention.keyProjection = layers.NewLinear(rank, configuration.NumKVHead*headDimension)
+		attention.valueProjection = layers.NewLinear(rank, configuration.NumKVHead*headDimension)
+	} else {
+		attention.keyProjection = layers.NewLinear(configuration.EmbedDim, configuration.NumKVHead*headDimension)
+		attention.valueProjection = layers.NewLinear(configuration.EmbedDim, configuration.NumKVHead*headDimension)
 	}
 	if hasValueEmbedding {
 		attention.valueEmbeddingGate = layers.NewLinear(veGateChannels, configuration.NumKVHead)
@@ -188,9 +226,10 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool, layer 
 // result has shape [batch, sequence, embedding].
 func (attention *CausalSelfAttention) Forward(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, cache *KVBuffer, layer int, share *compressionShare) *tensors.Tensor {
 	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
-	query := attention.queryProjection.Forward(input).Reshape(batchSize, sequenceLength, attention.queryHeadCount, attention.headDimension)
-	key := attention.keyProjection.Forward(input).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
-	value := attention.valueProjection.Forward(input).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+	query := attention.projectQuery(input).Reshape(batchSize, sequenceLength, attention.queryHeadCount, attention.headDimension)
+	keyProjected, valueProjected := attention.projectKeyValue(input)
+	key := keyProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+	value := valueProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
 
 	if valueEmbedding != nil {
 		valueEmbeddingHeads := valueEmbedding.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)

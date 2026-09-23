@@ -30,6 +30,25 @@ func tinyTrainModel() *Transformer {
 	return model
 }
 
+// perturbModel breaks the zero-initialized projection weights so a gradient
+// check sees non-trivial signal through every layer.
+func perturbModel(model *Transformer) *Transformer {
+	perturb := tensors.NewRNG(123)
+	for _, parameter := range model.Parameters() {
+		for elementIndex := range parameter.Data {
+			parameter.Data[elementIndex] += perturb.NormFloat32() * 0.1
+		}
+	}
+	return model
+}
+
+func lowRankConfig(queryDim, kvDim int) Config {
+	return Config{
+		SequenceLen: 16, VocabSize: 16, NumLayer: 2, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L", QueryCompressionDim: queryDim, KVLatentDim: kvDim,
+	}
+}
+
 func tinyCompressedModel() *Transformer {
 	config := Config{
 		SequenceLen: 16, VocabSize: 16, NumLayer: 2, NumHead: 2, NumKVHead: 2,
@@ -103,6 +122,72 @@ func TestBackpropDirectionalGradientCheckCompressed(t *testing.T) {
 // layer's compressor.
 func TestBackpropDirectionalGradientCheckReuse(t *testing.T) {
 	runDirectionalGradientCheck(t, tinyReuseModel())
+}
+
+// TestBackpropDirectionalGradientCheckLowRank exercises the low-rank query
+// bottleneck, the shared low-rank KV latent, and both together. The rank is
+// small relative to the 32-wide model so the bottleneck is active.
+func TestBackpropDirectionalGradientCheckLowRank(t *testing.T) {
+	cases := []struct {
+		name     string
+		queryDim int
+		kvDim    int
+	}{
+		{"query", 8, 0},
+		{"kv", 0, 8},
+		{"query+kv", 8, 8},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			model := perturbModel(NewTransformer(lowRankConfig(testCase.queryDim, testCase.kvDim)))
+			runDirectionalGradientCheck(t, model)
+		})
+	}
+}
+
+// TestBackpropPerElementLowRankCED checks the low-rank projections when they
+// feed the CED decoder's encoder-projected global KV. A per-element check is
+// used instead of the aggregate directional check because the CED directional
+// projection suffers heavy fp32 cancellation.
+func TestBackpropPerElementLowRankCED(t *testing.T) {
+	config := lowRankConfig(8, 8)
+	config.NumLayer = 4
+	config.CompressionRatio = 2
+	config.SWAWindow = 3
+	config.CED = true
+	model := perturbModel(NewTransformer(config))
+	indexes, targets := tinyData()
+	analyticGrads(model, indexes, targets)
+
+	checks := []struct {
+		name         string
+		parameter    *tensors.Tensor
+		elementIndex int
+	}{
+		{"enc.q_down", model.blocks[0].attention.queryDown.Weight, 3},
+		{"enc.kv_down", model.blocks[0].attention.kvDown.Weight, 3},
+		{"dec.q_down", model.blocks[2].attention.queryDown.Weight, 3},
+		{"dec.kv_down", model.blocks[2].attention.kvDown.Weight, 3},
+		{"dec.c_q", model.blocks[2].attention.queryProjection.Weight, 3},
+		{"dec.c_k", model.blocks[2].attention.keyProjection.Weight, 3},
+		{"dec.c_v", model.blocks[2].attention.valueProjection.Weight, 3},
+	}
+	epsilon := float32(1e-3)
+	for _, check := range checks {
+		analytic := check.parameter.Grad[check.elementIndex]
+		original := check.parameter.Data[check.elementIndex]
+		check.parameter.Data[check.elementIndex] = original + epsilon
+		lossPlus := meanLoss(model, indexes, targets)
+		check.parameter.Data[check.elementIndex] = original - epsilon
+		lossMinus := meanLoss(model, indexes, targets)
+		check.parameter.Data[check.elementIndex] = original
+		numeric := (lossPlus - lossMinus) / (2 * epsilon)
+
+		scale := math.Max(math.Max(math.Abs(float64(analytic)), math.Abs(float64(numeric))), 1e-3)
+		if math.Abs(float64(numeric-analytic)) > 0.5*scale {
+			t.Errorf("%s[%d]: analytic=%v numeric=%v", check.name, check.elementIndex, analytic, numeric)
+		}
+	}
 }
 
 func runDirectionalGradientCheck(t *testing.T, model *Transformer) {
@@ -197,5 +282,29 @@ func TestBackpropPerElementGradientCheck(t *testing.T) {
 		if math.Abs(float64(numeric-analytic)) > 0.5*scale {
 			t.Errorf("%s[%d]: analytic=%v numeric=%v", check.name, check.elementIndex, analytic, numeric)
 		}
+	}
+}
+
+// TestLowRankReducesParameters verifies that the low-rank factorizations lower
+// both the total parameter count and the per-token matmul weight bytes.
+func TestLowRankReducesParameters(t *testing.T) {
+	plain := NewTransformer(testConfig())
+	base := testConfig()
+	base.QueryCompressionDim = 8
+	base.KVLatentDim = 8
+	lowRank := NewTransformer(base)
+
+	if lowRank.TotalParams() >= plain.TotalParams() {
+		t.Fatalf("low-rank params %d must be fewer than plain %d", lowRank.TotalParams(), plain.TotalParams())
+	}
+	if lowRank.MatmulParams() >= plain.MatmulParams() {
+		t.Fatalf("low-rank matmul params %d must be fewer than plain %d", lowRank.MatmulParams(), plain.MatmulParams())
+	}
+	if lowRank.WeightReadBytes() >= plain.WeightReadBytes() {
+		t.Fatalf("low-rank decode weight bytes %d must be fewer than plain %d", lowRank.WeightReadBytes(), plain.WeightReadBytes())
+	}
+	// Full-rank behavior is unchanged: the config reports no bottleneck.
+	if plain.Config.QueryRank() != 0 || plain.Config.KVRank() != 0 {
+		t.Fatal("plain config should report no low-rank bottleneck")
 	}
 }

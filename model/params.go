@@ -19,6 +19,12 @@ func (model *Transformer) NamedParameters() map[string]*tensors.Tensor {
 		parameters[fmt.Sprintf("transformer.h.%d.attn.c_q.weight", layerIndex)] = block.attention.queryProjection.Weight
 		parameters[fmt.Sprintf("transformer.h.%d.attn.c_k.weight", layerIndex)] = block.attention.keyProjection.Weight
 		parameters[fmt.Sprintf("transformer.h.%d.attn.c_v.weight", layerIndex)] = block.attention.valueProjection.Weight
+		if block.attention.queryDown != nil {
+			parameters[fmt.Sprintf("transformer.h.%d.attn.q_down.weight", layerIndex)] = block.attention.queryDown.Weight
+		}
+		if block.attention.kvDown != nil {
+			parameters[fmt.Sprintf("transformer.h.%d.attn.kv_down.weight", layerIndex)] = block.attention.kvDown.Weight
+		}
 		parameters[fmt.Sprintf("transformer.h.%d.attn.c_proj.weight", layerIndex)] = block.attention.outputProjection.Weight
 		if block.attention.valueEmbeddingGate != nil {
 			parameters[fmt.Sprintf("transformer.h.%d.attn.ve_gate.weight", layerIndex)] = block.attention.valueEmbeddingGate.Weight

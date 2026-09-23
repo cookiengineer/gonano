@@ -39,6 +39,8 @@ func main() {
 		reusePattern      string
 		swaWindow         int
 		ced               bool
+		queryCompression  int
+		kvLatentDim       int
 		numIterations     int
 		batchSize         int
 		modelTag          string
@@ -61,6 +63,8 @@ func main() {
 	flag.StringVar(&reusePattern, "reuse-pattern", "", "cross-layer reuse pattern of F/R/U per layer (empty = all full)")
 	flag.IntVar(&swaWindow, "swa-window", 0, "local sliding-window branch width on compressed layers (0 disables)")
 	flag.BoolVar(&ced, "ced", false, "causal encoder-decoder split (decoder global KV from the encoder hidden state; requires --compression-ratio and --swa-window)")
+	flag.IntVar(&queryCompression, "query-compression-dim", 0, "low-rank query bottleneck width (0 = full-rank)")
+	flag.IntVar(&kvLatentDim, "kv-latent-dim", 0, "shared low-rank KV latent width (0 = full-rank)")
 	flag.IntVar(&numIterations, "num-iterations", 50, "optimization steps")
 	flag.IntVar(&batchSize, "device-batch-size", 1, "sequences per step")
 	flag.StringVar(&modelTag, "model-tag", "", "checkpoint directory name (default d<depth>)")
@@ -93,6 +97,8 @@ func main() {
 	configuration.ReusePattern = reusePattern
 	configuration.SWAWindow = swaWindow
 	configuration.CED = ced
+	configuration.QueryCompressionDim = queryCompression
+	configuration.KVLatentDim = kvLatentDim
 	model := model.NewTransformer(configuration)
 	model.InitWeights(tensors.NewRNG(42))
 	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5)

@@ -47,9 +47,10 @@ type attentionContext struct {
 // per-query log-sum-exp instead of the full probability matrix.
 func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, share *compressionShare) (*tensors.Tensor, *attentionContext) {
 	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
-	query := attention.queryProjection.Forward(input).Reshape(batchSize, sequenceLength, attention.queryHeadCount, attention.headDimension)
-	key := attention.keyProjection.Forward(input).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
-	value := attention.valueProjection.Forward(input).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+	query := attention.projectQuery(input).Reshape(batchSize, sequenceLength, attention.queryHeadCount, attention.headDimension)
+	keyProjected, valueProjected := attention.projectKeyValue(input)
+	key := keyProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+	value := valueProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
 
 	context := &attentionContext{window: window[0]}
 	if valueEmbedding != nil {
@@ -242,7 +243,7 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 				gradientEncoder := gradientInputFromCompressor
 				gradientEncoder = tensors.Add(gradientEncoder, attention.cedKeyProjectionBackward(share.encoderHidden, context, gradientKey, cosine, sine, positionOffset))
 				gradientValueSequence := toBatchSequenceLayout(gradientValue).Reshape(batchSize, sequenceLength, attention.keyValueHeadCount*headDimension)
-				gradientEncoder = tensors.Add(gradientEncoder, attention.valueProjection.Backward(share.encoderHidden, gradientValueSequence))
+				gradientEncoder = tensors.Add(gradientEncoder, attention.cedValueProjectionBackward(share.encoderHidden, gradientValueSequence))
 				// Every decoder layer shares one accumulator, so add in place.
 				share.gradientEncoder = accumulateTensor(share.gradientEncoder, gradientEncoder)
 				gradientKey = tensors.New(batchSize, attention.keyValueHeadCount, sequenceLength, headDimension)
@@ -318,9 +319,17 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 	gradientQueryProjected := ApplyRotary(gradientQueryPreNorm, cosine, negatedSine, positionOffset)
 	gradientKeyProjected := ApplyRotary(gradientKeyPreNorm, cosine, negatedSine, positionOffset)
 
-	// Accumulate into the input via the projection layers.
-	gradientInput := attention.queryProjection.Backward(input, gradientQueryProjected.Reshape(batchSize, sequenceLength, attention.queryHeadCount*attention.headDimension))
-	gradientInput = tensors.Add(gradientInput, attention.keyProjection.Backward(input, gradientKeyProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount*attention.headDimension)))
+	// Accumulate into the input via the projection layers (low-rank aware).
+	gradientQueryOutput := gradientQueryProjected.Reshape(batchSize, sequenceLength, attention.queryHeadCount*attention.headDimension)
+	gradientKeyOutput := gradientKeyProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount*attention.headDimension)
+	var gradientInput *tensors.Tensor
+	if attention.queryDown != nil {
+		queryLatent := attention.queryDown.Forward(input)
+		gradientQueryLatent := attention.queryProjection.Backward(queryLatent, gradientQueryOutput)
+		gradientInput = attention.queryDown.Backward(input, gradientQueryLatent)
+	} else {
+		gradientInput = attention.queryProjection.Backward(input, gradientQueryOutput)
+	}
 
 	// Value embedding gate backward.
 	gradientValueSequence := toBatchSequenceLayout(gradientValue)
@@ -358,8 +367,19 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 		gradientInput = tensors.Add(gradientInput, scattered)
 	}
 
-	// value projection gradient (gradientValue flows through valueProjection).
-	gradientInput = tensors.Add(gradientInput, attention.valueProjection.Backward(input, gradientValueSequence.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount*attention.headDimension)))
+	// Key/value projection gradients. With a shared low-rank latent both
+	// gradients flow through one down-projection so its parameter gradient is
+	// accumulated once from the combined latent gradient.
+	gradientValueOutput := gradientValueSequence.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount*attention.headDimension)
+	if attention.kvDown != nil {
+		kvLatent := attention.kvDown.Forward(input)
+		gradientKvLatent := attention.keyProjection.Backward(kvLatent, gradientKeyOutput)
+		gradientKvLatent = tensors.Add(gradientKvLatent, attention.valueProjection.Backward(kvLatent, gradientValueOutput))
+		gradientInput = tensors.Add(gradientInput, attention.kvDown.Backward(input, gradientKvLatent))
+	} else {
+		gradientInput = tensors.Add(gradientInput, attention.keyProjection.Backward(input, gradientKeyOutput))
+		gradientInput = tensors.Add(gradientInput, attention.valueProjection.Backward(input, gradientValueOutput))
+	}
 
 	// The compressor logit projection reads the attention input directly.
 	if gradientInputFromCompressor != nil {
@@ -401,7 +421,24 @@ func (attention *CausalSelfAttention) cedKeyProjectionBackward(encoderHidden *te
 	negatedSine := negateSineTable(sine)
 	gradientProjected := ApplyRotary(gradientPreNorm, cosine, negatedSine, positionOffset)
 	flat := gradientProjected.Reshape(encoderHidden.Shape[0], encoderHidden.Shape[1], attention.keyValueHeadCount*attention.headDimension)
+	if attention.kvDown != nil {
+		latent := attention.kvDown.Forward(encoderHidden)
+		gradientLatent := attention.keyProjection.Backward(latent, flat)
+		return attention.kvDown.Backward(encoderHidden, gradientLatent)
+	}
 	return attention.keyProjection.Backward(encoderHidden, flat)
+}
+
+// cedValueProjectionBackward backpropagates the gradient of a CED decoder's
+// global value projection, returning the gradient with respect to the encoder
+// hidden state. It is the value-side counterpart of cedKeyProjectionBackward.
+func (attention *CausalSelfAttention) cedValueProjectionBackward(encoderHidden, gradientValueSequence *tensors.Tensor) *tensors.Tensor {
+	if attention.kvDown != nil {
+		latent := attention.kvDown.Forward(encoderHidden)
+		gradientLatent := attention.valueProjection.Backward(latent, gradientValueSequence)
+		return attention.kvDown.Backward(encoderHidden, gradientLatent)
+	}
+	return attention.valueProjection.Backward(encoderHidden, gradientValueSequence)
 }
 
 // mlpContext holds activations for the MLP backward.

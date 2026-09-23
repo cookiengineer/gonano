@@ -714,6 +714,41 @@ func TestForwardDecodePath(t *testing.T) {
 	}
 }
 
+// TestForwardLowRankDecodePath runs prefill and decode with the low-rank query
+// and KV latent projections combined with dense compression and sliding-window
+// attention.
+func TestForwardLowRankDecodePath(t *testing.T) {
+	config := testConfig()
+	config.CompressionRatio = 2
+	config.SWAWindow = 3
+	config.QueryCompressionDim = 8
+	config.KVLatentDim = 8
+	transformer := NewTransformer(config)
+	transformer.InitWeights(tensors.NewRNG(42))
+
+	maximum := 16
+	cache := NewKVBuffer(1, maximum, config.NumLayer, config.NumKVHead, config.HeadDim())
+	cache.EnableCompression(config.Compression(), config.EmbedDim, config.NumKVHead*config.HeadDim(), maximum/config.Compression()+1)
+
+	prefill := tensors.NewInt32sWithData([]int{1, 6}, []int32{1, 2, 3, 4, 5, 6})
+	logits := transformer.Forward(prefill, cache)
+	assertFiniteTensor(t, logits)
+	for step := 0; step < 4; step++ {
+		next := tensors.NewInt32sWithData([]int{1, 1}, []int32{int32(step + 1)})
+		logits = transformer.Forward(next, cache)
+		assertFiniteTensor(t, logits)
+	}
+}
+
+func assertFiniteTensor(t *testing.T, values *tensors.Tensor) {
+	t.Helper()
+	for _, value := range values.Data {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			t.Fatalf("non-finite value %v", value)
+		}
+	}
+}
+
 func TestInitWeightsStats(t *testing.T) {
 	config := Config{
 		SequenceLen: 16, VocabSize: 64, NumLayer: 2, NumHead: 2, NumKVHead: 2,

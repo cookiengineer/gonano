@@ -63,10 +63,38 @@ type Config struct {
 	// The decoder's local sliding-window branch still reads its own hidden
 	// state. CED requires compression and a local window.
 	CED bool `json:"ced,omitempty"`
+	// QueryCompressionDim enables a low-rank (MLA-style) query projection: the
+	// query is down-projected to this width and then up-projected per head
+	// (DeepSeek-V4.1 §2.3/§4.2.1). Zero keeps the full-rank projection.
+	QueryCompressionDim int `json:"query_compression_dim,omitempty"`
+	// KVLatentDim enables a shared low-rank KV latent: key and value are
+	// projected from a single latent of this width instead of from the hidden
+	// state (MLA). Zero keeps the full-rank projections. The KV cache still
+	// stores the full per-head keys/values, so this reduces projection compute
+	// and parameters, not cache bytes.
+	KVLatentDim int `json:"kv_latent_dim,omitempty"`
 }
 
 // CEDEnabled reports whether the causal encoder-decoder split is active.
 func (config Config) CEDEnabled() bool { return config.CED }
+
+// QueryRank returns the low-rank query bottleneck width, or 0 when the query
+// projection is full-rank.
+func (config Config) QueryRank() int {
+	if config.QueryCompressionDim <= 0 {
+		return 0
+	}
+	return config.QueryCompressionDim
+}
+
+// KVRank returns the shared low-rank KV latent width, or 0 when the key/value
+// projections are full-rank.
+func (config Config) KVRank() int {
+	if config.KVLatentDim <= 0 {
+		return 0
+	}
+	return config.KVLatentDim
+}
 
 // CEDSplit returns the first decoder layer index, or 0 when CED is disabled.
 // The encoder is layers [0, CEDSplit) and the decoder is [CEDSplit, NumLayer).
@@ -253,6 +281,12 @@ func (config Config) Validate() {
 	}
 	if config.SWAWindow < 0 {
 		panic(fmt.Sprintf("model: SWAWindow %d must be >= 0", config.SWAWindow))
+	}
+	if config.QueryCompressionDim < 0 {
+		panic(fmt.Sprintf("model: QueryCompressionDim %d must be >= 0", config.QueryCompressionDim))
+	}
+	if config.KVLatentDim < 0 {
+		panic(fmt.Sprintf("model: KVLatentDim %d must be >= 0", config.KVLatentDim))
 	}
 	if config.ReusePattern != "" {
 		if config.Compression() <= 1 {

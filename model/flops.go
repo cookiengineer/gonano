@@ -13,6 +13,12 @@ func (model *Transformer) MatmulParams() int {
 		total += block.attention.keyProjection.Weight.Numel()
 		total += block.attention.valueProjection.Weight.Numel()
 		total += block.attention.outputProjection.Weight.Numel()
+		if block.attention.queryDown != nil {
+			total += block.attention.queryDown.Weight.Numel()
+		}
+		if block.attention.kvDown != nil {
+			total += block.attention.kvDown.Weight.Numel()
+		}
 		if block.attention.valueEmbeddingGate != nil {
 			total += block.attention.valueEmbeddingGate.Weight.Numel()
 		}
@@ -133,6 +139,12 @@ func (model *Transformer) estimatePrefillFlopsCED(numTokens int) float64 {
 			block.attention.outputProjection.Weight.Numel() +
 			block.mlp.inputProjection.Weight.Numel() +
 			block.mlp.outputProjection.Weight.Numel()
+		if block.attention.queryDown != nil {
+			blockParams += block.attention.queryDown.Weight.Numel()
+		}
+		if block.attention.kvDown != nil {
+			blockParams += block.attention.kvDown.Weight.Numel()
+		}
 		if block.attention.valueEmbeddingGate != nil {
 			blockParams += block.attention.valueEmbeddingGate.Weight.Numel()
 		}
@@ -220,7 +232,17 @@ type ScalingParams struct {
 func ScalingParamsForConfig(config Config) int64 {
 	config.Validate()
 	embeddingDimension := config.EmbedDim
-	perBlock := 12 * embeddingDimension * embeddingDimension // cq, ck, cv, cproj (4*E*E) + c_fc, c_proj (8*E*E)
+	// cq, ck, cv, cproj (4*E*E) + c_fc, c_proj (8*E*E), with the query and KV
+	// blocks replaced by their low-rank factorizations when configured.
+	queryParams := embeddingDimension * embeddingDimension
+	if rank := config.QueryRank(); rank > 0 {
+		queryParams = 2 * embeddingDimension * rank
+	}
+	kvParams := 2 * embeddingDimension * embeddingDimension
+	if rank := config.KVRank(); rank > 0 {
+		kvParams = 3 * embeddingDimension * rank
+	}
+	perBlock := queryParams + kvParams + embeddingDimension*embeddingDimension + 8*embeddingDimension*embeddingDimension
 	numValueEmbeddings := (config.NumLayer + 1) / 2
 	transformerMatrices := int64(config.NumLayer)*int64(perBlock) + int64(numValueEmbeddings)*int64(12*config.NumKVHead)
 	lmHead := int64(config.EmbedDim) * int64(config.PaddedVocab())
@@ -232,7 +254,15 @@ func ScalingParamsForConfig(config Config) int64 {
 func EstimateFlopsPerTokenForConfig(config Config) float64 {
 	config.Validate()
 	embeddingDimension := config.EmbedDim
-	perBlock := 12 * embeddingDimension * embeddingDimension
+	queryParams := embeddingDimension * embeddingDimension
+	if rank := config.QueryRank(); rank > 0 {
+		queryParams = 2 * embeddingDimension * rank
+	}
+	kvParams := 2 * embeddingDimension * embeddingDimension
+	if rank := config.KVRank(); rank > 0 {
+		kvParams = 3 * embeddingDimension * rank
+	}
+	perBlock := queryParams + kvParams + embeddingDimension*embeddingDimension + 8*embeddingDimension*embeddingDimension
 	numValueEmbeddings := (config.NumLayer + 1) / 2
 	matmulParameters := int64(config.NumLayer)*int64(perBlock) +
 		int64(numValueEmbeddings)*int64(12*config.NumKVHead) +
@@ -266,6 +296,12 @@ func (model *Transformer) NumScalingParams() ScalingParams {
 		scalingParams.TransformerMatrices += block.attention.keyProjection.Weight.Numel()
 		scalingParams.TransformerMatrices += block.attention.valueProjection.Weight.Numel()
 		scalingParams.TransformerMatrices += block.attention.outputProjection.Weight.Numel()
+		if block.attention.queryDown != nil {
+			scalingParams.TransformerMatrices += block.attention.queryDown.Weight.Numel()
+		}
+		if block.attention.kvDown != nil {
+			scalingParams.TransformerMatrices += block.attention.kvDown.Weight.Numel()
+		}
 		if block.attention.valueEmbeddingGate != nil {
 			scalingParams.TransformerMatrices += block.attention.valueEmbeddingGate.Weight.Numel()
 		}
