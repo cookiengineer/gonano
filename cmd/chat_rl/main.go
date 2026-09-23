@@ -35,6 +35,7 @@ func main() {
 	penaltyNorm := flag.Float64("penalty-norm", 256, "reference reasoning length for the penalty")
 	outPath := flag.String("out", "", "output checkpoint path")
 	baseDir := flag.String("base-dir", "", "tokenizer directory")
+	domain := flag.String("domain", "", "domain name for the model bank; recorded in the checkpoint (default output goes to domains/<name>/chatrl_checkpoints/)")
 	flag.Parse()
 
 	logger := logging.Default(slog.LevelInfo)
@@ -179,8 +180,18 @@ func main() {
 		logger.Info("rl", "step", step, "loss", fmt.Sprintf("%.4f", loss), "rollouts", len(results))
 	}
 
+	if *outPath == "" && *domain != "" {
+		*outPath = filepath.Join(*baseDir, "domains", *domain, "chatrl_checkpoints", "model_final.gn")
+	}
 	if *outPath != "" {
+		if err := os.MkdirAll(filepath.Dir(*outPath), 0o755); err != nil {
+			logger.Error("create output directory", "err", err)
+			os.Exit(1)
+		}
 		outMeta := checkpoint.Meta{Step: *numSteps, ModelConfig: model.Config}
+		if *domain != "" {
+			outMeta.UserConfig = map[string]any{"domain": *domain}
+		}
 		if err := checkpoint.Save(*outPath, outMeta, model.NamedParameters()); err != nil {
 			logger.Error("save", "err", err)
 			os.Exit(1)

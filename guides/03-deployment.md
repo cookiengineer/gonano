@@ -1,4 +1,4 @@
-# gonano — Deployment & Usage Guide
+# gonano -- Deployment & Usage Guide
 
 This guide shows how to load trained weights and run inference, both from the
 command line and from your own Go code (gonano is a library).
@@ -37,12 +37,12 @@ go run ./cmd/chat_cli \
 ```
 
 `chat_cli` wraps a conversation in the special tokens
-(`<|bos|> <|user_start|> … <|user_end|> <|assistant_start|>`) and streams the
+(`<|bos|> <|user_start|> ... <|user_end|> <|assistant_start|>`) and streams the
 assistant response until `<|assistant_end|>`.
 
 Flags: `--temperature`, `--top-k`, `--max-tokens`, `--model`.
 
-`--model` accepts either a `.gn` checkpoint or an exported `.gguf` file —
+`--model` accepts either a `.gn` checkpoint or an exported `.gguf` file --
 `checkpoint.LoadAny` auto-detects the format, so this works too:
 
 ```bash
@@ -63,7 +63,7 @@ go run ./cmd/infer_bench \
 Reports TTFT (time-to-first-token), TPOT (per-token latency), overall `tok/s`,
 and pure decode `decode tok/s` per batch size. Decode is
 memory-bandwidth-bound, so larger batches give more tok/s until
-compute saturates — this is where goroutine-per-op parallelism (`internal/parallel`)
+compute saturates -- this is where goroutine-per-op parallelism (`internal/parallel`)
 pays off.
 
 ---
@@ -105,21 +105,21 @@ func main() {
 
 | Step | API |
 |---|---|
-| Load weights (`.gn` or `.gguf`) | `checkpoint.LoadAny(path)` → `(Meta, map[string]*tensors.Tensor)` |
-| Rebuild model | `checkpoint.LoadModel(meta, params)` → `*model.Transformer` |
+| Load weights (`.gn` or `.gguf`) | `checkpoint.LoadAny(path)` -> `(Meta, map[string]*tensors.Tensor)` |
+| Rebuild model | `checkpoint.LoadModel(meta, params)` -> `*model.Transformer` |
 | Load tokenizer | `tokenizer.LoadTokenizer(path)` |
 | Build engine | `inference.NewEngine(model, tokenizer)` |
 | Generate | `engine.GenerateBatch(prompt, numSamples, maxTokens, temperature, topK, seed)` |
 
 ### How inference works under the hood (`inference/engine.go`)
 
-1. **Prefill** — the prompt is run once through `model.Forward` with a batch-1
+1. **Prefill** -- the prompt is run once through `model.Forward` with a batch-1
    KV cache, populating keys/values.
-2. **Replicate** — `model.PrefillFrom` clones the KV cache across `numSamples`
+2. **Replicate** -- `model.PrefillFrom` clones the KV cache across `numSamples`
    rows (and expands the smear state).
-3. **Decode loop** — for each step, `inference.SampleNextToken` samples the next
+3. **Decode loop** -- for each step, `inference.SampleNextToken` samples the next
    token per row (temperature/top-k/argmax), the tool-call state machine
-   (`inference.Engine.Tools`) handles `<|tool_start|>…<|tool_end|>`, and the
+   (`inference.Engine.Tools`) handles `<|tool_start|>...<|tool_end|>`, and the
    next single-token column is forwarded against the cache.
 
 The KV cache lives in `model.KVBuffer` (`model/kvcache.go`).
@@ -166,11 +166,11 @@ type Config struct {
 Key facts for anyone writing a custom loader:
 
 - **No biases** anywhere; RMSNorm has no learned parameters.
-- **Untied embeddings**: `transformer.wte.weight` ≠ `lm_head.weight`.
+- **Untied embeddings**: `transformer.wte.weight` != `lm_head.weight`.
 - **Rotary embeddings** (base 100000) with **QK-norm** and a 1.2 scale.
-- **ReLU²** MLP activation; **4×** expansion.
+- **ReLU^2** MLP activation; **4x** expansion.
 - **Value embeddings** on alternating layers (the last layer always has one).
-- **Softcap** (15·tanh(x/15)) applied to logits before sampling/loss.
+- **Softcap** (15*tanh(x/15)) applied to logits before sampling/loss.
 - The vocabulary is padded to a multiple of 64 internally; logits are cropped
   back to `vocab_size` before sampling.
 
@@ -183,7 +183,7 @@ For a long-running service:
 - Reuse a single `*inference.Engine` (it holds no per-request state; create one per
   request row or manage caches per session).
 - For concurrent requests, run independent `Generate` calls in separate
-  goroutines — the `internal/parallel` pool sizes itself to `GOMAXPROCS`.
+  goroutines -- the `internal/parallel` pool sizes itself to `GOMAXPROCS`.
 - Measure with `inference.Measure` before and after changes.
 
 ## 8. OpenAI-compatible API (`cmd/server`)
@@ -198,14 +198,14 @@ go run ./cmd/server \
 
 Endpoints:
 
-- `POST /v1/chat/completions` — non-streaming and streaming (`"stream": true`).
+- `POST /v1/chat/completions` -- non-streaming and streaming (`"stream": true`).
   Accepts `model`, `messages` (roles `system`/`user`/`assistant`/`tool`),
   `temperature`, `top_k`, `max_tokens`, `n`, `seed`, `tools`, `reasoning_effort`,
   `thinking` (enable/disable the reasoning trace) and `thinking_budget` (cap the
   reasoning tokens). Responses carry the trace in the `reasoning_content` field
   of the assistant message (and of each streamed delta); `thinking_budget`
   forces a closing `<|think_end|>` once the budget is exhausted.
-- `GET /v1/models` — lists the served model.
+- `GET /v1/models` -- lists the served model.
 
 Example with thinking enabled and a 64-token budget:
 
@@ -223,9 +223,31 @@ curl http://localhost:8080/v1/chat/completions \
 ```
 
 Tool calls are executed **server-side** by the `server` package: the model
-emits `<|tool_start|>…<|tool_end|>`, the registered `inference.Tool` set runs it in
+emits `<|tool_start|>...<|tool_end|>`, the registered `inference.Tool` set runs it in
 Go, and the result is fed back. The built-in calculator is registered by
-default; `cmd/server` also demonstrates registering a custom `now` tool — add
+default; `cmd/server` also demonstrates registering a custom `now` tool -- add
 your own by implementing `inference.Tool` and calling `registry.Register`.
+
+## 9. Domain bank serving (Mixture-of-Experts Sharding)
+
+Serve a bank of independently trained expert models instead of one monolithic
+model:
+
+```bash
+go run ./cmd/server \
+  --bank ~/.cache/gonano/bank/bank.json \
+  --max-domains 2 --route-scope last-turn --addr :8080
+```
+
+Per request the server classifies the prompt (default: the latest user turn),
+loads only the routed experts from the bank, and blends their outputs. The
+chosen domains are returned in the `X-Gonano-Domains` header, and putting a
+domain name in the OpenAI `model` field pins that domain. `--max-domains` caps
+the blend size and `--min-domain-score` sets the minimum probability for an
+extra domain. The full workflow is in
+[07-moe-sharding.md](07-moe-sharding.md).
+
+The Go API is the same `server.NewServer`, with the bank and router attached
+(`Server.Bank`, `Server.Router`, `Server.MaxDomains`, `Server.RouteScope`).
 
 Next: [Debugging guide](04-debugging.md).

@@ -1,4 +1,4 @@
-# gonano — Debugging Guide
+# gonano -- Debugging Guide
 
 Where to look when something goes wrong. For every failure mode, this gives the
 symptom, the likely cause, and the exact file/function to inspect.
@@ -16,13 +16,13 @@ symptom, the likely cause, and the exact file/function to inspect.
 | `package simd is not in GOROOT` / simd link errors | Go < 1.27 or experiment off | `go env GOROOT`, `GOEXPERIMENT` |
 | `no trained tokenizer, using byte-level tokenizer` | tokenizer not trained / wrong `--base-dir` | `cmd/base_train/main.go`, `tokenizer.LoadTokenizer` |
 | `no parquet files found` / `no .md files found` | wrong `--data-dir`, or `--data-format` mismatch | `cmd/base_train/main.go`, `data.ListParquetFiles`, `data.NewMarkdownSource` |
-| `parquet: corrupt …` / `unsupported encoding/compression` | shard not the expected schema | `data/parquet/reader.go`, `data/parquet/encoding.go`, `data/parquet/snappy.go` |
+| `parquet: corrupt ...` / `unsupported encoding/compression` | shard not the expected schema | `data/parquet/reader.go`, `data/parquet/encoding.go`, `data/parquet/snappy.go` |
 | `sequence longer than rotary cache` | prompt or `max-seq-len` exceeds the trained context | `model/transformer.go` (`Forward`) |
-| `tensor: index … out of range` in `layers.Embedding.Forward` | token id ≥ vocab size (model/tokenizer mismatch) | `model/layers/linear.go` (`Embedding.Forward`), `model/config.go` |
+| `tensor: index ... out of range` in `layers.Embedding.Forward` | token id >= vocab size (model/tokenizer mismatch) | `model/layers/linear.go` (`Embedding.Forward`), `model/config.go` |
 | `loss` becomes `NaN` / `Inf` | optimizer or backprop bug, too-high LR | `optimizer/muon.go`, `optimizer/optimizer.go`, `model/train.go` |
 | Training very slow / high CPU | matmul not tiling well, tiny batch | `kernels/simd/matmul.go`, `internal/parallel/pool.go` |
 | `checkpoint: invalid magic` | wrong file (not a `.gn`), truncated download | `model/checkpoint/checkpoint.go` |
-| `checkpoint: truncated …` | file cut short / version mismatch | `model/checkpoint/checkpoint.go` |
+| `checkpoint: truncated ...` | file cut short / version mismatch | `model/checkpoint/checkpoint.go` |
 | GGUF rejected by a tool | not a stock arch, or corrupt | `model/checkpoint/gguf.go` |
 | Empty / garbage generation | temperature=0 with bad tokenizer, or model not trained | `inference/engine.go`, `inference/sampler.go`, `tokenizer` |
 | Tool call silent | expression unsupported by any registered tool | `inference/tooluse.go` (`Tool`, `Registry`) |
@@ -32,7 +32,7 @@ symptom, the likely cause, and the exact file/function to inspect.
 
 ## 2. Build & environment failures
 
-**Symptom:** `go build ./...` → `package simd: build constraints exclude all Go files`.
+**Symptom:** `go build ./...` -> `package simd: build constraints exclude all Go files`.
 
 **Cause:** the `simd` standard-library package is experimental and gated behind
 `goexperiment.simd` (see `doc.go` in GOROOT/src/simd). Every command needs it:
@@ -41,17 +41,17 @@ symptom, the likely cause, and the exact file/function to inspect.
 GOEXPERIMENT=simd go build ./... && GOEXPERIMENT=simd go test ./...
 ```
 
-There is no `go.mod` trick for this — it is a toolchain experiment flag. Add it
+There is no `go.mod` trick for this -- it is a toolchain experiment flag. Add it
 to your shell profile, `Makefile`, or CI environment.
 
 **Symptom:** builds work but `go test` panics with a `simd`/`archsimd` stack trace
-(e.g. `cannot convert slice with length … to array … length 16`).
+(e.g. `cannot convert slice with length ... to array ... length 16`).
 
 **Cause:** the vector width is **runtime-selected** (128/256/512-bit depending
 on CPU). gonano's kernels are width-agnostic (`kernels/simd/backend.go` reads
 `simd.VectorBitSize()`); a fixed-width panic indicates you are calling a raw
-`simd.Load…` with a too-short slice outside the `tensors` package. Use
-`tensors` kernels or `Load…Part`/`Store…Part`.
+`simd.Load...` with a too-short slice outside the `tensors` package. Use
+`tensors` kernels or `Load...Part`/`Store...Part`.
 
 ---
 
@@ -61,9 +61,9 @@ on CPU). gonano's kernels are width-agnostic (`kernels/simd/backend.go` reads
 
 `cmd/base_train/main.go` selects the source from `--data-dir` + `--data-format`:
 
-- `parquet` (default) → `data.ListParquetFiles` looks for `*.parquet` (ignoring
+- `parquet` (default) -> `data.ListParquetFiles` looks for `*.parquet` (ignoring
   `*.tmp`). Each file must have a **flat `text` BYTE_ARRAY column**.
-- `markdown` → `data.NewMarkdownSource` walks for `*.md` recursively.
+- `markdown` -> `data.NewMarkdownSource` walks for `*.md` recursively.
 
 If your webdata is Markdown but you passed `--data-dir` without
 `--data-format markdown`, you get "no parquet files found". If your shards are
@@ -75,17 +75,17 @@ The reader is minimal by design (`data/parquet/`). It supports **PLAIN** and
 **RLE_DICTIONARY** encodings for **BYTE_ARRAY / INT32 / INT64**, with **SNAPPY**
 or no compression. Anything else fails loudly with a specific message:
 
-- `unsupported compression codec N` → `decompress` in `reader.go` (only 0/1).
-- `unsupported encoding N` → `readColumnValues` / `ReadColumnInt64`.
-- `parquet: corrupt …` → `compact.go` (Thrift metadata) or `snappy.go`.
+- `unsupported compression codec N` -> `decompress` in `reader.go` (only 0/1).
+- `unsupported encoding N` -> `readColumnValues` / `ReadColumnInt64`.
+- `parquet: corrupt ...` -> `compact.go` (Thrift metadata) or `snappy.go`.
 
 If you see "unsupported encoding", the shard likely uses a nested/list column
-or DELTA encoding — re-export it with a flat `text` column, or feed the data as
+or DELTA encoding -- re-export it with a flat `text` column, or feed the data as
 Markdown instead.
 
 ### 3.3 Tokenizer / vocab mismatch
 
-**Symptom:** `panic: tensor: index … out of range` inside `layers.Embedding.Forward`
+**Symptom:** `panic: tensor: index ... out of range` inside `layers.Embedding.Forward`
 during training or inference.
 
 **Cause:** the model's `VocabSize` does not match the tokenizer's. The model was
@@ -99,7 +99,7 @@ if model.Config.VocabSize != tok.VocabSize() { /* mismatch */ }
 
 The reference `build_model` in nanochat asserts exactly this; gonano's
 `checkpoint.LoadModel` rebuilds from the stored config, so a `.gn` always
-round-trips — but a hand-written loader must match vocab sizes.
+round-trips -- but a hand-written loader must match vocab sizes.
 
 ---
 
@@ -122,7 +122,7 @@ The fix is always to clamp input length to the model's `SequenceLen`. The
 loop.
 
 **Cause:** `model.TrainForward` (backprop path) requires a sequence of length
-> 1. You called `TrainStep` with a single-token batch. Use a batch size ≥ 2.
+> 1. You called `TrainStep` with a single-token batch. Use a batch size >= 2.
 
 ---
 
@@ -141,13 +141,13 @@ This is the most serious failure. Work through the layers in order:
    ```
 3. **Optimizer state.** `optimizer/optimizer.go` (AdamW) and `optimizer/muon.go` (Muon)
    accumulate moments in float32; a NaN there propagates forever. Check for a
-   division by zero in the RMSNorm/softmax (`kernels/simd/norm.go`) — the epsilon is
+   division by zero in the RMSNorm/softmax (`kernels/simd/norm.go`) -- the epsilon is
    `1e-6`.
 4. **Data.** A target id outside `[0, vocab)` or a `-1` that isn't masked
    correctly can inject garbage into `tensors.CrossEntropyGrad`
    (`tensors/backward.go`).
 
-Bisect with a **tiny model**: depth 1–2, a few tokens, `--num-iterations 5`,
+Bisect with a **tiny model**: depth 1-2, a few tokens, `--num-iterations 5`,
 and print `loss` every step. If it NaNs immediately, the bug is in the
 forward/backward; if it NaNs later, it's the optimizer or learning rate.
 
@@ -155,14 +155,14 @@ forward/backward; if it NaNs later, it's the optimizer or learning rate.
 
 ## 6. Performance problems
 
-- **Matmul dominates** — see `kernels/simd/matmul.go` (`gemmTransB`/`gemmNN`). They
+- **Matmul dominates** -- see `kernels/simd/matmul.go` (`gemmTransB`/`gemmNN`). They
   tile over rows (block size 64) and parallelize across `parallel.Pool`.
   Verify `parallel.Default().Workers() == runtime.GOMAXPROCS(0)`.
-- **Tiny batches** — decode is bandwidth-bound; batching helps (see the
+- **Tiny batches** -- decode is bandwidth-bound; batching helps (see the
   `infer_bench` guide).
-- **Too many goroutines** — the `internal/parallel` pool uses `GOMAXPROCS`; don't nest
+- **Too many goroutines** -- the `internal/parallel` pool uses `GOMAXPROCS`; don't nest
   `parallel.For` inside another parallel loop.
-- **GC pressure** — the training loop allocates activations per step; the
+- **GC pressure** -- the training loop allocates activations per step; the
   reference nanochat freezes the GC. gonano's `trainer/trainer.go` does not yet
   do this (roadmap).
 
@@ -170,11 +170,11 @@ forward/backward; if it NaNs later, it's the optimizer or learning rate.
 
 ## 7. Checkpoint & export failures
 
-- `checkpoint: invalid magic in …` → you passed a file that isn't a `.gn`
+- `checkpoint: invalid magic in ...` -> you passed a file that isn't a `.gn`
   (or a corrupted/truncated file). `checkpoint.Load` checks the 8-byte magic
   `GONANO\x00\x01`.
-- `checkpoint: truncated …` → the file is short. Re-download / re-save.
-- GGUF rejected → the file is a *nanochat* container, not a stock llama
+- `checkpoint: truncated ...` -> the file is short. Re-download / re-save.
+- GGUF rejected -> the file is a *nanochat* container, not a stock llama
   architecture. See the export guide's architectural note. The writer itself is
   validated in `model/checkpoint/gguf_test.go`.
 
@@ -182,19 +182,19 @@ forward/backward; if it NaNs later, it's the optimizer or learning rate.
 
 ## 8. Inference failures
 
-- **Empty/garbage output** — the model may be under-trained, or the tokenizer
+- **Empty/garbage output** -- the model may be under-trained, or the tokenizer
   doesn't round-trip. Check `tokenizer` round-trips
   (`go test ./tokenizer`), then verify `engine.GenerateBatch` equals a naive
   `model.Forward` loop (`inference/inference_test.go`, `TestEngineMatchesNaiveGenerate`).
-- **Top-k/temperature odd behavior** — `inference/sampler.go` (`sampleRow`,
-  `maskTopK`, `kthLargest`). temperature ≤ 0 is argmax; top-k masks everything
+- **Top-k/temperature odd behavior** -- `inference/sampler.go` (`sampleRow`,
+  `maskTopK`, `kthLargest`). temperature <= 0 is argmax; top-k masks everything
   below the k-th logit.
-- **Tool use never fires** — `inference/engine.go` looks for `<|tool_start|>` /
+- **Tool use never fires** -- `inference/engine.go` looks for `<|tool_start|>` /
   `<|tool_end|>` and dispatches the enclosed text to the `inference.Tool` registry
   (`inference/tooluse.go`), which by default contains only the calculator
   (pure arithmetic or `"str".count("sub")` expressions). Register more tools
   via `Registry.Register` to extend it.
-- **HumanEval 0%** — `executor.Available()` reports whether `python3` is on `PATH`;
+- **HumanEval 0%** -- `executor.Available()` reports whether `python3` is on `PATH`;
   if not, `HumanEval.Evaluate` returns false (`evaluator/tasks/humaneval.go`).
 
 ---
@@ -214,5 +214,5 @@ For reference when writing custom loaders or debugging:
 
 If you hit a problem not covered here, open an issue with the exact panic
 message, the `--depth`/`--max-seq-len`/`--data-format` flags, and the last few
-log lines — the `logging` package (`internal/logging/logging.go`) emits leveled
+log lines -- the `logging` package (`internal/logging/logging.go`) emits leveled
 `slog` output that makes this easy to include.

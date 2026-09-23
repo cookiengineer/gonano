@@ -234,6 +234,163 @@ func runDirectionalGradientCheck(t *testing.T, model *Transformer) {
 	}
 }
 
+// pooledHidden mean-pools a [1,T,dim] hidden state.
+func pooledHidden(hidden *tensors.Tensor) []float32 {
+	sequenceLength := hidden.Shape[1]
+	dim := hidden.Shape[2]
+	inverse := 1 / float32(sequenceLength)
+	features := make([]float32, dim)
+	for position := 0; position < sequenceLength; position++ {
+		base := position * dim
+		for channel := 0; channel < dim; channel++ {
+			features[channel] += hidden.Data[base+channel] * inverse
+		}
+	}
+	return features
+}
+
+// classificationLogits computes weight*pooled + bias for a pooled hidden state.
+func classificationLogits(features []float32, weight, bias *tensors.Tensor) []float32 {
+	classes := weight.Shape[0]
+	dim := weight.Shape[1]
+	logits := make([]float32, classes)
+	for class := 0; class < classes; class++ {
+		sum := bias.Data[class]
+		for channel := 0; channel < dim; channel++ {
+			sum += weight.Data[class*dim+channel] * features[channel]
+		}
+		logits[class] = sum
+	}
+	return logits
+}
+
+// classificationLoss is the pooled linear-head cross-entropy for a hidden state.
+func classificationLoss(hidden *tensors.Tensor, weight, bias *tensors.Tensor, label int) float32 {
+	logits := classificationLogits(pooledHidden(hidden), weight, bias)
+	maximum := logits[0]
+	for _, value := range logits {
+		if value > maximum {
+			maximum = value
+		}
+	}
+	var sum float64
+	for _, value := range logits {
+		sum += math.Exp(float64(value - maximum))
+	}
+	return float32(-(float64(logits[label]-maximum) - math.Log(sum)))
+}
+
+// classificationHiddenGradient returns dL/d(hidden) for the pooled head, the
+// same computation the router's hiddenGradient performs.
+func classificationHiddenGradient(hidden *tensors.Tensor, weight, bias *tensors.Tensor, label int) *tensors.Tensor {
+	sequenceLength := hidden.Shape[1]
+	dim := weight.Shape[1]
+	features := pooledHidden(hidden)
+	logits := classificationLogits(features, weight, bias)
+	maximum := logits[0]
+	for _, value := range logits {
+		if value > maximum {
+			maximum = value
+		}
+	}
+	var sum float64
+	for _, value := range logits {
+		sum += math.Exp(float64(value - maximum))
+	}
+	classes := weight.Shape[0]
+	probabilities := make([]float32, classes)
+	for class := range probabilities {
+		probabilities[class] = float32(math.Exp(float64(logits[class]-maximum)) / sum)
+	}
+	gradientPooled := make([]float32, dim)
+	for class := 0; class < classes; class++ {
+		gradient := probabilities[class]
+		if class == label {
+			gradient -= 1
+		}
+		for channel := 0; channel < dim; channel++ {
+			gradientPooled[channel] += gradient * weight.Data[class*dim+channel]
+		}
+	}
+	inverse := 1 / float32(sequenceLength)
+	gradientHidden := make([]float32, sequenceLength*dim)
+	for position := 0; position < sequenceLength; position++ {
+		base := position * dim
+		for channel := 0; channel < dim; channel++ {
+			gradientHidden[base+channel] = gradientPooled[channel] * inverse
+		}
+	}
+	return tensors.NewWithData([]int{1, sequenceLength, dim}, gradientHidden)
+}
+
+// TestBackpropClassificationDirectionalGradientCheck verifies the
+// TrainClassification backward path (the router's encoder fine-tuning) against
+// finite differences on the pooled-head cross-entropy.
+func TestBackpropClassificationDirectionalGradientCheck(t *testing.T) {
+	model := tinyTrainModel()
+	indexes := tensors.NewInt32sWithData([]int{1, 6}, []int32{1, 5, 2, 8, 3, 7})
+	classes := 3
+	dim := model.Config.EmbedDim
+	weight := tensors.New(classes, dim)
+	bias := tensors.New(classes)
+	headRNG := tensors.NewRNG(7)
+	for index := range weight.Data {
+		weight.Data[index] = headRNG.NormFloat32() * 0.3
+	}
+	for index := range bias.Data {
+		bias.Data[index] = headRNG.NormFloat32() * 0.1
+	}
+	label := 2
+
+	model.ZeroGrad()
+	model.TrainClassification(indexes, func(hidden *tensors.Tensor) *tensors.Tensor {
+		return classificationHiddenGradient(hidden, weight, bias, label)
+	})
+
+	loss := func() float32 {
+		_, context := model.TrainForward(indexes)
+		return classificationLoss(context.finalNorm, weight, bias, label)
+	}
+
+	parameters := model.Parameters()
+	directions := make([][]float32, len(parameters))
+	directionRNG := tensors.NewRNG(999)
+	var analytic float64
+	for parameterIndex, parameter := range parameters {
+		directions[parameterIndex] = make([]float32, parameter.Numel())
+		for elementIndex := range parameter.Data {
+			value := directionRNG.NormFloat32()
+			directions[parameterIndex][elementIndex] = value
+			analytic += float64(parameter.Grad[elementIndex]) * float64(value)
+		}
+	}
+
+	epsilon := float32(1e-3)
+	for parameterIndex, parameter := range parameters {
+		for elementIndex := range parameter.Data {
+			parameter.Data[elementIndex] += epsilon * directions[parameterIndex][elementIndex]
+		}
+	}
+	lossPlus := loss()
+	for parameterIndex, parameter := range parameters {
+		for elementIndex := range parameter.Data {
+			parameter.Data[elementIndex] -= 2 * epsilon * directions[parameterIndex][elementIndex]
+		}
+	}
+	lossMinus := loss()
+	for parameterIndex, parameter := range parameters {
+		for elementIndex := range parameter.Data {
+			parameter.Data[elementIndex] += epsilon * directions[parameterIndex][elementIndex]
+		}
+	}
+	numeric := float64(lossPlus-lossMinus) / (2 * float64(epsilon))
+
+	scale := math.Abs(analytic) + 1e-6
+	if math.Abs(numeric-analytic) > 5e-2*scale {
+		t.Fatalf("classification directional gradient mismatch: analytic=%v numeric=%v", analytic, numeric)
+	}
+}
+
 func TestBackpropPerElementGradientCheck(t *testing.T) {
 	model := tinyTrainModel()
 	indexes, targets := tinyData()

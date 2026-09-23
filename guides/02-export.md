@@ -1,10 +1,10 @@
-# gonano — Export Guide (GGUF)
+# gonano -- Export Guide (GGUF)
 
 This guide explains how to get your trained weights out of gonano, in two
 formats:
 
-1. **`.gn`** — gonano's native checkpoint (used for gonano deployment).
-2. **`.gguf`** — the GGUF container format, for interop/archival.
+1. **`.gn`** -- gonano's native checkpoint (used for gonano deployment).
+2. **`.gguf`** -- the GGUF container format, for interop/archival.
 
 > **Setup.** All commands below run from the repo root with
 > `export GOEXPERIMENT=simd`. See [00-quickstart.md](00-quickstart.md) for the
@@ -12,7 +12,7 @@ formats:
 
 > **Important architectural note.** GGUF is a *container*, not a model
 > definition. gonano's transformer is a **custom architecture** (rotary
-> embeddings, QK-normalization, ReLU² MLP, group-query attention, value
+> embeddings, QK-normalization, ReLU^2 MLP, group-query attention, value
 > embeddings, smear/backout) that does **not** map onto a stock llama.cpp
 > architecture. The exported GGUF is therefore a faithful, self-describing
 > weight container tagged `general.architecture = "nanochat"`. A stock
@@ -90,7 +90,7 @@ Implementation: `model/checkpoint/gguf.go` (`ExportGGUF`).
 | `tokenizer.ggml.model` | string | `"gpt2"` (byte-level BPE) |
 | `tokenizer.ggml.bos_token_id` | uint32 | `<|bos|>` id |
 
-**Tensors** — one GGUF tensor per `model.Transformer.NamedParameters()` entry,
+**Tensors** -- one GGUF tensor per `model.Transformer.NamedParameters()` entry,
 keeping the exact names so a custom loader can reconstruct the model
 unambiguously:
 
@@ -131,7 +131,7 @@ gonano exports **float32** weights. Quantization (int8/fp8/fp16) is not
 implemented in the exporter; the model and training are float32 by design (see
 the implementation plan's "precision" note). If you need a smaller artifact,
 quantize *after* export with an external tool, or store the `.gn`/`.gguf` as-is
-— the f32 weights are the ground truth.
+-- the f32 weights are the ground truth.
 
 ---
 
@@ -142,11 +142,11 @@ quantize *after* export with an external tool, or store the `.gn`/`.gguf` as-is
 | Move weights between gonano runs | `.gn` | `base_train` writes it; `checkpoint.Load` reads it |
 | Inspect/archive weights portably | `.gguf` | `go run ./cmd/export` |
 | Run inference **now** | `.gn` or `.gguf` | `chat_cli` / `infer_bench` (both accept either) |
-| Run in llama.cpp/ollama | — | not supported (custom architecture) |
+| Run in llama.cpp/ollama | -- | not supported (custom architecture) |
 
 `chat_cli` and `infer_bench` load either format automatically
 (`checkpoint.LoadAny`, which dispatches to `LoadGGUF` for `.gguf` and `Load`
 for `.gn`), so an exported GGUF is a complete, loadable artifact for gonano
-itself — the export round-trips losslessly.
+itself -- the export round-trips losslessly.
 
 Next: [Deployment & usage guide](03-deployment.md).

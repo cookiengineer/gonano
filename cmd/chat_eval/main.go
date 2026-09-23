@@ -20,11 +20,12 @@ import (
 func main() {
 	modelPath := flag.String("model", "", "path to a .gn checkpoint (required)")
 	baseDir := flag.String("base-dir", "", "tokenizer directory")
+	domain := flag.String("domain", "", "domain label to report for this evaluation (optional)")
 	flag.Parse()
 
 	logger := logging.Default(slog.LevelInfo)
 	if *modelPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: chat_eval --model <path>")
+		fmt.Fprintln(os.Stderr, "usage: chat_eval --model <path> [--domain <name>]")
 		os.Exit(1)
 	}
 	if *baseDir == "" {
@@ -42,6 +43,9 @@ func main() {
 	}
 	model := checkpoint.LoadModel(meta, params)
 	engine := inference.NewEngine(model, tokenizer)
+	if *domain != "" {
+		logger.Info("evaluating domain", "domain", *domain, "model", *modelPath)
+	}
 
 	// Synthetic categorical task for demonstration.
 	mmlu := tasks.NewMMLUFromRows([]tasks.MMLURow{

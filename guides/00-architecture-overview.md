@@ -1,7 +1,7 @@
-# gonano — Architecture Overview
+# gonano -- Architecture Overview
 
 This document explains how the gonano codebase is organized, how the packages
-relate to one another, and what actually happens — step by step — when you
+relate to one another, and what actually happens -- step by step -- when you
 train a model or run inference. It is meant to be read top to bottom: each
 section builds on the previous one. There are no diagrams; instead, the flow is
 described with ordered lists you can follow like a recipe.
@@ -16,7 +16,7 @@ wrappers that only parse flags and call the library.
 
 Think of the code as three stacked layers, plus a set of stand-alone tools.
 
-1. **The numeric core** — `kernels` (the backend contract), `kernels/simd`,
+1. **The numeric core** -- `kernels` (the backend contract), `kernels/simd`,
    `kernels/scalar`, `tensors`, and `model/layers`. The `kernels.Backend` interface is the
    API contract every other package computes through: elementwise vector ops,
    reductions, matmul, fused softmax/RMSNorm, and flash attention. `kernels/simd`
@@ -26,15 +26,16 @@ Think of the code as three stacked layers, plus a set of stand-alone tools.
    types (`Linear`, `Embedding`). This layer has no idea what a transformer or a
    tokenizer is.
 
-2. **The model** — `model`. This is the actual nanochat GPT transformer: the
+2. **The model** -- `model`. This is the actual nanochat GPT transformer: the
    `Config` that defines its shape, the `Transformer` that owns the weights, and
    both the forward pass (`Forward`) and the training forward/backward pair
    (`TrainForward`/`TrainBackward`). It is built out of `model/layers` primitives and
    `tensors` ops, and its attention uses the flash-attention kernel.
 
-3. **The orchestration** — `trainer`, `inference`, `evaluator`, `data`, `tokenizer`. These
-   packages drive the model: producing data, running training loops, sampling
-   completions, and scoring results.
+3. **The orchestration** -- `trainer`, `inference`, `evaluator`, `data`, `tokenizer`, and -- for
+   Mixture-of-Experts Sharding -- `router` and `bank`. These packages drive the model:
+   producing data, running training loops, sampling completions, routing a
+   prompt to a bank of expert models, and scoring results.
 
 The stand-alone tools are `optimizer` (the optimizers), `model/checkpoint`
 (persistence), `executor` (sandboxed code execution for evaluations), and the
@@ -51,57 +52,62 @@ decoupled, so each can be imported and understood on its own.
 No package may import a package above it. Reading this list bottom-to-top is
 the same order the program bootstraps.
 
-1. `internal/parallel`, `internal/logging`, `internal/device` — the leaves. A goroutine worker pool, an
+1. `internal/parallel`, `internal/logging`, `internal/device` -- the leaves. A goroutine worker pool, an
    `slog` setup, and CPU capability detection (`simd.VectorBitSize`,
    `runtime.GOMAXPROCS`).
 
-2. `kernels` — the backend contract. It is dependency-free and declares the
+2. `kernels` -- the backend contract. It is dependency-free and declares the
    `Backend` interface (`Elementwise`, `Reductions`, `LinearAlgebra`, `Rows`,
    `Attention`).
 
-3. `kernels/scalar` and `kernels/simd` — the implementations. `kernels/scalar` is
+3. `kernels/scalar` and `kernels/simd` -- the implementations. `kernels/scalar` is
    pure Go (no `simd` import); `kernels/simd` depends on `internal/parallel` and the
    standard-library `simd` package and is the default backend.
 
-4. `tensors` — depends on `kernels` and `internal/parallel`. Owns `Tensor` (row-major
+4. `tensors` -- depends on `kernels` and `internal/parallel`. Owns `Tensor` (row-major
    float32 data plus an optional gradient buffer), `Int32s`, and the high-level
    operations that delegate to the active `kernels.Backend`. The default backend
    is `kernels/simd`; `UseKernelBackend` swaps it (the scalar backend is used in
    tests and portable builds).
 
-5. `model/layers` — depends on `tensors` and `internal/parallel`. `Linear` and `Embedding` wrap the
+5. `model/layers` -- depends on `tensors` and `internal/parallel`. `Linear` and `Embedding` wrap the
    tensor matmul/gather operations and add analytic gradients.
 
-6. `model` — depends on `model/layers` and `tensors`. The transformer and its
+6. `model` -- depends on `model/layers` and `tensors`. The transformer and its
    forward/backward. It also imports `optimizer` in one place (`SetupOptimizer`
    returns `optimizer.ParamGroup`s), which keeps parameter grouping next to the
    parameters.
 
-7. `optimizer` — depends on `tensors`. `MuonAdamW` routes parameter groups to
+7. `optimizer` -- depends on `tensors`. `MuonAdamW` routes parameter groups to
    `AdamW` or `Muon`.
 
-8. `tokenizer` — depends on `internal/parallel`. Byte-level BPE training and inference,
+8. `tokenizer` -- depends on `internal/parallel`. Byte-level BPE training and inference,
    plus chat rendering. No dependency on the model.
 
-9. `data` — depends on `tokenizer`, `tensors`, and its own `data/parquet`
+9. `data` -- depends on `tokenizer`, `tensors`, and its own `data/parquet`
    sub-package. Turns files into token tensors.
 
-10. `trainer` — depends on `model`, `optimizer`, `data`, `tensors`. The training
+10. `trainer` -- depends on `model`, `optimizer`, `data`, `tensors`. The training
     loops and hyperparameter derivation.
 
-11. `inference` — depends on `model`, `tokenizer`, `tensors`. The KV-cache engine,
-    sampler, and calculator tool.
+11. `inference` -- depends on `model`, `tokenizer`, `tensors`. The KV-cache engine,
+    sampler, and calculator tool. Its `Ensemble` blends several models' logits
+    for Mixture-of-Experts Sharding.
 
-12. `evaluator` — depends on `model`, `tokenizer`, `inference`, `tensors`, plus the
+12. `router` and `bank` -- `router` depends on `model`, `tensors`, `optimizer`,
+    `model/checkpoint`; `bank` depends on `model`, `model/checkpoint`,
+    `tokenizer`. The domain meta-router and its on-demand model bank.
+
+13. `evaluator` -- depends on `model`, `tokenizer`, `inference`, `tensors`, plus the
     `evaluator/tasks` sub-package (which depends only on `tokenizer`).
 
-13. `executor` and `model/checkpoint` — `executor` is a leaf (`os/exec` only);
+14. `executor` and `model/checkpoint` -- `executor` is a leaf (`os/exec` only);
     `model/checkpoint` depends on `model` and `tensors`.
 
-14. `cmd/*` — the executables import the library packages they need.
+15. `cmd/*` -- the executables import the library packages they need.
 
 This ordering is enforced implicitly (there are no import cycles); it is also
-why the KV cache (`model.KVBuffer`) lives in `model` rather than `inference` — the
+why the KV cache (`model.KVBuffer`) lives in `model` rather than `inference` -- the
 model's forward pass needs to write to it, and `model` may not import `inference`.
 
 ---
@@ -123,7 +129,7 @@ model's forward pass needs to write to it, and `model` may not import `inference
    standard-library `simd` lanes and parallelized across CPU cores via
    `internal/parallel`. Its fused `AttentionForward`/`AttentionBackward` implement flash
    attention: the `[queryLength, keyLength]` score matrix is never materialized
-   — only a `[queryBlockSize, keyBlockSize]` tile and a
+   -- only a `[queryBlockSize, keyBlockSize]` tile and a
    `[queryBlockSize, headDim]` accumulator are live, with the online softmax
    statistics carried forward. The transcendental operations (`Exp`, `Sigmoid`,
    `Tanh`, `Rsqrt`) fall back to `math` because the `simd` package exposes none.
@@ -163,11 +169,11 @@ model's forward pass needs to write to it, and `model` may not import `inference
 
 ### 3.3 `model/layers`
 
-1. `Linear{Weight [out,in]}` — `Forward` is `x @ Wᵀ`, `Backward` accumulates
-   `gradW = gradOutᵀ @ x` and returns `gradIn = gradOut @ W`. No biases
+1. `Linear{Weight [out,in]}` -- `Forward` is `x @ W^T`, `Backward` accumulates
+   `gradW = gradOut^T @ x` and returns `gradIn = gradOut @ W`. No biases
    anywhere in the model.
 
-2. `Embedding{Weight [vocab,dim]}` — `Forward` gathers rows, `Backward`
+2. `Embedding{Weight [vocab,dim]}` -- `Forward` gathers rows, `Backward`
    scatters the gradient back into the gathered rows.
 
 3. `init.go` provides `InitNormal`, `InitUniform`, `InitZeros`, and
@@ -195,7 +201,7 @@ model's forward pass needs to write to it, and `model` may not import `inference
 4. `Forward(idx, cache)` runs the whole stack: embedding, RMSNorm, the "smear"
    step, the per-layer residual trunk (attention + feed-forward, with
    `resid_lambdas`/`x0_lambdas` and value embeddings), the backout step, final
-   norm, `lm_head`, and the logit softcap. The feed-forward is a dense ReLU² MLP
+   norm, `lm_head`, and the logit softcap. The feed-forward is a dense ReLU^2 MLP
    by default, or an always-active SwiGLU shared expert plus a routed
    DeepSeekMoE (`model/moe.go`) when `Config.NumExperts > 0`.
 
@@ -310,10 +316,43 @@ model's forward pass needs to write to it, and `model` may not import `inference
 
 2. `renderMessages` translates OpenAI `system`/`user`/`assistant`/`tool`
    messages into the gonano token protocol; `generate` runs the engine and
-   parses `<|tool_start|>…<|tool_end|>` spans into structured `tool_calls`.
+   parses `<|tool_start|>...<|tool_end|>` spans into structured `tool_calls`.
 
 3. Tool calls are executed server-side in Go by the registry, so a single
    request can carry a complete tool-using turn.
+
+4. In **bank mode** (`cmd/server --bank`), `Server.selectGenerator` classifies
+   the request (default: the last user turn), acquires the routed experts from
+   the `bank`, and returns a blended `inference.Ensemble`; the routed domains
+   are reported in the `X-Gonano-Domains` header. Without a bank, the server
+   serves the single model as before.
+
+### 3.13 `router`
+
+1. `NgramClassifier` is a hashed token n-gram linear softmax classifier (the
+   fast path); `TransformerClassifier` is a `model.Transformer` encoder plus a
+   linear head on its pooled hidden state, trained with `Train` (frozen probe)
+   or `FineTune` (joint encoder/head, via `model.Transformer.TrainClassification`).
+
+2. `DistillNgram` trains the fast path from the transformer's labels;
+   `Router.Predict` runs the fast path and escalates to the transformer when
+   the top-1/top-2 margin is below `Threshold`.
+
+3. A `Router` bundles the domain list, the fast path, the optional transformer,
+   and the encoder path; it is saved with the shared `model/checkpoint` format
+   and reloaded by `LoadRouterAuto`.
+
+### 3.14 `bank`
+
+1. `Manifest` is a JSON descriptor of the domains (id, name, checkpoint, data
+   dirs) and the router path.
+
+2. `Bank` loads experts on demand, validates that each model's `VocabSize`
+   matches the shared tokenizer, and evicts by LRU within a byte/model-count
+   budget (`BankOptions`).
+
+3. `Acquire`/`AcquireMany` return the requested expert models; the caller
+   builds `inference.ModelWeight`s and runs the `Ensemble`.
 
 ---
 
@@ -339,8 +378,8 @@ Follow these steps to trace what `cmd/base_train` actually does.
 5. `Trainer.TrainStep` runs `Transformer.TrainForward`, which walks the
    transformer and saves activations, then computes `CrossEntropy` against `y`.
 
-6. `tensors.CrossEntropyGrad` produces the `softmax − onehot` gradient, and
-   `TrainBackward` flows it in reverse — through `lm_head`, the final RMSNorm,
+6. `tensors.CrossEntropyGrad` produces the `softmax - onehot` gradient, and
+   `TrainBackward` flows it in reverse -- through `lm_head`, the final RMSNorm,
    the backout, then each block's MLP and attention, the residual/smear
    connections, and finally back into the embedding table.
 
@@ -374,7 +413,7 @@ Follow these steps to trace `cmd/chat_cli`.
 
 5. In the decode loop, `SampleNextToken` picks the next token per row from the
    last logits, the tool-call state machine rewrites any
-   `<|tool_start|>…<|tool_end|>` spans into tool outputs (via the registered
+   `<|tool_start|>...<|tool_end|>` spans into tool outputs (via the registered
    `inference.Tool` set), and the resulting token column is forwarded again
    through `Forward` against the KV cache.
 
@@ -383,23 +422,23 @@ Follow these steps to trace `cmd/chat_cli`.
    `tokenizer.Decode` turns back into text.
 
 The key performance fact: decode re-reads all weights plus the KV cache for a
-single token, so it is memory-bandwidth-bound — which is why `infer_bench`
+single token, so it is memory-bandwidth-bound -- which is why `infer_bench`
 shows higher tokens-per-second at larger batch sizes.
 
 ---
 
 ## 6. Artifacts on disk
 
-1. `$GONANO_BASE_DIR/tokenizer/tokenizer.json` — the BPE vocabulary
+1. `$GONANO_BASE_DIR/tokenizer/tokenizer.json` -- the BPE vocabulary
    (default base dir is `~/.cache/gonano`).
 
-2. `$GONANO_BASE_DIR/base_checkpoints/<tag>/model_<step>.gn` — a pretraining
+2. `$GONANO_BASE_DIR/base_checkpoints/<tag>/model_<step>.gn` -- a pretraining
    checkpoint; the same layout is used under `chatsft_checkpoints` and
    `chatrl_checkpoints`.
 
-3. `*.gguf` — an exported GGUF container, written by `cmd/export`.
+3. `*.gguf` -- an exported GGUF container, written by `cmd/export`.
 
-4. `$GONANO_BASE_DIR/base_data/*.parquet` — the downloaded text shards
+4. `$GONANO_BASE_DIR/base_data/*.parquet` -- the downloaded text shards
    (a flat `text` column each).
 
 ---
@@ -440,6 +479,11 @@ shows higher tokens-per-second at larger batch sizes.
 | The inference engine | `inference/engine.go`, `inference/sampler.go` |
 | The OpenAI API server | `server/server.go`, `server/handler.go`, `cmd/server` |
 | Checkpoint/GGUF | `model/checkpoint/checkpoint.go`, `model/checkpoint/gguf.go` |
+| Domain meta-router | `router/router.go`, `router/ngram.go`, `router/transformer.go` |
+| Domain model bank | `bank/bank.go` |
+| Blended (ensemble) generation | `inference/ensemble.go` |
+| MoE Sharding design + workflow | `guides/07-moe-sharding.md` |
+| Benchmarks | `guides/08-benchmarking.md` |
 
 For a from-scratch walkthrough, continue with
 [00-quickstart.md](00-quickstart.md); for training specifics see

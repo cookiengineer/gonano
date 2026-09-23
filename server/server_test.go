@@ -126,7 +126,7 @@ func TestGenerateSplitsReasoningAndContent(test *testing.T) {
 		srv.Tokenizer.EncodeSpecial("<|assistant_start|>"),
 		srv.Tokenizer.EncodeSpecial("<|think_start|>"),
 	}
-	rows := srv.generate(prompt, 0, 0, 6, 1, 1, thinkingOptions{enabled: true, budget: 2})
+	rows := srv.generate(srv.Engine, prompt, 0, 0, 6, 1, 1, thinkingOptions{enabled: true, budget: 2})
 	if len(rows) != 1 {
 		test.Fatalf("rows = %d, want 1", len(rows))
 	}

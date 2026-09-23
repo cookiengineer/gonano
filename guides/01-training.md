@@ -1,12 +1,12 @@
-# gonano — Training Guide
+# gonano -- Training Guide
 
 This guide walks through training a gonano model end to end, from raw text to a
 talking model. It focuses on the two most common data pipelines:
 
-1. **Off-the-shelf web corpus** — download a pretraining dataset (we use
+1. **Off-the-shelf web corpus** -- download a pretraining dataset (we use
    [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu), the
    standard "base English understanding" corpus).
-2. **Your own webdata encoded as Markdown** — crawl pages, convert HTML to
+2. **Your own webdata encoded as Markdown** -- crawl pages, convert HTML to
    Markdown, and train directly on the `.md` files.
 
 Every command below must run with the `simd` build experiment enabled (see
@@ -42,17 +42,17 @@ GOEXPERIMENT=simd go test ./...
 ## 1. The pipeline at a glance
 
 ```
-┌──────────────┐   ┌───────────────┐   ┌──────────────┐   ┌──────────────┐
-│ raw text /   │ → │  tokenizer    │ → │  pretraining │ → │  finetuning  │
-│ markdown     │   │  (tok_train)  │   │ (base_train) │   │ (chat_sft)   │
-└──────────────┘   └───────────────┘   └──────────────┘   └──────────────┘
-        │                                    │
-        │                                    ├── evaluate (base_eval)
-        │                                    └── export (export → GGUF)
-        └────────────────────────────────────┴── deploy (chat_cli)
++--------------+   +---------------+   +--------------+   +--------------+
+| raw text /   |   |  tokenizer    |   |  pretraining |   |  finetuning  |
+| markdown     |-->|  (tok_train)  |-->| (base_train) |-->| (chat_sft)   |
++--------------+   +---------------+   +--------------+   +--------------+
+        |                                    |
+        |                                    +-- evaluate (base_eval)
+        |                                    +-- export (export -> GGUF)
+        +------------------------------------+-- deploy (chat_cli)
 ```
 
-There is **one complexity dial** — `--depth`, the number of transformer
+There is **one complexity dial** -- `--depth`, the number of transformer
 layers. Everything else (width, heads, batch size, learning rates, training
 horizon, weight decay) is derived automatically from the scaling laws in
 `trainer/scaling.go` (`DeriveHyperparams`).
@@ -67,7 +67,7 @@ with a `text` column**, or **Markdown files**. Two ways to get data:
 ### 2a. Download FineWeb-Edu (recommended base corpus)
 
 FineWeb-Edu is the standard, freely-licensed English web corpus used to teach a
-model general English. It ships as Parquet shards, each with a `text` column —
+model general English. It ships as Parquet shards, each with a `text` column --
 exactly what gonano consumes.
 
 Pick a size:
@@ -137,7 +137,7 @@ go run ./cmd/tok_train \
   --vocab-size 32768
 ```
 
-Or let `trainer.sh` handle the tokenizer for you — it trains one on the data,
+Or let `trainer.sh` handle the tokenizer for you -- it trains one on the data,
 loads an existing one, or copies a bundled default (`tokenizer/defaults/`:
 `markdown.json` for Markdown, `byte.json` otherwise):
 
@@ -230,7 +230,7 @@ What happens under the hood (`trainer/trainer.go`, `trainer/scaling.go`):
    ~1.6B-active MoE.
 
 > **Training memory.** The trainer is fully in-RAM: a training step needs the
-> float32 weights, the gradients, and the optimizer state resident at once —
+> float32 weights, the gradients, and the optimizer state resident at once --
 > roughly `12 bytes/parameter` for the flash preset (Muon momentum + factored
 > second moment, Sinkhorn momentum for the embedding tables), plus activations
 > and the Go runtime. Checkpoints (`checkpoint.Save`) go to SSD, but SSD does
@@ -238,11 +238,11 @@ What happens under the hood (`trainer/trainer.go`, `trainer/scaling.go`):
 > or optimizer offloading. `base_train` estimates the requirement (via
 > `model.EstimatedTrainingMemoryBytes`) and exits before allocating if it
 > exceeds the host's available memory. For reference at the default 128k vocab:
-> depth 20 → 19.9 GiB weights / ~60 GiB training state; depth 22 → 27.7 GiB /
-> ~83 GiB; depth 24 → 37.9 GiB / ~114 GiB. Inference (weights only) can hold a
+> depth 20 -> 19.9 GiB weights / ~60 GiB training state; depth 22 -> 27.7 GiB /
+> ~83 GiB; depth 24 -> 37.9 GiB / ~114 GiB. Inference (weights only) can hold a
 > larger checkpoint than the host can train.
 2. `trainer.DeriveHyperparams` computes the total batch size
-   (`B ∝ D^0.383`, Power Laws), the LR scaling (`∝ √B`), and weight decay
+   (`B proportional to D^0.383`, Power Laws), the LR scaling (`proportional to sqrt(B)`), and weight decay
    (T-epoch framework).
 3. `model.SetupOptimizer` routes embeddings/scalars to AdamW and 2-D matrices
    to Muon (`optimizer/muon.go`).
@@ -255,9 +255,27 @@ Checkpoints are written to
 ### Resuming / scaling up
 
 `base_train` currently trains from scratch. To resume, note the checkpoint step
-and restart with a higher `--num-iterations` — the scaling laws are
+and restart with a higher `--num-iterations` -- the scaling laws are
 deterministic, so re-running with the same `--depth` reproduces the same
 hyperparameters. Full resume-from-step is on the roadmap.
+
+### Per-domain training (Mixture-of-Experts Sharding)
+
+Every training command accepts `--domain <name>`. It writes the checkpoint under
+`domains/<name>/base_checkpoints/`, records the domain in the checkpoint
+metadata, and defaults the post-training output directory under
+`domains/<name>/`. All experts in a bank must share **one tokenizer**.
+
+```bash
+go run ./cmd/base_train --domain physics --data-dir ~/data/physics --data-format markdown
+go run ./cmd/chat_sft   --domain physics --model .../model_000500.gn
+go run ./cmd/chat_rl    --domain physics --model .../model_000500.gn
+go run ./cmd/chat_opd   --domain physics --model .../model_000500.gn --teacher .../teacher.gn
+go run ./cmd/chat_eval  --domain physics --model .../model_000500.gn
+```
+
+Train the meta-router and register the domain bank in
+[07-moe-sharding.md](07-moe-sharding.md).
 
 ---
 
@@ -269,7 +287,7 @@ go run ./cmd/base_eval --model ~/.cache/gonano/base_checkpoints/d4/model_000200.
 
 This prints samples and (with `--data-dir`) the bits-per-byte metric
 (`evaluator/bpb.go`). The DCLM CORE benchmark (`evaluator/core.go`) requires downloading
-the evaluation bundle — see the debugging guide for how it is invoked.
+the evaluation bundle -- see the debugging guide for how it is invoked.
 
 ---
 
@@ -292,12 +310,12 @@ uses synthetic conversations for demonstration.
 
 ## 7. What "good" looks like
 
-- **Loss decreasing** — pretraining loss should fall smoothly; a depth-4 smoke
+- **Loss decreasing** -- pretraining loss should fall smoothly; a depth-4 smoke
   run drops from ~5.5 to well below 1 on a tiny corpus.
-- **No NaNs** — see the debugging guide if you see `NaN`/`Inf`.
-- **Samples become coherent** — after enough data, `chat_cli` produces
+- **No NaNs** -- see the debugging guide if you see `NaN`/`Inf`.
+- **Samples become coherent** -- after enough data, `chat_cli` produces
   plausible continuations.
-- **Throughput scales with batch size** — `infer_bench` shows higher tok/s at
+- **Throughput scales with batch size** -- `infer_bench` shows higher tok/s at
   larger decode batch sizes (goroutine-per-op parallelism).
 
 Next steps: [Export guide](02-export.md) and [Deployment guide](03-deployment.md).

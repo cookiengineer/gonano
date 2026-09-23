@@ -1,313 +1,221 @@
 # gonano
 
-This project is a pure-Go reimplementation of [nanochat](https://github.com/karpathy/nanochat),
-and contains an end-to-end LLM training and inference harness. It is built on the experimental
-Go 1.27 [`simd`](https://pkg.go.dev/simd) standard-library package, and optimized for parallelization
-of training and inference on CPUs that support `AVX-512`.
+gonano is a pure-Go LLM training and inference harness. It is a reimplementation
+of [nanochat](https://github.com/karpathy/nanochat) built on the experimental Go
+1.27 [`simd`](https://pkg.go.dev/simd) standard-library package, and it is
+optimized for long-context inference and training on CPUs with `AVX-512`.
 
-## Requirements
+Everything is **float32**, parallelism is goroutine-per-op, and the model is a
+DeepSeek-V4.1-style transformer. On top of that, gonano introduces
+**Mixture-of-Experts Sharding**: a way to run a library of independently trained
+domain models that are loaded on demand.
 
-The `simd` package is experimental and gated behind the `goexperiment.simd` build tag.
-**Every** build, test, and run must set it:
+---
 
-```bash
-GOEXPERIMENT=simd go build ./...;
-GOEXPERIMENT=simd go test ./...;
-```
+## Mixture-of-Experts Sharding
 
-- Vector width is auto-selected from the CPU (128/256/512-bit; AVX-512 via `GODEBUG=simd=512`).
-- Numeric precision is **float32** everywhere; parallelism is goroutine-per-op via the `internal/parallel` package.
+Instead of one monolithic model, gonano lets you train and serve a **bank of
+expert models**, one per semantic domain:
 
-## Features
+- **Expert models.** Each domain (`physics`, `math`, `wikipedia`,
+  `stackoverflow`, ...) is an independently trained model with its own weights
+  and its own datasets. Experts share nothing at the weight level.
+- **Meta-router.** A small classifier maps a prompt to a probability
+  distribution over domains. It has a fast **n-gram** path (distilled from the
+  transformer) that escalates to the transformer only when its confidence is
+  low, so routing is cheap.
+- **Model bank.** Only the selected experts are loaded into RAM. A byte-budgeted
+  LRU keeps the working set bounded and evicts the rest; unrelated experts stay
+  on disk.
+- **Blended inference.** When the router selects several domains, each selected
+  expert runs and their next-token logits are combined into one distribution, so
+  a single token is still sampled once.
 
-> **The full DeepSeek-V4.1-Flash stack is on by default.** Training commands
-> take a single `--preset` (`flash` is the default) rather than per-feature
-> flags; `flash` enables HCA compression, CSA sparse attention, the hierarchical
-> indexer, cross-layer reuse, sliding-window attention, the causal
-> encoder-decoder split, DeepSeekMoE, grouped-query attention, head-wise Muon,
-> partial RoPE, and Sinkhorn embeddings/head. Use `--preset latent` for absorbed
-> MLA + MoE, or `--preset dense` for the classic decoder. The individual
-> `model.Config` fields remain for programmatic use.
+**Why.** The goal is dedicated, scalable CPU compute per expert model while
+using only the RAM that the active experts actually need. A desktop can hold a
+large on-disk library of domain experts and pull in only the relevant ones for a
+request; adding a domain means training and registering one more expert, not
+growing one giant model. Independent experts also mean independent scheduling:
+each expert is a full model that can be run on its own share of the CPU.
 
-gonano is optimized for CPU long-context inference and batched decode. The table
-below summarizes the measured effect of each optimization. Values are speedups
-(`×`, higher is better; below `1×` means slower) for the two inference phases,
-split by decode batch size; each row is measured against the baseline named in
-its own row, so the cells are not one single end-to-end run.
+> **Not the same as DeepSeekMoE.** DeepSeekMoE (implemented here too) routes
+> *within* a layer's feed-forward block to fine-grained experts that all live in
+> one model. Mixture-of-Experts Sharding routes *between whole models* at the
+> bank level. The two compose: a bank expert can itself be a DeepSeekMoE model.
 
-| Feature | Baseline | Prefill (TTFT) | Decode ×1 | Decode ×16 | Decode ×64 |
-|:--------|:---------|---------------:|----------:|-----------:|-----------:|
-| Goroutine-parallel kernels | 1 core, seq 64 | — | 1.01× | 2.26× | — |
-| Split-K flash decoding | 1 core, seq 1024 | 5.75× | 1.37× | 2.89× | — |
-| Vectorized SIMD `exp` | attention kernel, seq 1024 | 1.17× | — | — | — |
-| Rank-1 score-tile GEMM | attention kernel, seq 1024 | 1.25× | — | — | — |
-| HCA dense KV compression (÷4 sequence) | uncompressed, seq 4096 | 0.7–0.8× | 1.37× | 1.02× | 1.14× |
-| CSA sparse attention + hierarchical indexer | compression-only, seq 4096 | ~1.5× | 0.96× | 1.27× | 1.29× |
-| Compression + sparsity | uncompressed, seq 4096 | 1.05–1.23× | 1.31× | 1.29× | 1.48× |
-| Compression + sparsity + SWA + CED (recommended, long context) | uncompressed, seq 16384 | ~3.3× | 1.6× | 1.8× | 2.1× |
+See [guides/07-moe-sharding.md](guides/07-moe-sharding.md) for the full design
+and the end-to-end workflow.
 
-**Recommended configuration:** the `flash` preset is the recommended default
-(compression ratio 4, top-k 8, indexer pool 8, reuse `FRU`, SWA 128, CED). It is
-the best combined result: prefill ≈3.3× and decode ≈1.6–2.1× versus uncompressed
-at seq 16384, because CED's bounded replay cuts prefill by another ≈1.5× over
-SWA-only without a measurable decode cost. The one exception is a **decode-only**
-workload with short prompts, where compression + sparsity without SWA/CED is
-~10–15% faster on decode; SWA and CED trade that decode margin for local fidelity
-and the large prefill win (the exact per-feature flags below are the knobs the
-preset sets).
+---
 
-Architectural features that reduce memory rather than latency:
+## The model
 
-- **Grouped-query / multi-query attention**: one KV head per `N` query heads
-  (the `flash`/`latent` presets use a 2:1 ratio). Cuts KV-cache size without a
-  throughput claim (KV traffic is reduced proportionally).
-- **Partial RoPE** (`RotaryDims`, default 64): DeepSeek-style rotary embedding
-  applied only to the trailing head dimensions, with no throughput cost.
-- **Hierarchical sparse indexer**: coarse-to-fine block selection scores each
-  super-block by the maximum index score among its entries and bounds the number
-  of entries scored per query, making deeper indexing constant-cost in context
-  length.
+gonano's transformer is a decoder-only stack with:
 
-### Local sliding-window attention
+- **Rotary embeddings** (partial RoPE, deep-tail 64 dims), **QK-norm**, and a
+  1.2 attention scale.
+- **Grouped-query attention** (one KV head per `N` query heads) to cut KV size.
+- **Value embeddings** (ResFormer-style) on alternating layers.
+- **Untied** token embedding and `lm_head`, no biases anywhere, softcapped
+  logits.
 
-The `flash` preset's sliding-window branch (width 128; `--swa-window N` in the
-underlying config) adds a **layer-local sliding-window branch** to compressed
-layers: every query attends to the global compressed blocks *and* the raw
-keys/values of the last `N` tokens. The two branches are merged through a single
-exact softmax (they share one log-sum-exp, and each branch's backward is
-corrected by the merged row term `dO·O`), so the local branch adds local context
-without changing the attention semantics. Its cost is bounded by `N` and is
-independent of context length, which is the key property for long context.
+The `flash` preset turns on the full DeepSeek-V4.1-Flash long-context stack:
 
-Because decode is compute/overhead bound, adding a second branch costs
-throughput at short context; the cost does not grow with context. Depth-4 models,
-`GOMAXPROCS=16`, prompt ≈ seq length, decode 16:
+| Concept | What it does |
+|:--|:--|
+| Causal Encoder-Decoder (CED) | Decoder global KV is projected from the encoder's final hidden state; prefill reuses the encoder. |
+| HCA dense KV compression | Merges each block of `ratio` key/value rows into one compressed entry. |
+| CSA sparse attention | Each query attends to the top-`k` compressed blocks selected by a lightning indexer. |
+| Cross-layer reuse (`FRU`) | `Full`/`Reindex`/`Reuse` layers share compressed KV and indexer work. |
+| Hierarchical sparse indexer | Coarse-to-fine block selection keeps deeper indexing constant-cost. |
+| Local sliding window (SWA) | Bounded local attention merged into the same softmax as the global branch. |
+| DeepSeekMoE | One shared expert plus routed fine-grained experts per block. |
+| Grouped-query attention / partial RoPE | Smaller KV cache and DeepSeek-style rotary. |
+| MLA | Absorbed low-rank query/KV latent (the `latent` preset). |
 
-| Model | seq | TTFT (ms) | decode tok/s ×1 | ×16 | ×64 |
-|:------|----:|----------:|----------------:|----:|----:|
-| compression + sparsity | 4096 | 854–1012 | 1152 | 1610 | 2003 |
-| + SWA (`--swa-window 128`) | 4096 | 1051–1173 | 912 | 1449 | 1773 |
-| + CED (`--ced`) | 4096 | 739–752 | 975 | 1460 | 1785 |
-| compression + sparsity | 16384 | 4566–5023 | 427 | 779 | 872 |
-| + SWA (`--swa-window 128`) | 16384 | 5269–5956 | 465 | 735 | 831 |
-| + CED (`--ced`) | 16384 | 3604–3641 | 530 | 745 | 855 |
-| uncompressed (reference) | 16384 | 11691–12825 | 325 | 408 | 412 |
+Presets: `flash` (default, the DeepSeek-V4.1 long-context + MoE stack),
+`latent` (absorbed MLA + MoE), and `dense` (the classic decoder).
 
-SWA costs ≈ 10–15% decode and ≈ 11–19% prefill versus compression-only at seq
-4096, narrowing to ≈ 5–13% decode at seq 16384. Against the uncompressed
-reference the **compression + sparsity + SWA stack is still ≈ 2.0× decode and
-≈ 2.2× prefill at seq 16384** — the local branch is what retains local fidelity.
-
-CED shares the SWA config (`--compression-ratio 4 --sparse-topk 8
---swa-window 128`) and cuts prefill TTFT by **≈1.4–1.6× at seq 4096 and
-≈1.46–1.51× at seq 16384** versus SWA-only, while decode stays within the
-run-to-run spread: decode still runs every layer per token, so CED only adds the
-decoder's global K/V projection at decode time. The bounded replay's window
-bounds the decoder prefill work independent of context length, which is why the
-prefill saving holds from 4k to 16k.
-
-### Causal encoder-decoder prefill
-
-`--ced` activates the Causal Encoder-Decoder split (DeepSeek-V4.1 §2.2). The
-bottom half of the layers `[0, d/2)` is a causal encoder; the top half
-`[d/2, d)` is a decoder whose **global compressed keys/values are projected from
-the encoder's final hidden state** rather than from each decoder layer's own
-hidden state. The decoder's local sliding-window keys/values still come from its
-own hidden state, and the layer's own query, MLP, and output projections are
-unchanged. The projection reuses each decoder layer's existing K/V projections
-and compressor, so `--ced` adds **no parameters and no new cache layout**.
-
-Prefill is encoder-only plus a **bounded replay**: the encoder runs over the
-full prompt and fills every decoder layer's global compressed cache (and
-indexer keys) from its final hidden state; the decoder is then replayed over
-only the last `--swa-window` tokens to rebuild its local state. The last prompt
-position's logits remain exact when the window covers the replay segment, the
-decoder SWA state is used for decoding but never persisted as prefix cache, and
-decode is unchanged because every layer still runs per token.
-
-`--ced` requires `--compression-ratio > 1` and `--swa-window > 0`. The M6.1
-`--reuse-pattern` is applied independently within each half (restarting at the
-decoder split), so a decoder group never borrows an encoder layer's cache; the
-decoder producer projects the shared cache from the encoder hidden state.
-
-A/B benchmark (depth 4, ratio 4, top-k 8, pool 8, `--swa-window 128`, prompt ≈
-seq, decode 16, `GOMAXPROCS=16`; see the table above and the Features table):
-
-| config | seq | TTFT (ms) | prefill tok/s ×1 | ×16 | ×64 |
-|:-------|----:|----------:|-----------------:|----:|----:|
-| compression + sparsity + SWA | 4096 | 1051–1173 | 13–15 | 207–210 | 600–603 |
-| + CED (`--ced`) | 4096 | 739–752 | 21 | 271–275 | 716–730 |
-| compression + sparsity + SWA | 16384 | 5256–5490 | 3 | 44 | 145–147 |
-| + CED (`--ced`) | 16384 | 3604–3641 | 4 | 62 | 192–195 |
-
-Decode token rates are unchanged within noise (4k ≈ 975/1460/1785 tok/s,
-16k ≈ 530/745/855 tok/s at batch 1/16/64).
-
-### Notes
-
-- Benchmarks: 16-core AMD Ryzen 7 7840HS (AVX-512), Go 1.27.1,
-  `GOEXPERIMENT=simd`, `GOMAXPROCS=16`, float32. Reproduce with `benchmark.sh`
-  and `cmd/infer_bench`.
-- "attention kernel" rows are single-`AttentionForward` timings at
-  `seq 1024, head 128`; the other rows are end-to-end `infer_bench` timings.
-- `—` means that phase was not measured for that row, not that the effect is zero.
-- The HCA prefill cost is an implementation/prefill-load artifact at short
-  context; compression pays off in decode and becomes more favourable at longer
-  context, where sparsity is layered on top.
-- **Low-bit weights/KV are rejected by decision**: an int8 QAT experiment was
-  slower than fp32 on this platform (the Go `simd` package has no vectorized
-  int8→float32 conversion, and decode is compute-bound here), and a storage-only
-  quantized KV cache is out of scope. The backend is float32-only. See
-  [guides/06-numeric-precision.md](guides/06-numeric-precision.md) for the locked-in
-  decision record.
+---
 
 ## Quickstart
 
+The `simd` package is gated behind the `goexperiment.simd` build tag, so
+**every** build, test, and run must set it:
+
 ```bash
-export GOEXPERIMENT=simd;
-
-# Train a tiny model (synthetic data, no dataset required)
-go run ./cmd/base_train --depth 4 --max-seq-len 64 --num-iterations 50;
-
-# Chat with it
-go run ./cmd/chat_cli --model ~/.cache/gonano/base_checkpoints/d4/model_000050.gn --prompt "the capital of France is";
-
-# Benchmark inference
-go run ./cmd/infer_bench --model ~/.cache/gonano/base_checkpoints/d4/model_000050.gn;
+export GOEXPERIMENT=simd
 ```
 
-Train a tokenizer from Parquet text shards:
+Train a tiny model on synthetic data and chat with it:
 
 ```bash
-go run ./cmd/tok_train --data-dir /path/to/parquet-shards --vocab-size 32768;
+go run ./cmd/base_train --depth 2 --max-seq-len 64 --num-iterations 20
+
+go run ./cmd/chat_cli \
+  --model ~/.cache/gonano/base_checkpoints/d2/model_000020.gn \
+  --prompt "the capital of France is" \
+  --max-tokens 24
 ```
 
-Download a base English corpus (FineWeb-Edu shards):
+The output is near-gibberish on a 20-step toy model -- the point is that the
+whole pipeline works: train, save, load, infer.
+
+Serve an OpenAI-compatible API:
 
 ```bash
-go run ./cmd/dataset --repo HuggingFaceFW/fineweb-edu --config sample-10BT --split train --num 20;
-```
-
-Pretrain on real data (Parquet or Markdown):
-
-```bash
-# Parquet shards (the "text" column)
-go run ./cmd/base_train --depth 20 --data-dir ~/.cache/gonano/base_data --num-iterations 10000;
-
-# Your own webdata encoded as Markdown (one document per .md file)
-go run ./cmd/base_train --depth 20 --data-dir ~/webdata-md --data-format markdown;
-```
-
-Or use the one-command `trainer.sh` wrapper, which also sets up a tokenizer
-for you (training one, loading an existing one, or copying the bundled default):
-
-```bash
-# Markdown webdata (uses the bundled default tokenizer if none exists yet)
-./trainer.sh ~/webdata-md --format markdown --depth 20 --num-iterations 10000;
-
-# Parquet shards, training a fresh tokenizer on the data
-./trainer.sh ~/.cache/gonano/base_data --format parquet --train-tokenizer --depth 20;
-```
-
-`trainer.sh` wraps `cmd/trainer` (an end-to-end training CLI) and ships default
-tokenizers in `tokenizer/defaults/` — `markdown.json` (BPE tuned for Markdown)
-and `byte.json` (a byte-level fallback). The format-appropriate one is copied
-into place when no trained tokenizer exists; regenerate both with
-`go run ./cmd/tok_default`.
-
-Export weights to GGUF:
-
-```bash
-go run ./cmd/export --model ~/.cache/gonano/base_checkpoints/d20/model_010000.gn --out d20.gguf;
-```
-
-## Benchmarking
-
-Measure inference latency and throughput across decode batch sizes:
-
-```bash
-bash benchmark.sh;
-```
-
-`infer_bench` prints, per batch size, the time-to-first-token (`TTFT`), the
-per-token decode latency (`TPOT`), overall tokens/second (`tok/s`), and pure
-decode tokens/second (`decode tok/s`, excluding prefill). Decode is
-memory-bandwidth-bound, so tokens/second rises with batch size. The prompt
-length is clamped automatically to fit the model's context window.
-
-The benchmark uses a synthetic prompt and never decodes text, so it works even
-without a trained tokenizer (it falls back to a byte-level tokenizer and logs a
-warning).
-
-## Serving (OpenAI-compatible API)
-
-Run an OpenAI-compatible HTTP server (chat completions, streaming, tool calls):
-
-```bash
-go run ./cmd/server --model ~/.cache/gonano/base_checkpoints/d4/model_000050.gn --addr :8080;
+go run ./cmd/server \
+  --model ~/.cache/gonano/base_checkpoints/d2/model_000020.gn \
+  --addr :8080
 
 curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gonano","messages":[{"role":"user","content":"what is 2+2?"}]}';
+  -d '{"model":"gonano","messages":[{"role":"user","content":"what is 2+2?"}]}'
 ```
 
-Tool calls are executed server-side in Go via the `server` package (the built-in
-calculator, plus any tools you register in `cmd/server`). The API also supports
-an explicit reasoning trace: send `"thinking": true` (and an optional
-`"thinking_budget"`) and the answer's reasoning is returned in the
-`reasoning_content` field, non-streaming or as streamed deltas. On the command
-line, `chat_cli --thinking [--thinking-budget N]` streams the trace to stderr.
-See `guides/03-deployment.md` for the Go library usage.
+### Domain bank quickstart
 
-See `guides/00-quickstart.md` for a copy-pasteable ArchLinux setup, and `guides/` for the
-step-by-step training, export, deployment, and debugging guides. The long-context
-attention design and the DeepSeek-V4.1-Flash optimizations (CED, CSA2 reuse, the
-hierarchical sparse indexer, low-rank query/KV, the KV prefix cache, the persistent
-multi-entry KV cache tier, head-wise Muon, Sinkhorn-balanced embeddings, on-policy
-distillation, DSpark semi-autoregressive drafting with a prefix-survival scheduler, and an absorbed MLA latent KV cache) are documented in `guides/05-deepseek-v4.1-optimizations.md`.
-The same guide covers the training-side features: the sequence-level MoE
-balance loss (paper §4.2.2), sample-level attention masking for packed
-documents (`--sample-masking`, on by default), joint semi-autoregressive DSpark
-training, reasoning-effort conditioning (`--effort` / `reasoning_effort`),
-explicit thinking traces (`--thinking` / `thinking` / `reasoning_content`), and
-checkpoint merging for RL re-initialization (`cmd/model_merge`).
+Train one expert per domain, train the meta-router, register the bank, and serve
+with routing:
+
+```bash
+# 1) Train a small expert per domain (datasets/ is a runnable example corpus).
+go run ./cmd/base_train --domain physics --depth 4 --num-iterations 200 \
+  --data-dir datasets/physics --data-format markdown
+go run ./cmd/base_train --domain math --depth 4 --num-iterations 200 \
+  --data-dir datasets/math --data-format markdown
+
+# 2) Train the router (supervised fast path; --fine-tune adapts the encoder).
+go run ./cmd/router_train \
+  --domain physics=datasets/physics --domain math=datasets/math \
+  --data-format markdown --out ~/.cache/gonano/router/router.gn
+
+# 3) Register the bank.
+go run ./cmd/bank_init \
+  --domain physics=~/.cache/gonano/domains/physics/base_checkpoints/d4/model_000200.gn \
+  --domain math=~/.cache/gonano/domains/math/base_checkpoints/d4/model_000200.gn \
+  --router ~/.cache/gonano/router/router.gn \
+  --out ~/.cache/gonano/bank/bank.json
+
+# 4) Serve with per-turn routing and 2-way blending.
+go run ./cmd/server --bank ~/.cache/gonano/bank/bank.json --max-domains 2 --addr :8080
+```
+
+The router's choice is returned in the `X-Gonano-Domains` response header, and
+requesting a domain by name in the `model` field pins it.
+
+---
+
+## Guides
+
+| Guide | Contents |
+|:--|:--|
+| [00-quickstart.md](guides/00-quickstart.md) | Copy-pasteable ArchLinux setup and smoke run. |
+| [00-architecture-overview.md](guides/00-architecture-overview.md) | How the packages fit together, step by step. |
+| [01-training.md](guides/01-training.md) | Data, tokenizer, pretraining, SFT, and per-domain training. |
+| [02-export.md](guides/02-export.md) | The `.gn` checkpoint format and GGUF export. |
+| [03-deployment.md](guides/03-deployment.md) | Loading weights, the Go API, and the OpenAI server. |
+| [04-debugging.md](guides/04-debugging.md) | Symptom-to-file troubleshooting. |
+| [05-deepseek-v4.1-optimizations.md](guides/05-deepseek-v4.1-optimizations.md) | The DeepSeek-V4.1 paper-to-code map. |
+| [06-numeric-precision.md](guides/06-numeric-precision.md) | The float32 requirement and the low-bit decisions. |
+| [07-moe-sharding.md](guides/07-moe-sharding.md) | **Mixture-of-Experts Sharding: design and workflow.** |
+| [08-benchmarking.md](guides/08-benchmarking.md) | Reproducing prefill/decode benchmarks and the measured tables. |
+
+---
 
 ## Packages
 
-| Package             | Responsibility |
-|:--------------------|:-----------------------------------------------------------------------------------------------------------------|
-| `kernels`           | The numeric backend contract (`Backend`): elementwise, reductions, matmul, softmax/RMSNorm, flash attention      |
-| `kernels/simd`      | Production SIMD implementation of `kernels.Backend` (AVX-512/AVX2, goroutine-parallel)                           |
-| `kernels/scalar`    | Portable pure-Go reference implementation used for parity tests and hosts without SIMD                            |
-| `tensors`           | Dense float32/int32 tensor types plus high-level ops that delegate to the active kernel backend                   |
-| `model`             | The nanochat GPT transformer (RoPE, QK-norm, GQA, value embeddings, sliding windows) + training forward/backward |
-| `model/layers`      | Neural-network building blocks: linear layers, embeddings, initializers                                          |
-| `model/checkpoint`  | Versioned binary checkpoint save/load + GGUF export                                                              |
-| `optimizer`         | AdamW + Muon (Polar Express) + Sinkhorn-balanced momentum + MuonAdamW                                            |
-| `tokenizer`         | Byte-level BPE training/inference + chat rendering                                                               |
-| `data`              | Parquet reader, Snappy, HF-Hub download, Markdown source, BOS-aligned dataloaders                                |
-| `trainer`           | Scaling laws, schedulers, pretraining/SFT/RL loops                                                               |
-| `inference`         | KV-cache engine, sampler, calculator tool, benchmark                                                             |
-| `server`            | OpenAI-compatible HTTP API (chat completions, streaming, tool calls)                                             |
-| `evaluator`         | BPB, CORE, ChatCORE + `evaluator/tasks` (MMLU/GSM8K/ARC/HumanEval/SmolTalk)                                      |
-| `executor`          | Sandboxed Python execution (HumanEval)                                                                           |
-| `internal/parallel` | Goroutine worker pool                                                                                            |
-| `internal/device`, `internal/logging` | Hardware detection, logging/metrics                                                            |
+| Package | Responsibility |
+|:--|:--|
+| `kernels` | The numeric backend contract (`Backend`): elementwise, reductions, matmul, softmax/RMSNorm, flash attention, indexer, MoE. |
+| `kernels/simd` | Production SIMD implementation (`AVX-512`/`AVX2`, goroutine-parallel). |
+| `kernels/scalar` | Portable reference backend used for parity tests. |
+| `tensors` | Dense float32/int32 tensor types plus high-level ops. |
+| `model` | The transformer, its training forward/backward, and the DeepSeek-V4.1 features. |
+| `model/layers`, `model/checkpoint` | Building blocks; versioned `.gn`/GGUF persistence. |
+| `optimizer` | AdamW, Muon (Polar Express), Sinkhorn, and MuonAdamW. |
+| `tokenizer` | Byte-level BPE training/inference and chat rendering. |
+| `data` | Parquet/Markdown sources and BOS-aligned dataloaders. |
+| `trainer` | Scaling laws, schedules, and the pretraining/SFT/RL/distillation loops. |
+| `inference` | KV-cache engine, sampler, tools, and the blended `Ensemble`. |
+| `router` | The domain meta-router: n-gram fast path + transformer classifier. |
+| `bank` | The domain model bank: manifest, on-demand loading, LRU eviction. |
+| `server` | OpenAI-compatible HTTP API, single-model or bank mode. |
+| `evaluator`, `evaluator/tasks` | BPB, CORE, ChatCORE, and the task datasets. |
+| `executor` | Sandboxed Python execution (HumanEval). |
+| `internal/parallel`, `internal/device`, `internal/logging` | Worker pool, hardware detection, logging. |
 
-Swap backends at runtime with `tensors.UseKernelBackend(scalar.New())`; the
-default is `kernels/simd`. See `guides/00-architecture-overview.md` for how the
-components fit together.
+Swap backends with `tensors.UseKernelBackend(scalar.New())`; the default is
+`kernels/simd`.
 
 ## Testing
 
-Every feature has unit tests: scalar-vs-SIMD parity tests for the entire
-`kernels.Backend` contract (including flash attention), numerical gradient
-checks of the backprop (including grouped-query attention), and an end-to-end
-train, save, load, generate test.
+Every feature has unit tests, including scalar-vs-SIMD parity for the whole
+kernel contract, numerical gradient checks of the backprop, and an end-to-end
+domain-bank test that trains from `datasets/` and serves over HTTP:
 
 ```bash
-GOEXPERIMENT=simd go test -race ./...;
+GOEXPERIMENT=simd go test ./...
+GOEXPERIMENT=simd go test -short ./...   # skips the slow end-to-end test
 ```
+
+## References
+
+The architecture is inspired by, and links directly to:
+
+- **DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression** --
+  <https://arxiv.org/abs/2609.19969> (the long-context attention and KV stack).
+- **DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts
+  Language Models** -- <https://arxiv.org/abs/2401.06066> (in-model routed
+  experts).
+- **Bag of Tricks for Efficient Text Classification (fastText)** --
+  <https://arxiv.org/abs/1607.01759> (the n-gram fast path).
+- **SetFit: Efficient Few-Shot Learning Without Prompts** --
+  <https://arxiv.org/abs/2209.11055> (encoder plus classification head).
+- **Efficient Intent Detection with Dual Sentence Encoders** --
+  <https://arxiv.org/abs/2003.04807> (sentence-encoder routers).
+- **RouteLLM: Learning to Route LLMs with Preference Data** --
+  <https://arxiv.org/abs/2406.18665> (routing between whole models).
 
 ## License
 

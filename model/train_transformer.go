@@ -146,15 +146,36 @@ func (model *Transformer) trainForward(indexes *tensors.Int32s, segments *tensor
 // into every parameter's Grad buffer.
 func (model *Transformer) TrainBackward(context *trainCtx, gradLogits *tensors.Tensor) {
 	batchSize, sequenceLength := context.indexes.Shape[0], context.indexes.Shape[1]
-	embeddingDimension := model.Config.EmbedDim
-
 	gradSoftcap := tensors.SoftcapBackward(context.logits, gradLogits, softcap) // [B,T,vocab]
 	gradPadded := tensors.New(batchSize*sequenceLength, model.paddedVocab)
 	for tokenIndex := 0; tokenIndex < batchSize*sequenceLength; tokenIndex++ {
 		copy(gradPadded.Data[tokenIndex*model.paddedVocab:], gradSoftcap.Data[tokenIndex*model.Config.VocabSize:(tokenIndex+1)*model.Config.VocabSize])
 	}
+	gradFinalNorm := model.lmHead.Backward(context.finalNorm, gradPadded).Reshape(batchSize, sequenceLength, model.Config.EmbedDim)
+	model.trainBackwardFromHidden(context, gradFinalNorm)
+}
 
-	gradFinalNorm := model.lmHead.Backward(context.finalNorm, gradPadded).Reshape(batchSize, sequenceLength, embeddingDimension)
+// TrainClassification runs the training forward over indexes, asks
+// hiddenGradient for the gradient of the loss with respect to the final
+// normalized hidden state, and backpropagates it through the encoder. It is how
+// the meta-router fine-tunes its encoder jointly with a classification head:
+// the callback owns the head parameters, accumulates their gradients, and
+// returns dL/d(hidden) of shape [B,T,EmbedDim].
+func (model *Transformer) TrainClassification(indexes *tensors.Int32s, hiddenGradient func(hidden *tensors.Tensor) *tensors.Tensor) {
+	_, context := model.TrainForwardSegments(indexes, nil)
+	gradHidden := hiddenGradient(context.finalNorm)
+	if gradHidden == nil {
+		return
+	}
+	model.trainBackwardFromHidden(context, gradHidden)
+}
+
+// trainBackwardFromHidden backpropagates a gradient with respect to the final
+// normalized hidden state through the trunk, smear, and embedding. It is the
+// shared tail of TrainBackward and TrainClassification.
+func (model *Transformer) trainBackwardFromHidden(context *trainCtx, gradFinalNorm *tensors.Tensor) {
+	batchSize, sequenceLength := context.indexes.Shape[0], context.indexes.Shape[1]
+	embeddingDimension := model.Config.EmbedDim
 	gradActivations := normalizeLastDimBackward(context.finalPreNorm, gradFinalNorm)
 
 	var gradBackoutActivations *tensors.Tensor

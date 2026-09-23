@@ -1,4 +1,4 @@
-# gonano — Numeric Precision and Low-Bit Decisions
+# gonano -- Numeric Precision and Low-Bit Decisions
 
 This document is the authoritative record of gonano's numeric-precision
 requirements and the decisions that have been locked in about quantization. It
@@ -19,8 +19,8 @@ gonano's production compute path is the SIMD kernel backend, and that backend is
 **float32 only**.
 
 1. `kernels/simd` is the default `kernels.Backend`. Every vector op it
-   implements — elementwise arithmetic, reductions, matmul, fused
-   softmax/RMSNorm, flash attention, the indexer, and the MoE kernels — operates
+   implements -- elementwise arithmetic, reductions, matmul, fused
+   softmax/RMSNorm, flash attention, the indexer, and the MoE kernels -- operates
    on `[]float32`.
 2. `tensors.Tensor` stores `Data` and `Grad` as `float32`; `tensors.Int32s`
    exists only for token ids and masks, never for arithmetic.
@@ -30,12 +30,12 @@ gonano's production compute path is the SIMD kernel backend, and that backend is
    for scalar-vs-SIMD parity tests and for hosts without SIMD; it is **not** a
    low-bit fallback.
 5. The environment is the Go 1.27 standard-library `simd` package on AVX-512.
-   That package exposes no vectorized int8/fp4 → float32 conversion, and the
+   That package exposes no vectorized int8/fp4 -> float32 conversion, and the
    `internal/parallel` goroutine pool parallelizes float32 work.
 
 Because the SIMD kernel is a hard requirement, "quantize, then cast back to
 float32 for the vector op" is the only shape a low-bit path could take here.
-That pattern is exactly what was measured and rejected (see §2.1).
+That pattern is exactly what was measured and rejected (see Sec. 2.1).
 
 ---
 
@@ -44,7 +44,7 @@ That pattern is exactly what was measured and rejected (see §2.1).
 ### 2.1 Quantization-aware training (QAT) is rejected
 
 The DeepSeek-V4.1-Flash paper uses QAT to accelerate the indexer with FP4
-indexer queries/keys (paper §2.4.4). gonano implemented an int8 QAT experiment
+indexer queries/keys (paper Sec. 2.4.4). gonano implemented an int8 QAT experiment
 and it gave **no performance improvement**, because the quantized values were
 cast back to float32 before the SIMD vector op. Decode is compute-bound on this
 platform, not bandwidth-bound, so removing bytes did not remove the dominant
@@ -57,11 +57,11 @@ factorizations (`--query-compression-dim`, `--kv-latent-dim`, absorbed MLA).
 
 ### 2.2 A quantized KV cache is not in scope
 
-The paper's headline KV win is an FP4 **main KV cache** (paper §2.4.4). The paper
+The paper's headline KV win is an FP4 **main KV cache** (paper Sec. 2.4.4). The paper
 is explicit that this reduces *storage*, not matrix-multiply speed:
 dequantizing the cached values before attention is what allows a more accurate
 format without native low-bit matmul support. In principle that is compatible
-with a float32 SIMD kernel — store the cache in int8/FP4 with scales, dequantize
+with a float32 SIMD kernel -- store the cache in int8/FP4 with scales, dequantize
 to float32 in the attention read path, then run the existing float32 kernels.
 
 That storage-only design was considered and is **explicitly excluded from
@@ -69,7 +69,7 @@ scope**. The backend and cache remain fully float32.
 
 **Decision: gonano does not implement a quantized KV cache.** It is not a TODO
 and should not be reintroduced without first revisiting this record and
-re-benchmarking (§3).
+re-benchmarking (Sec. 3).
 
 ### 2.3 Consequences
 
@@ -92,5 +92,5 @@ re-benchmarking (§3).
    - keep `GOEXPERIMENT=simd go test -race ./...` and the scalar-vs-SIMD parity
      tests green.
 3. The approved float32-compatible levers for the paper's low-bit goals are the
-   vectorized indexer/MoE/matmul kernels (§4 of the optimizations guide) and the
-   low-rank factorizations plus MLA (§5 of that guide).
+   vectorized indexer/MoE/matmul kernels (Sec. 4 of the optimizations guide) and the
+   low-rank factorizations plus MLA (Sec. 5 of that guide).

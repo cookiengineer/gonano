@@ -2,10 +2,13 @@ package server
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 
+	"github.com/cookiengineer/gonano/bank"
 	"github.com/cookiengineer/gonano/inference"
 	"github.com/cookiengineer/gonano/model"
+	"github.com/cookiengineer/gonano/router"
 	"github.com/cookiengineer/gonano/tokenizer"
 )
 
@@ -18,6 +21,49 @@ type Server struct {
 	Engine    *inference.Engine
 	Tools     *inference.Registry
 	ModelName string
+
+	// Bank and Router, when both non-nil, enable domain routing: each request
+	// is classified by Router and only the selected domain models are loaded
+	// (via Bank) and blended (via inference.Ensemble).
+	Bank   *bank.Bank
+	Router *router.Router
+	// MaxDomains caps how many routed domains are blended per request
+	// (default 1).
+	MaxDomains int
+	// MinDomainScore is the minimum router probability to include an extra
+	// domain in the blend.
+	MinDomainScore float32
+	// RouteScope selects what the router classifies: "last-turn" (default)
+	// uses the latest user message, "full-prompt" uses the whole rendered
+	// prompt.
+	RouteScope string
+}
+
+// routeScopeLastTurn routes on the latest user message.
+const routeScopeLastTurn = "last-turn"
+
+// routingScope returns the effective route scope.
+func (server *Server) routingScope() string {
+	if server.RouteScope == "" {
+		return routeScopeLastTurn
+	}
+	return server.RouteScope
+}
+
+// lastUserContent returns the content of the most recent user message.
+func lastUserContent(messages []ChatMessage) string {
+	for index := len(messages) - 1; index >= 0; index-- {
+		if messages[index].Role == "user" {
+			return messages[index].Content
+		}
+	}
+	return ""
+}
+
+// tokenGenerator is the shared generation contract of the single-model Engine
+// and the blended Ensemble.
+type tokenGenerator interface {
+	GenerateWith(tokens []int, numSamples, maxTokens int, temperature float32, topK int, seed uint64, options inference.GenerateOptions) func(yield func([]int, []int) bool)
 }
 
 // NewServer builds a Server. tools may be nil, in which case the engine's
@@ -65,10 +111,83 @@ func resolveThinking(chatRequest ChatCompletionRequest) thinkingOptions {
 	return options
 }
 
+// selectGenerator chooses the generator and routed domain names for a request.
+// It routes on the last user turn by default (RouteScope "last-turn") or the
+// full prompt ("full-prompt"), and it treats a requested model name that names
+// a bank domain as a hard pin.
+func (server *Server) selectGenerator(chatRequest ChatCompletionRequest, prompt []int) (tokenGenerator, []string) {
+	if server.Bank == nil || server.Router == nil {
+		return server.Engine, nil
+	}
+	maxDomains := server.MaxDomains
+	if maxDomains < 1 {
+		maxDomains = 1
+	}
+
+	// A requested domain pins routing (e.g. the OpenAI "model" field).
+	if requested := chatRequest.Model; requested != "" {
+		for _, domain := range server.Router.Domains {
+			if domain == requested {
+				return server.ensembleForScores([]router.Score{{Domain: requested, Value: 1}}), []string{requested}
+			}
+		}
+	}
+
+	routePrompt := prompt
+	if server.routingScope() == routeScopeLastTurn {
+		if last := lastUserContent(chatRequest.Messages); last != "" {
+			routePrompt = server.Tokenizer.Encode(last)
+		}
+	}
+	scores := server.Router.TopDomains(server.toTokenIDs(routePrompt), maxDomains, server.MinDomainScore)
+	if len(scores) == 0 {
+		return server.Engine, nil
+	}
+	ids := make([]string, 0, len(scores))
+	routed := make([]string, 0, len(scores))
+	for _, score := range scores {
+		ids = append(ids, score.Domain)
+		routed = append(routed, fmt.Sprintf("%s=%.3f", score.Domain, score.Value))
+	}
+	generator := server.ensembleForScores(scores)
+	if generator == nil {
+		return server.Engine, nil
+	}
+	slog.Info("domain route", "domains", routed)
+	return generator, ids
+}
+
+// ensembleForScores acquires the selected domains and builds a blended
+// generator. It returns nil when no model could be loaded.
+func (server *Server) ensembleForScores(scores []router.Score) tokenGenerator {
+	weights := make([]inference.ModelWeight, 0, len(scores))
+	for _, score := range scores {
+		transformer, err := server.Bank.Acquire(score.Domain)
+		if err != nil {
+			slog.Warn("domain model unavailable", "domain", score.Domain, "err", err)
+			continue
+		}
+		weights = append(weights, inference.ModelWeight{Model: transformer, Weight: score.Value, Domain: score.Domain})
+	}
+	if len(weights) == 0 {
+		return nil
+	}
+	return inference.NewEnsemble(weights, server.Tokenizer)
+}
+
+// toTokenIDs converts prompt token ids to the int32 encoding the router uses.
+func (server *Server) toTokenIDs(prompt []int) []int32 {
+	ids := make([]int32, len(prompt))
+	for index, token := range prompt {
+		ids[index] = int32(token)
+	}
+	return ids
+}
+
 // generate runs n samples of autoregressive generation and parses each row
 // into its natural-language content, reasoning trace, tool calls, and finish
 // reason.
-func (server *Server) generate(prompt []int, temperature float32, topK, maxTokens, numSamples int, seed uint64, thinking thinkingOptions) []rowResult {
+func (server *Server) generate(generator tokenGenerator, prompt []int, temperature float32, topK, maxTokens, numSamples int, seed uint64, thinking thinkingOptions) []rowResult {
 	tokenizerImpl := server.Tokenizer
 	results := make([]rowResult, numSamples)
 
@@ -97,7 +216,7 @@ func (server *Server) generate(prompt []int, temperature float32, topK, maxToken
 		inThinking[index] = primedThinking
 	}
 
-	generate := server.Engine.GenerateWith(prompt, numSamples, maxTokens, temperature, topK, seed,
+	generate := generator.GenerateWith(prompt, numSamples, maxTokens, temperature, topK, seed,
 		inference.GenerateOptions{Thinking: thinking.enabled || thinking.budget > 0, ThinkingBudget: thinking.budget})
 	generate(func(column, mask []int) bool {
 		for index := 0; index < numSamples; index++ {

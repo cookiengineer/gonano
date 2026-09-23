@@ -22,6 +22,7 @@ func main() {
 	maxSeqLen := flag.Int("max-seq-len", 512, "max sequence length")
 	outPath := flag.String("out", "", "output checkpoint path")
 	baseDir := flag.String("base-dir", "", "tokenizer directory")
+	domain := flag.String("domain", "", "domain name for the model bank; recorded in the checkpoint (default output goes to domains/<name>/chatsft_checkpoints/)")
 	flag.Parse()
 
 	logger := logging.Default(slog.LevelInfo)
@@ -65,12 +66,22 @@ func main() {
 		}
 	})
 
+	if *outPath == "" && *domain != "" {
+		*outPath = filepath.Join(*baseDir, "domains", *domain, "chatsft_checkpoints", "model_final.gn")
+	}
 	if *outPath != "" {
+		if err := os.MkdirAll(filepath.Dir(*outPath), 0o755); err != nil {
+			logger.Error("create output directory", "err", err)
+			os.Exit(1)
+		}
 		outMeta := checkpoint.Meta{Step: *numIterations, ModelConfig: model.Config}
+		if *domain != "" {
+			outMeta.UserConfig = map[string]any{"domain": *domain}
+		}
 		if err := checkpoint.Save(*outPath, outMeta, model.NamedParameters()); err != nil {
 			logger.Error("save", "err", err)
 			os.Exit(1)
 		}
-		logger.Info("saved SFT checkpoint", "path", *outPath)
+		logger.Info("saved SFT checkpoint", "path", *outPath, "domain", *domain)
 	}
 }

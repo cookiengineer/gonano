@@ -1,9 +1,11 @@
-# gonano — DeepSeek-V4.1-Flash Optimizations
+# gonano -- DeepSeek-V4.1-Flash Optimizations
 
 gonano started as a pure-Go reimplementation of nanochat's GPT transformer.
 On top of that base it implements the long-context attention design and the
 KV-cache optimizations described in
 [DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression](https://arxiv.org/abs/2609.19969).
+The inherited feed-forward design is
+[DeepSeekMoE](https://arxiv.org/abs/2401.06066) (Sec. 2.7).
 
 This guide is the map between the paper and the code: which concept is
 implemented where, how to turn it on, and which parts are deliberately *not*
@@ -11,9 +13,14 @@ implemented. It assumes you have read
 [00-architecture-overview.md](00-architecture-overview.md) for the package
 layout.
 
+> This guide covers the **in-model** optimizations. The separate bank-level
+> architecture -- routing between independently trained domain models -- is
+> **Mixture-of-Experts Sharding**, documented in
+> [07-moe-sharding.md](07-moe-sharding.md).
+
 > **Setup.** Run everything from the repo root with `GOEXPERIMENT=simd`, as
 > described in [00-quickstart.md](00-quickstart.md). The numeric backend is
-> **float32** everywhere; there is no low-bit path (see §8).
+> **float32** everywhere; there is no low-bit path (see Sec. 8).
 
 ---
 
@@ -23,7 +30,7 @@ The whole stack below is **on by default** through the `flash` preset; the
 `latent` and `dense` presets are alternates. The "Enable with" column names the
 preset (or runtime API) that turns each concept on.
 
-| Paper concept | § | Implemented in | Enable with |
+| Paper concept | Sec. | Implemented in | Enable with |
 |---|---|---|---|
 | Causal Encoder-Decoder (CED) | 2.2 | `model/transformer.go` `PrefillCED`, `model/train_transformer.go`, `model/train.go` | `flash` |
 | Decoder SWA bounded replay | 2.2, 3.2.2 | `PrefillCED` phase 3 | `flash` |
@@ -40,7 +47,7 @@ preset (or runtime API) that turns each concept on.
 | Sequence-level balance loss | 4.2.2 | `MoE.sequenceBalance`, `Config.MoEBalanceWeight` | MoE (default 1e-4) |
 | Sample-level attention masking | 4.2.2 | `data` `NextSegments`, `model.TrainForwardSegments`, `kernels` `SegmentIDs` | `--sample-masking` (pretrain/SFT) |
 | Reasoning-effort control | 5.1.4 | `tokenizer.ReasoningEffortInstruction`, `trainer.ExponentialTokenPenalty`, `cmd/chat_rl` | `--efforts` |
-| Explicit thinking trace | — | `tokenizer/special.go`, `tokenizer/render.go`, `inference/engine.go`, `server/` | `--thinking`, `thinking_budget` |
+| Explicit thinking trace | -- | `tokenizer/special.go`, `tokenizer/render.go`, `inference/engine.go`, `server/` | `--thinking`, `thinking_budget` |
 | Model merging for RL re-init | 5.1.2 | `model/checkpoint` `MergeParameters`/`MergeFiles`, `cmd/model_merge` | `--models`/`--weights` |
 | Head-wise Muon for Q/K | 2.5 | `model/optimizer.go` `headWiseViews` | `flash` |
 | Sinkhorn-balanced embeddings / lm_head | 2.5 | `optimizer/sinkhorn.go`, `model/optimizer.go` `sinkhornGroup` | all presets except `dense` |
@@ -51,8 +58,8 @@ preset (or runtime API) that turns each concept on.
 | Global-KV prefix reuse + SWA replay | 3.2.1, 3.2.2 | `inference/prefix.go` `PrefixCache`, `Engine.Prefix` | `Engine.Prefix = NewPrefixCache(...)` |
 | Persistent multi-entry KV cache (LRU/TTL/disk) | 3.2.1 | `inference/cache.go` `CacheManager`, `model/kvcache_codec.go` | `Engine.Cache = NewCacheManager(...)` |
 | SWA pool + bounded replay (global-only persistence) | 3.2.1, 3.2.2 | `KVBuffer.StripRaw`, `Transformer.ReplaySWA`, `Engine.SWACache` | `CacheOptions.StripSWA`, `Engine.SWACache` |
-| FP4 main KV cache / FP4 indexer QAT | 2.4.4 | **not implemented** (float32-only) | — |
-| Engram, Single-Pass mHC | 2.1, 2.4 | **not applicable / not implemented** | — |
+| FP4 main KV cache / FP4 indexer QAT | 2.4.4 | **not implemented** (float32-only) | -- |
+| Engram, Single-Pass mHC | 2.1, 2.4 | **not applicable / not implemented** | -- |
 
 ---
 
@@ -63,8 +70,8 @@ preset (or runtime API) that turns each concept on.
 The paper splits the 40-layer backbone into a 20-layer causal **encoder** and a
 20-layer **decoder**; the decoder's *global* keys/values are projected from the
 encoder's final hidden state `H_{L/2}` instead of from each decoder layer's own
-hidden state, so prefill drops from `O(N·L)` to roughly `O(N·L/2)`
-(paper §2.2).
+hidden state, so prefill drops from `O(N*L)` to roughly `O(N*L/2)`
+(paper Sec. 2.2).
 
 In gonano:
 
@@ -90,8 +97,8 @@ In gonano:
   for CED, and `NumLayer >= 2`.
 
 The paper's **Encoder SWA Bounded Replay** (recomputing only `n_win` tokens on a
-global-KV cache hit, §3.2.2) is the serving-side counterpart; gonano exposes the
-building block through the prefix cache (§6).
+global-KV cache hit, Sec. 3.2.2) is the serving-side counterpart; gonano exposes the
+building block through the prefix cache (Sec. 6).
 
 ### 2.2 Dense KV compression (HCA) and sparse attention (CSA)
 
@@ -114,17 +121,17 @@ The indexer is trained with a distillation loss (`distillationTarget`,
 `Config.IndexerLossWeight`); it is deliberately low-rank (`IndexerDim` per
 head) so scoring compressed blocks is much cheaper than full attention. Indexer
 K is projected from the compressed main KV, matching the CSA2 simplification in
-paper §2.3 (no separate compression path, no absolute positional embedding).
+paper Sec. 2.3 (no separate compression path, no absolute positional embedding).
 
 ### 2.3 Cross-layer KV and index reuse (Full / Reindex / Reuse)
 
-Paper §2.3.1 assigns each layer one of three modes:
+Paper Sec. 2.3.1 assigns each layer one of three modes:
 
-- **Full** — owns the compressor and indexer; produces compressed KV, indexer K,
+- **Full** -- owns the compressor and indexer; produces compressed KV, indexer K,
   and (when sparse) the top-k selection.
-- **Reindex** — reuses the most recent group's compressed KV and indexer K, but
+- **Reindex** -- reuses the most recent group's compressed KV and indexer K, but
   runs its own indexer for a fresh selection.
-- **Reuse** — reuses both the compressed KV and the latest published selection;
+- **Reuse** -- reuses both the compressed KV and the latest published selection;
   runs no indexer at all.
 
 In gonano this is the cyclic `Config.ReusePattern` (`F`/`R`/`U`, must start
@@ -136,7 +143,7 @@ well as indexer work.
 
 ### 2.4 Hierarchical sparse indexer
 
-Paper §2.3.2 narrows the search domain of deeper indexers: the first Full-mode
+Paper Sec. 2.3.2 narrows the search domain of deeper indexers: the first Full-mode
 decoder layer scores all visible positions and builds a **candidate pool**, and
 later Reindex layers score only that pool, making their per-query cost bounded
 rather than linear in context length.
@@ -171,10 +178,10 @@ Both branches share one exact softmax:
 
 - `mergeAttentionBranches` (training) and `mergeAttentionRow` (inference)
   combine the branch log-sum-exps; the backward pass shares the merged
-  log-sum-exp and the merged row correction `dO·O` (`rowCorrection`).
+  log-sum-exp and the merged row correction `dO*O` (`rowCorrection`).
 
 Because the window is bounded by `W`, the local branch's cost is independent of
-context length — the key property for long context. SWA KV is layer-local: every
+context length -- the key property for long context. SWA KV is layer-local: every
 reuse mode computes its own, independently of the shared global compressed KV.
 
 ### 2.6 GQA and partial RoPE
@@ -186,7 +193,7 @@ partial RoPE (`model/rotary.go`).
 
 ### 2.7 Mixture-of-Experts (DeepSeekMoE)
 
-Paper §2.1 and §4.2.1 use one shared expert plus many fine-grained routed
+Paper Sec. 2.1 and Sec. 4.2.1 use one shared expert plus many fine-grained routed
 experts in every feed-forward layer. gonano implements this as `model/moe.go`,
 enabled with `--moe`:
 
@@ -197,7 +204,7 @@ enabled with `--moe`:
 - **Activation.** Experts and the shared expert use clamped SwiGLU,
   `silu(min(gate,10)) * clamp(up,-10,10)` (`kernels.Backend.SwiGLU`,
   `tensors.SwiGLU`). The clamp threshold is `Config.MoEClamp` (default 10; a
-  negative value disables clamping). Plain (non-MoE) blocks keep the ReLU² MLP.
+  negative value disables clamping). Plain (non-MoE) blocks keep the ReLU^2 MLP.
 - **Weight layout.** Routed expert weights are packed contiguously as
   `[E, Hidden, Dim]` (gate/up) and `[E, Dim, Hidden]` (down) so a future grouped
   SIMD kernel can walk them without pointer chasing. The optimizer consumes
@@ -224,19 +231,19 @@ enabled with `--moe`:
   (`kernels/scalar/moe.go`) and SIMD parity tests.
 - **Load balancing.** After each optimizer step,
   `Transformer.UpdateRouterBias` applies the auxiliary-loss-free update
-  `bias_e += u·sign(mean_load − load_e)` with `u = Config.RouterBiasUpdate`
+  `bias_e += u*sign(mean_load - load_e)` with `u = Config.RouterBiasUpdate`
   (default 0.001). Overloaded experts get a lower selection bias. On top of
   that, a small **sequence-level balance loss** (`Config.MoEBalanceWeight`,
   default 1e-4) keeps a single packed sequence from collapsing onto a few
   experts: `MoE.sequenceBalance` computes the DeepSeek-V3 objective
-  `α·Σ_e f_{s,e}·P_{s,e}` per sequence (selection treated as straight-through)
+  `alpha*sum_e f_{s,e}*P_{s,e}` per sequence (selection treated as straight-through)
   and adds its gradient to the router weight. A negative weight disables it.
 - **Accounting.** `MatmulParams` counts every expert (total parameters), while
   `ActiveMatmulParams` counts only the top-`k` experts plus shared/router; the
   decode FLOPs and `WeightReadBytes` (and therefore `cmd/infer_bench`) use the
   active count, since only those weights are read per token.
 - **Sizing from depth.** With `--moe`, the routed expert count is
-  `model.MoEExpertsForDepth(depth) = max(8, 2·depth)`; `--num-experts`,
+  `model.MoEExpertsForDepth(depth) = max(8, 2*depth)`; `--num-experts`,
   `--experts-per-token` (default 2), and `--expert-hidden-dim` (default the
   embedding width) override the derivation. MoE is orthogonal to the attention
   design, so it composes with GQA, compression, SWA, CED, and MLA (all covered
@@ -281,7 +288,7 @@ Units: `model/moe_test.go` (`TestMoEConfigDefaults`, `TestMoEConfigValidation`,
 
 ## 3. Shared candidate pool (constant-cost deeper indexer)
 
-This is the runtime complement to §2.4. Before it, every Full/Reindex layer
+This is the runtime complement to Sec. 2.4. Before it, every Full/Reindex layer
 re-pooled and coarse-scored the whole visible context on every decode step. Now:
 
 1. A Full layer computes the candidate pool once per step and stores it in
@@ -301,7 +308,7 @@ Units: `TestSelectWithinPoolMatchesFineStage`, `TestHierarchicalPoolBoundedByBud
 ## 4. SIMD, parallel, and bounded top-k kernels
 
 The paper accelerates indexing with FP4 quantization of indexer queries/keys.
-gonano cannot use low-bit arithmetic (float32-only; see §8), so it accelerates
+gonano cannot use low-bit arithmetic (float32-only; see Sec. 8), so it accelerates
 the same work with vectorization and parallelism instead:
 
 - **`kernels.Indexer`** (new backend contract, `kernels/backend.go`):
@@ -312,7 +319,7 @@ the same work with vectorization and parallelism instead:
   - `IndexerBlockMax(destination, scores, rows, blocks, groupSize)` reduces the
     score matrix to per-super-block maxima with SIMD; it replaced the earlier
     pooled-mean coarse stage so the hierarchical indexer matches the paper's
-    block score (DeepSeek-V4.1 §2.3.2).
+    block score (DeepSeek-V4.1 Sec. 2.3.2).
 - The coarse stage materializes per-entry scores in bounded row chunks
   (`selectProjectedScores`), so peak scratch memory is independent of context
   length while `IndexerBlockMax` still handles the reduction.
@@ -325,8 +332,8 @@ the same work with vectorization and parallelism instead:
   per-row goroutine overhead would dominate.
 - **`kernels.MoE`** (new backend contract, `kernels/backend.go`): the fused
   mixture-of-experts kernels `MoEGateTopK`, the vectorized `TopKIndices`
-  selection, and `GroupedMatMulTransposed` (DeepSeek-V4.1 §2.1/§4.2.1; see
-  §2.7), implemented in `kernels/simd/moe.go` and `kernels/scalar/moe.go`.
+  selection, and `GroupedMatMulTransposed` (DeepSeek-V4.1 Sec. 2.1/Sec. 4.2.1; see
+  Sec. 2.7), implemented in `kernels/simd/moe.go` and `kernels/scalar/moe.go`.
 
 Units: `kernels/simd/parity_test.go` (`TestIndexerScoresParity`,
 `TestIndexerBlockMaxParity`), `model/indexer_test.go`
@@ -337,7 +344,7 @@ Units: `kernels/simd/parity_test.go` (`TestIndexerScoresParity`,
 
 ## 5. MLA low-rank query and KV latent
 
-Paper §2.3 / §4.2.1 uses a query-compression dimension and a shared KV latent
+Paper Sec. 2.3 / Sec. 4.2.1 uses a query-compression dimension and a shared KV latent
 (MLA). gonano implements the low-rank factorizations, disabled by default so the
 existing full-rank path and checkpoints are unchanged:
 
@@ -412,8 +419,8 @@ Units: `TestPrefixCacheLookupStore`, `TestPrefixCacheGenerationMatchesFullPrefil
 
 **Persistent multi-entry cache tier.** `inference/cache.go` generalizes the
 single-entry cache into `CacheManager`, the in-memory analogue of the paper's
-persistent KV cache (§3.2.1): it keeps multiple prefixes, evicts by LRU and TTL,
-bounds memory by entry count or allocated bytes, and — when given a directory —
+persistent KV cache (Sec. 3.2.1): it keeps multiple prefixes, evicts by LRU and TTL,
+bounds memory by entry count or allocated bytes, and -- when given a directory --
 serializes each snapshot to disk via `KVBuffer.MarshalBinary` /
 `model.UnmarshalKVBuffer`, keeping only metadata in memory. `Engine.Cache` takes
 precedence over `Engine.Prefix`, and `cmd/server` enables a small in-memory tier
@@ -449,7 +456,7 @@ Units: `TestKVCacheCodecStrippedRoundTrip`,
 
 ## 7. Head-wise Muon for Q and K
 
-Paper §2.5 splits the query (and key) weights by attention head before the Muon
+Paper Sec. 2.5 splits the query (and key) weights by attention head before the Muon
 update, giving each head its own preconditioner. In gonano:
 
 - `Config.HeadWiseMuon` (`--head-wise-muon`) switches it on.
@@ -467,7 +474,7 @@ Units: `TestHeadWiseViewsShareStorage`,
 routes the token embedding, `lm_head`, and value embeddings to the
 Sinkhorn-balanced momentum update instead of AdamW (Algorithm 1 of the paper):
 Nesterov momentum, masking of near-zero rows, `K=11` alternating row/column L2
-normalizations, a `√n` unit-RMS rescale, and the `γ=0.18` learning-rate
+normalizations, a `sqrt(n)` unit-RMS rescale, and the `gamma=0.18` learning-rate
 correction, with no weight decay. Because it keeps only a momentum buffer, it
 halves the optimizer-state memory of those large `[vocab, dim]` matrices and
 matches the paper's choice for embedding tables and the prediction head. It is
@@ -478,7 +485,7 @@ Units: `TestSinkhornSingleRowNormalization`, `TestSinkhornMasksNearZeroRows`,
 `TestSetupOptimizerSinkhornRoutesEmbeddings`, `TestSinkhornTrainStepFinite`.
 
 **Full-vocabulary on-policy distillation.** `cmd/chat_opd` runs the paper's
-final post-training stage (§5.2.4): the student generates rollouts, a frozen
+final post-training stage (Sec. 5.2.4): the student generates rollouts, a frozen
 teacher checkpoint scores them, and the student is trained to match the teacher's
 full next-token distribution. The objective is the forward KL from the student
 to the teacher (equivalently the cross-entropy of the teacher distribution under
@@ -498,7 +505,7 @@ Units: `TestDistillationMatchesCrossEntropyForOneHotTeacher`,
 small trunk (3 blocks, context capped at 128 tokens) distilled from a frozen,
 uncompressed backbone, plus a low-rank **Markov head** and a **confidence head**
 trained on top of the frozen trunk. `DSpark.Draft` is **semi-autoregressive**
-(DeepSeek-V4.1 §2.4.3): it runs a *single* trunk forward over the context
+(DeepSeek-V4.1 Sec. 2.4.3): it runs a *single* trunk forward over the context
 followed by `count-1` learned **draft-mask positions**
 (`Transformer.ForwardHiddenSuffix` + `dspark.draft_mask.embedding`) and reads
 the parallel next-token logits of the last `count` positions, then biases each
@@ -548,7 +555,7 @@ Units: `TestDrafterConfigBounded`, `TestDraftTokensLengthAndRange`,
 `TestSpeculativeWithDSparkMatchesGreedy`, `TestScheduledLength`.
 
 **Sample-level attention masking.** The paper masks attention across packed
-documents during pre-training (paper §4.2.2). `data.PretrainLoader.NextSegments`
+documents during pre-training (paper Sec. 4.2.2). `data.PretrainLoader.NextSegments`
 and `data.SFTLoader.NextSegments` emit a per-token segment id (a new segment at
 every packed document/conversation, and a final segment for SFT padding), which
 `Transformer.TrainForwardSegments` threads into the attention kernels through
@@ -565,7 +572,7 @@ Because a compression block would otherwise mix two documents, the
 row, and the dense/sparse compressed attention filters out cross-segment blocks,
 including the sparse indexer selection and its distillation target. Tokens that
 fall after a boundary inside a straddling block are therefore represented only
-by the local sliding-window branch, not the global compressed cache — no
+by the local sliding-window branch, not the global compressed cache -- no
 cross-document information ever leaks.
 
 Units: `kernels/simd` `TestAttentionSegmentMaskParity`; `model`
@@ -575,12 +582,12 @@ SWA); `data` `TestPretrainLoaderSegmentsAlignWithBOS`; `trainer`
 `TestTrainStepSegmentsFinite`.
 
 **Reasoning-effort control.** The paper conditions RL on a scalar effort level
-b∈[1,100] with an exponential reasoning-length penalty (paper §5.1.4).
+bin[1,100] with an exponential reasoning-length penalty (paper Sec. 5.1.4).
 `tokenizer.ReasoningEffortInstruction` renders the system-prompt instruction,
 and a conversation's `Extra["effort"]` (or the server's `reasoning_effort`
 field) injects it into any render. `trainer.ExponentialTokenPenalty` implements
-`-min(C_max, k(b)·ℓ/L_norm)` with `k(b) = k0·exp(-(b-b_min)/τ)`,
-`τ = λ·meanΔb`. `cmd/chat_rl` samples each effort level as its own GRPO subgroup
+`-min(C_max, k(b)*l/L_norm)` with `k(b) = k0*exp(-(b-b_min)/tau)`,
+`tau = lambda*mean(Delta b)`. `cmd/chat_rl` samples each effort level as its own GRPO subgroup
 (`--efforts`, `--samples-per-effort`, `--penalty-k0/lambda/cap/norm`), adds the
 length penalty to the task reward, and mean-centers advantages within each
 `(prompt, effort)` subgroup. `cmd/chat_cli --effort` and the server's
@@ -596,7 +603,7 @@ supports a first-class reasoning trace delimited by two special tokens,
 so existing token ids are unchanged:
 
 ```
-<|assistant_start|> <|think_start|> …reasoning… <|think_end|> …answer… <|assistant_end|>
+<|assistant_start|> <|think_start|> ...reasoning... <|think_end|> ...answer... <|assistant_end|>
 ```
 
 `tokenizer.Message.Thinking` and the `"thinking"` `MessagePart` render the block
@@ -609,7 +616,7 @@ separately. The server exposes it as the request fields `thinking` /
 streamed deltas). `cmd/chat_cli --thinking [--thinking-budget N]` prints the
 reasoning to standard error while streaming the answer to standard output.
 `cmd/chat_rl --thinking` rolls out a trace and uses
-`tokenizer.ReasoningTokenCount` (the ℓ of the effort penalty) instead of the
+`tokenizer.ReasoningTokenCount` (the reasoning length of the effort penalty) instead of the
 full completion length.
 
 Units: `tokenizer.TestRenderConversationThinking`,
@@ -620,7 +627,7 @@ Units: `tokenizer.TestRenderConversationThinking`,
 `TestChatCompletionsStreamingReasoningContent`.
 
 **Model merging for RL re-initialization.** Successive RL runs can be
-reinitialized by merging checkpoints from different runs (paper §5.1.2).
+reinitialized by merging checkpoints from different runs (paper Sec. 5.1.2).
 `checkpoint.MergeParameters` validates matching names/shapes and returns a
 weighted average (uniform by default, normalized to sum one), and
 `checkpoint.MergeFiles` loads, verifies the model configs match, merges, and
@@ -636,12 +643,12 @@ Units: `model/checkpoint.TestMergeParametersUniform`,
 ## 8. Low-bit weights and KV were rejected
 
 The paper's headline KV win is FP4 for the main KV cache and FP4 QAT for indexer
-queries/keys (paper §2.4.4). gonano does **not** do this. An int8 experiment was
+queries/keys (paper Sec. 2.4.4). gonano does **not** do this. An int8 experiment was
 slower than float32 on this platform because the Go `simd` package has no
-vectorized int8→float32 conversion and decode is compute-bound here; the backend
+vectorized int8->float32 conversion and decode is compute-bound here; the backend
 is therefore float32-only. The float32-compatible substitutes for the paper's
-low-bit indexer acceleration are the vectorized kernels in §4 and the low-rank
-factorizations in §5. Do not expect per-token KV bytes to match the paper's
+low-bit indexer acceleration are the vectorized kernels in Sec. 4 and the low-rank
+factorizations in Sec. 5. Do not expect per-token KV bytes to match the paper's
 890 bytes/token.
 
 > **Locked-in decision.** QAT and a quantized KV cache are out of scope by
@@ -663,9 +670,9 @@ feature flags at all.
 
 | Preset | Default | What it enables |
 |---|---|---|
-| `flash` | ✓ | HCA compression (ratio 4), CSA sparse attention (top-k 8), hierarchical indexer (pool 8), cross-layer reuse (`FRU`), SWA (128), CED, SwiGLU DeepSeekMoE, GQA, head-wise Muon, partial RoPE, Sinkhorn embeddings/head |
+| `flash` | yes | HCA compression (ratio 4), CSA sparse attention (top-k 8), hierarchical indexer (pool 8), cross-layer reuse (`FRU`), SWA (128), CED, SwiGLU DeepSeekMoE, GQA, head-wise Muon, partial RoPE, Sinkhorn embeddings/head |
 | `latent` | | Absorbed MLA + SwiGLU DeepSeekMoE + GQA + partial RoPE + Sinkhorn |
-| `dense` | | The historical dense nanochat decoder (full attention, ReLU² MLP, no MoE) |
+| `dense` | | The historical dense nanochat decoder (full attention, ReLU^2 MLP, no MoE) |
 
 The remaining flags are the ordinary training controls, not architecture
 switches: `--depth`, `--max-seq-len`, `--vocab-size`, `--num-iterations`,
@@ -696,7 +703,7 @@ groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, preset.UsesSinkhorn()
 `Config.ApplyPreset` only turns *on* disabled options, so an explicit
 configuration is never silently broadened. MoE shape (`NumExperts`,
 `NumExpertsPerToken`, `ExpertHiddenDim`, `SharedExpertHiddenDim`) defaults to
-`max(8, 2·depth)` experts, top-2, with an expert width equal to the embedding
+`max(8, 2*depth)` experts, top-2, with an expert width equal to the embedding
 width. `Config.Validate` still enforces the cross-field rules (sparse requires
 compression, CED requires compression + SWA, MLA excludes the compression
 stack and head-wise Muon, etc.).
@@ -755,10 +762,10 @@ GOEXPERIMENT=simd go test -race ./...
 
 For completeness, the paper components that are out of scope here:
 
-- **FP4 main KV cache and FP4 indexer QAT** (see §8).
+- **FP4 main KV cache and FP4 indexer QAT** (see Sec. 8).
 - **Engram conditional memory and Single-Pass mHC.** gonano is a
   single-residual-stream model; these are architectural components of the 552B
-  model and do not map onto it. The MoE backbone *is* implemented (§2.7).
+  model and do not map onto it. The MoE backbone *is* implemented (Sec. 2.7).
 - **EPD disaggregation and the GPU kernel fusions** (Mega-* kernels, FlashMLA):
   single-process CPU serving only.
 

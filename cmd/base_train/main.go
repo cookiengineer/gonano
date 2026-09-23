@@ -33,6 +33,7 @@ func main() {
 	dataFormat := flag.String("data-format", "parquet", "data format: parquet|markdown")
 	baseDir := flag.String("base-dir", "", "checkpoint/tokenizer directory (default ~/.cache/gonano)")
 	modelTag := flag.String("model-tag", "", "checkpoint directory name (default d<depth>)")
+	domain := flag.String("domain", "", "domain name for the domain model bank; writes to domains/<name>/... and records it in the checkpoint")
 	sampleMasking := flag.Bool("sample-masking", true, "mask attention across packed documents (DeepSeek-V4.1 §4.2.2)")
 	flag.Parse()
 
@@ -129,6 +130,11 @@ func main() {
 
 	// Training loop.
 	outputDir := filepath.Join(*baseDir, "base_checkpoints", modelTagOrDepth(*modelTag, *depth))
+	if *domain != "" {
+		// Domain models live under domains/<name>/ so the bank manifest can
+		// find them without colliding with the monolithic base checkpoints.
+		outputDir = filepath.Join(*baseDir, "domains", *domain, "base_checkpoints", modelTagOrDepth(*modelTag, *depth))
+	}
 	os.MkdirAll(outputDir, 0o755)
 
 	logger.Info("training", "depth", *depth, "dim", configuration.EmbedDim, "params", model.TotalParams(), "steps", *numIterations)
@@ -149,11 +155,14 @@ func main() {
 
 	// Save the final checkpoint.
 	meta := checkpoint.Meta{Step: *numIterations, ModelConfig: configuration}
+	if *domain != "" {
+		meta.UserConfig = map[string]any{"domain": *domain}
+	}
 	if err := checkpoint.Save(checkpoint.ModelPath(outputDir, *numIterations), meta, model.NamedParameters()); err != nil {
 		logger.Error("save checkpoint", "err", err)
 		os.Exit(1)
 	}
-	logger.Info("saved checkpoint", "path", checkpoint.ModelPath(outputDir, *numIterations))
+	logger.Info("saved checkpoint", "path", checkpoint.ModelPath(outputDir, *numIterations), "domain", *domain)
 }
 
 func modelTagOrDepth(tag string, depth int) string {

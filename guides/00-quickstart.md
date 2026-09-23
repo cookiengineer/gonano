@@ -1,8 +1,8 @@
-# gonano — Quick Start (ArchLinux)
+# gonano -- Quick Start (ArchLinux)
 
 A copy-pasteable path from a fresh ArchLinux host to a talking model. Every
 command assumes a normal user shell; run them in order. The full guide lives in
-[01-training.md](01-training.md) — this file gets you set up and proves the
+[01-training.md](01-training.md) -- this file gets you set up and proves the
 toolchain works end to end.
 
 ---
@@ -72,8 +72,8 @@ go run ./cmd/chat_cli \
   --max-tokens 24
 ```
 
-The output will be near-gibberish (it's a 20-step toy model) — the point is
-that **the whole pipeline works**: train → save → load → inference.
+The output will be near-gibberish (it's a 20-step toy model) -- the point is
+that **the whole pipeline works**: train -> save -> load -> inference.
 
 > The default `--preset flash` turns on the full DeepSeek-V4.1-Flash stack
 > (KV compression, sparse attention, cross-layer reuse, sliding-window
@@ -134,9 +134,11 @@ go run ./cmd/chat_cli --model d4.gguf --prompt "hello there"
 
 ## Next
 
-- [01 — Training guide](01-training.md) (data, tokenizer, scaling laws)
-- [02 — Export guide](02-export.md) (`.gn` and GGUF)
-- [03 — Deployment guide](03-deployment.md) (loading + inference, Go API)
-- [04 — Debugging guide](04-debugging.md) (symptom → file to look at)
-- [05 — DeepSeek-V4.1-Flash optimizations](05-deepseek-v4.1-optimizations.md)
-- [06 — Numeric precision](06-numeric-precision.md) (float32 requirement + low-bit decisions)
+- [01 -- Training guide](01-training.md) (data, tokenizer, scaling laws, per-domain training)
+- [02 -- Export guide](02-export.md) (`.gn` and GGUF)
+- [03 -- Deployment guide](03-deployment.md) (loading + inference, Go API, bank serving)
+- [04 -- Debugging guide](04-debugging.md) (symptom -> file to look at)
+- [05 -- DeepSeek-V4.1-Flash optimizations](05-deepseek-v4.1-optimizations.md)
+- [06 -- Numeric precision](06-numeric-precision.md) (float32 requirement + low-bit decisions)
+- [07 -- Mixture-of-Experts Sharding](07-moe-sharding.md) (domain bank + meta-router)
+- [08 -- Benchmarking](08-benchmarking.md) (prefill/decode numbers and how to reproduce them)

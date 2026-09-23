@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/cookiengineer/gonano/inference"
@@ -52,17 +53,22 @@ func (server *Server) handleChatCompletions(writer http.ResponseWriter, request 
 	prompt := server.renderMessages(chatRequest.Messages, chatRequest.Tools, chatRequest.ReasoningEffort, chatRequest.Thinking)
 	genOptions := resolveOptions(chatRequest, server.Model.Config.SequenceLen)
 
+	generator, domains := server.selectGenerator(chatRequest, prompt)
+	if len(domains) > 0 {
+		writer.Header().Set("X-Gonano-Domains", strings.Join(domains, ","))
+	}
+
 	if chatRequest.Stream {
-		server.streamCompletion(writer, prompt, chatRequest, genOptions)
+		server.streamCompletion(writer, generator, prompt, chatRequest, genOptions)
 		return
 	}
-	server.complete(writer, prompt, chatRequest, genOptions)
+	server.complete(writer, generator, prompt, chatRequest, genOptions)
 }
 
 // complete writes a single non-streaming chat completion response.
-func (server *Server) complete(writer http.ResponseWriter, prompt []int, chatRequest ChatCompletionRequest, genOptions generationOptions) {
+func (server *Server) complete(writer http.ResponseWriter, generator tokenGenerator, prompt []int, chatRequest ChatCompletionRequest, genOptions generationOptions) {
 	thinking := resolveThinking(chatRequest)
-	rows := server.generate(prompt, genOptions.temperature, genOptions.topK, genOptions.maxTokens, genOptions.numSamples, genOptions.seed, thinking)
+	rows := server.generate(generator, prompt, genOptions.temperature, genOptions.topK, genOptions.maxTokens, genOptions.numSamples, genOptions.seed, thinking)
 
 	choices := make([]Choice, len(rows))
 	var totalPrompt, totalCompletion int
@@ -86,7 +92,7 @@ func (server *Server) complete(writer http.ResponseWriter, prompt []int, chatReq
 }
 
 // streamCompletion writes a server-sent-events stream of completion chunks.
-func (server *Server) streamCompletion(writer http.ResponseWriter, prompt []int, chatRequest ChatCompletionRequest, genOptions generationOptions) {
+func (server *Server) streamCompletion(writer http.ResponseWriter, generator tokenGenerator, prompt []int, chatRequest ChatCompletionRequest, genOptions generationOptions) {
 	flusher, ok := writer.(http.Flusher)
 	if !ok {
 		http.Error(writer, "streaming unsupported", http.StatusInternalServerError)
@@ -126,7 +132,7 @@ func (server *Server) streamCompletion(writer http.ResponseWriter, prompt []int,
 	finished := make([]bool, genOptions.numSamples)
 	completion := 0
 
-	generate := server.Engine.GenerateWith(prompt, genOptions.numSamples, genOptions.maxTokens, genOptions.temperature, genOptions.topK, genOptions.seed,
+	generate := generator.GenerateWith(prompt, genOptions.numSamples, genOptions.maxTokens, genOptions.temperature, genOptions.topK, genOptions.seed,
 		inference.GenerateOptions{Thinking: thinking.enabled || thinking.budget > 0, ThinkingBudget: thinking.budget})
 	generate(func(column, mask []int) bool {
 		for index := 0; index < genOptions.numSamples; index++ {
