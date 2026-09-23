@@ -134,3 +134,32 @@ func TestSpeculativeEligibility(t *testing.T) {
 		t.Fatal("compressed models must not speculate")
 	}
 }
+
+// TestSpeculativeWithDSparkMatchesGreedy verifies that the DSpark confidence
+// scheduler preserves exactness.
+func TestSpeculativeWithDSparkMatchesGreedy(t *testing.T) {
+	backbone, _, tokenizerImpl := testSpeculativeModel()
+	dspark := model.NewDSpark(backbone)
+	dspark.InitWeights(tensors.NewRNG(123))
+
+	engine := NewEngine(backbone, tokenizerImpl)
+	engine.DSpark = dspark
+	engine.Speculative = true
+	engine.DraftLength = 5
+
+	prompt := []int{1, 5, 2, 8, 3, 7}
+	got, _ := engine.GenerateBatch(prompt, 1, 12, 0, 0, 0)
+	assertSameTokens(t, got[0][len(prompt):], greedyReference(backbone, prompt, 12))
+}
+
+func TestScheduledLength(t *testing.T) {
+	if got := scheduledLength(nil, 0.5); got != 1 {
+		t.Fatalf("empty confidence length = %d, want 1", got)
+	}
+	if got := scheduledLength([]float32{0.9, 0.9, 0.1}, 0.5); got != 3 {
+		t.Fatalf("length = %d, want 3", got)
+	}
+	if got := scheduledLength([]float32{0.1, 0.9}, 0.5); got != 1 {
+		t.Fatalf("length = %d, want 1", got)
+	}
+}

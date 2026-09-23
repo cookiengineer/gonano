@@ -13,6 +13,7 @@ import (
 	"github.com/cookiengineer/gonano/data"
 	"github.com/cookiengineer/gonano/inference"
 	"github.com/cookiengineer/gonano/internal/logging"
+	modelpkg "github.com/cookiengineer/gonano/model"
 	"github.com/cookiengineer/gonano/model/checkpoint"
 	"github.com/cookiengineer/gonano/tokenizer"
 )
@@ -61,7 +62,11 @@ func main() {
 			logger.Error("load drafter", "err", err)
 			os.Exit(1)
 		}
-		engine.Drafter = checkpoint.LoadModel(drafterMeta, drafterParams)
+		if checkpoint.IsDSpark(drafterMeta) {
+			engine.DSpark = modelpkg.LoadDSpark(drafterMeta.ModelConfig, drafterParams)
+		} else {
+			engine.Drafter = checkpoint.LoadModel(drafterMeta, drafterParams)
+		}
 		engine.DraftLength = *draftLength
 	}
 	engine.Speculative = *speculative

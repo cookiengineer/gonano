@@ -1,7 +1,8 @@
 // Command dspark_train trains a DSpark drafter (DeepSeek-V4.1 §2.4.3): a small
-// transformer distilled from a frozen backbone, used for speculative decoding.
-// The backbone must be uncompressed, because the drafter learns from the
-// backbone's full-vocabulary logits.
+// transformer trunk distilled from a frozen backbone, plus a Markov head and a
+// confidence head trained on top of the frozen trunk. The backbone must be
+// uncompressed, because the drafter learns from the backbone's full-vocabulary
+// logits.
 package main
 
 import (
@@ -15,6 +16,7 @@ import (
 	"github.com/cookiengineer/gonano/internal/logging"
 	"github.com/cookiengineer/gonano/model"
 	"github.com/cookiengineer/gonano/model/checkpoint"
+	"github.com/cookiengineer/gonano/optimizer"
 	"github.com/cookiengineer/gonano/tensors"
 	"github.com/cookiengineer/gonano/tokenizer"
 	"github.com/cookiengineer/gonano/trainer"
@@ -24,7 +26,9 @@ func main() {
 	modelPath := flag.String("model", "", "path to the frozen backbone .gn checkpoint (required)")
 	dataDir := flag.String("data-dir", "", "directory of training data (.parquet or .md)")
 	dataFormat := flag.String("data-format", "parquet", "data format: parquet|markdown")
-	numIterations := flag.Int("num-iterations", 200, "optimization steps")
+	numIterations := flag.Int("num-iterations", 200, "trunk distillation steps")
+	headSteps := flag.Int("head-steps", 100, "head training steps")
+	headLR := flag.Float64("head-lr", 1e-3, "head learning rate")
 	deviceBatchSize := flag.Int("device-batch-size", 1, "per-step batch size")
 	distillTemperature := flag.Float64("distill-temperature", 1.0, "distillation softmax temperature")
 	outPath := flag.String("out", "", "output drafter checkpoint path")
@@ -56,10 +60,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	drafter := model.NewDrafter(backbone)
-	drafter.InitWeights(tensors.NewRNG(42))
+	dspark := model.NewDSpark(backbone)
+	dspark.InitWeights(tensors.NewRNG(42))
+	drafter := dspark.Drafter
 	logger.Info("drafter", "layers", drafter.Config.NumLayer, "dim", drafter.Config.EmbedDim,
-		"context", drafter.Config.SequenceLen, "params", drafter.TotalParams())
+		"context", drafter.Config.SequenceLen, "params", len(dspark.Parameters()))
 
 	// The drafter only ever sees SequenceLen tokens, so train on windows of
 	// exactly that length.
@@ -89,24 +94,40 @@ func main() {
 	}
 
 	loader := data.NewPretrainLoader(tokenizer, *deviceBatchSize, sequenceLen, provider, 1000)
-	groups := drafter.SetupOptimizer(0.008, 0.2, 0.02, 0.0, 0.5, false)
 
-	next := func() (*tensors.Int32s, *tensors.Int32s, bool) {
+	// Phase 1: distill the trunk from the frozen backbone.
+	trunkGroups := drafter.SetupOptimizer(0.008, 0.2, 0.02, 0.0, 0.5, false)
+	distillNext := func() (*tensors.Int32s, *tensors.Int32s, bool) {
 		inputs, _, _ := loader.Next()
 		return inputs, nil, true
 	}
-	trainer.Distill(drafter, backbone, groups, next, *numIterations, float32(*distillTemperature), func(step int, loss float32) {
+	trainer.Distill(drafter, backbone, trunkGroups, distillNext, *numIterations, float32(*distillTemperature), func(step int, loss float32) {
 		if step%20 == 0 {
-			logger.Info("dspark", "step", step, "loss", fmt.Sprintf("%.4f", loss))
+			logger.Info("dspark-trunk", "step", step, "loss", fmt.Sprintf("%.4f", loss))
 		}
 	})
+
+	// Phase 2: train the Markov and confidence heads with the trunk frozen.
+	headOptimizer := optimizer.NewMuonAdamW(dspark.SetupHeadOptimizer(float32(*headLR), 0))
+	for step := 0; step < *headSteps; step++ {
+		inputs, targets, _ := loader.Next()
+		loss := dspark.TrainHeadsStep(inputs, targets)
+		headOptimizer.Step()
+		if step%20 == 0 {
+			logger.Info("dspark-heads", "step", step, "loss", fmt.Sprintf("%.4f", loss))
+		}
+	}
 
 	if *outPath == "" {
 		*outPath = filepath.Join(*baseDir, "dspark_checkpoints", fmt.Sprintf("dspark_%06d.gn", *numIterations))
 	}
 	os.MkdirAll(filepath.Dir(*outPath), 0o755)
-	saveMeta := checkpoint.Meta{Step: *numIterations, ModelConfig: drafter.Config}
-	if err := checkpoint.Save(*outPath, saveMeta, drafter.NamedParameters()); err != nil {
+	saveMeta := checkpoint.Meta{
+		Step:        *numIterations,
+		ModelConfig: drafter.Config,
+		UserConfig:  map[string]any{"dspark": true},
+	}
+	if err := checkpoint.Save(*outPath, saveMeta, dspark.NamedParameters()); err != nil {
 		logger.Error("save drafter", "err", err)
 		os.Exit(1)
 	}

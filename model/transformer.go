@@ -141,6 +141,14 @@ func (model *Transformer) InitWeights(rng *tensors.RNG) {
 // autoregressive inference (KV-cache). Loss computation is intentionally kept
 // out of the model; callers use tensors.CrossEntropy on the returned logits.
 func (model *Transformer) Forward(indexes *tensors.Int32s, cache *KVBuffer) *tensors.Tensor {
+	logits, _ := model.forward(indexes, cache, false)
+	return logits
+}
+
+// ForwardHidden is Forward but also returns the final normalized hidden state
+// [B,T,EmbedDim] that feeds lm_head. It is used to train the DSpark confidence
+// head.
+func (model *Transformer) ForwardHidden(indexes *tensors.Int32s, cache *KVBuffer) (logits, hidden *tensors.Tensor) {
 	return model.forward(indexes, cache, false)
 }
 
@@ -155,7 +163,7 @@ func (model *Transformer) ReplaySWA(indexes *tensors.Int32s, cache *KVBuffer) {
 	model.forward(indexes, cache, true)
 }
 
-func (model *Transformer) forward(indexes *tensors.Int32s, cache *KVBuffer, replay bool) *tensors.Tensor {
+func (model *Transformer) forward(indexes *tensors.Int32s, cache *KVBuffer, replay bool) (*tensors.Tensor, *tensors.Tensor) {
 	batchSize, sequenceLength := indexes.Shape[0], indexes.Shape[1]
 	if sequenceLength > model.Config.SequenceLen {
 		panic("model: sequence longer than rotary cache")
@@ -244,7 +252,7 @@ func (model *Transformer) forward(indexes *tensors.Int32s, cache *KVBuffer, repl
 	logits := model.lmHead.Forward(activations) // [B,T,paddedVocab]
 	logits = trimVocab(logits, model.paddedVocab, model.Config.VocabSize)
 	logits = tensors.Softcap(logits, softcap)
-	return logits.Reshape(batchSize, sequenceLength, model.Config.VocabSize)
+	return logits.Reshape(batchSize, sequenceLength, model.Config.VocabSize), activations
 }
 
 // PrefillCED runs the causal encoder-decoder prefill. The encoder half

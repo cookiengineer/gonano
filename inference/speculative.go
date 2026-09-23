@@ -8,12 +8,32 @@ import (
 // defaultDraftLength is the number of tokens the drafter proposes per round.
 const defaultDraftLength = 5
 
+// defaultConfidenceThreshold is the minimum confidence for a drafted token to
+// be included in the verification block.
+const defaultConfidenceThreshold = 0.5
+
+// scheduledLength returns how many candidates to verify: the first candidate
+// plus the leading drafts whose confidence meets the threshold, at least one.
+func scheduledLength(confidences []float32, threshold float32) int {
+	limit := 1
+	for _, confidence := range confidences {
+		if confidence < threshold {
+			break
+		}
+		limit++
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	return limit
+}
+
 // speculativeEligible reports whether a request can use exact greedy
 // speculative decoding. Speculation is limited to single-row, greedy,
 // uncompressed models and must be enabled explicitly, because it does not run
 // the tool-call state machine.
 func (engine *Engine) speculativeEligible(numSamples int, temperature float32) bool {
-	return engine.Speculative && engine.Drafter != nil &&
+	return engine.Speculative && (engine.DSpark != nil || engine.Drafter != nil) &&
 		engine.Model.Config.Compression() == 1 &&
 		numSamples == 1 && temperature <= 0
 }
@@ -79,7 +99,19 @@ func (engine *Engine) speculativeGenerate(tokens []int, maxTokens int, yield fun
 		candidates = append(candidates, first)
 		if draftCount > 0 {
 			draftContext := append(append([]int(nil), sequence...), first)
-			candidates = append(candidates, engine.Drafter.DraftTokens(draftContext, draftCount)...)
+			if engine.DSpark != nil {
+				drafted, confidences := engine.DSpark.Draft(draftContext, draftCount)
+				candidates = append(candidates, drafted...)
+				threshold := engine.ConfidenceThreshold
+				if threshold <= 0 {
+					threshold = defaultConfidenceThreshold
+				}
+				if limit := scheduledLength(confidences, threshold); limit < len(candidates) {
+					candidates = candidates[:limit]
+				}
+			} else {
+				candidates = append(candidates, engine.Drafter.DraftTokens(draftContext, draftCount)...)
+			}
 		}
 		blockSize = len(candidates)
 

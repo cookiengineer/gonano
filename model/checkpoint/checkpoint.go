@@ -135,6 +135,13 @@ func decodeFloat32sFromBytes(source []byte, destination []float32) {
 	}
 }
 
+// IsDSpark reports whether a checkpoint holds a DSpark drafter rather than a
+// plain transformer.
+func IsDSpark(meta Meta) bool {
+	dspark, _ := meta.UserConfig["dspark"].(bool)
+	return dspark
+}
+
 // LoadModel reconstructs a Transformer from a checkpoint's metadata and params.
 func LoadModel(meta Meta, params map[string]*tensors.Tensor) *model.Transformer {
 	transformer := model.NewTransformer(meta.ModelConfig)

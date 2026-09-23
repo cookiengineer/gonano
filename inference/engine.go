@@ -40,6 +40,13 @@ type Engine struct {
 	// Drafter, when set alongside Speculative, enables exact greedy speculative
 	// decoding (DeepSeek-V4.1 §2.4.3) with the given draft model.
 	Drafter *model.Transformer
+	// DSpark, when set alongside Speculative, enables speculative decoding with
+	// the DSpark heads: the confidence head schedules how many drafted tokens
+	// are verified. It takes precedence over Drafter.
+	DSpark *model.DSpark
+	// ConfidenceThreshold is the minimum confidence for a drafted token to be
+	// verified. Zero uses the default of 0.5.
+	ConfidenceThreshold float32
 	// Speculative enables speculative decoding when Drafter is set. It only
 	// applies to single-row greedy requests on uncompressed models and does not
 	// run the tool-call state machine.
