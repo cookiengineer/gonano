@@ -37,6 +37,7 @@ func main() {
 		modelTag      string
 		baseDir       string
 		sampleMasking bool
+		initModel     string
 	)
 	flag.StringVar(&dataDir, "data-dir", "", "directory of training data (.parquet or .md) (required)")
 	flag.StringVar(&format, "format", "parquet", "data format: parquet|markdown")
@@ -53,6 +54,7 @@ func main() {
 	flag.StringVar(&modelTag, "model-tag", "", "checkpoint directory name (default d<depth>)")
 	flag.StringVar(&baseDir, "base-dir", "", "checkpoint/tokenizer directory (default ~/.cache/gonano)")
 	flag.BoolVar(&sampleMasking, "sample-masking", true, "mask attention across packed documents (DeepSeek-V4.1 §4.2.2)")
+	flag.StringVar(&initModel, "init-model", "", "path to a .gn checkpoint to continue pretraining from; uses that checkpoint's architecture and ignores --depth/--preset/--head-dim/--vocab-size/--max-seq-len")
 	flag.Parse()
 
 	logger := logging.Default(slog.LevelInfo)
@@ -76,11 +78,37 @@ func main() {
 	// 1) Tokenizer setup.
 	tokenizer := setupTokenizer(logger, baseDir, dataDir, format, tokenizerPath, trainTok, vocabSize, maxChars)
 
-	// 2) Model: the preset selects the whole architecture.
-	configuration := model.ConfigForPreset(preset, depth, tokenizer.VocabSize(), 64, headDim, maxSeqLen, "SSSL")
-	model := model.NewTransformer(configuration)
-	model.InitWeights(tensors.NewRNG(42))
-	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, preset.UsesSinkhorn())
+	// 2) Model: the preset selects the whole architecture, unless --init-model
+	// continues from an existing checkpoint, in which case that checkpoint's
+	// architecture is used verbatim.
+	var (
+		configuration model.Config
+		initMeta      checkpoint.Meta
+		initParams    map[string]*tensors.Tensor
+		continuing    = initModel != ""
+	)
+	if continuing {
+		meta, params, err := loadInitialCheckpoint(initModel, tokenizer.VocabSize())
+		if err != nil {
+			logger.Error("init-model", "err", err)
+			os.Exit(1)
+		}
+		initMeta, initParams = meta, params
+		configuration = meta.ModelConfig
+		maxSeqLen = configuration.SequenceLen
+	} else {
+		configuration = model.ConfigForPreset(preset, depth, tokenizer.VocabSize(), 64, headDim, maxSeqLen, "SSSL")
+	}
+
+	var transformer *model.Transformer
+	if continuing {
+		transformer = checkpoint.LoadModel(initMeta, initParams)
+		logger.Info("continuing from checkpoint", "path", initModel, "step", initMeta.Step)
+	} else {
+		transformer = model.NewTransformer(configuration)
+		transformer.InitWeights(tensors.NewRNG(42))
+	}
+	groups := transformer.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, configuration.MoEEnabled())
 
 	// 3) Data source.
 	source, err := newDocProvider(dataDir, format)
@@ -91,13 +119,13 @@ func main() {
 
 	loader := data.NewPretrainLoader(tokenizer, batchSize, maxSeqLen, source, 1000)
 	gradAccum := 1
-	trainer := trainer.NewTrainer(model, groups, gradAccum)
+	trainer := trainer.NewTrainer(transformer, groups, gradAccum)
 
 	outputDir := filepath.Join(baseDir, "base_checkpoints", tagOrDepth(modelTag, depth))
 	os.MkdirAll(outputDir, 0o755)
 
-	logger.Info("training", "depth", depth, "dim", configuration.EmbedDim, "vocab", tokenizer.VocabSize(),
-		"format", format, "params", model.TotalParams(), "steps", numIterations)
+	logger.Info("training", "layers", configuration.NumLayer, "dim", configuration.EmbedDim, "vocab", tokenizer.VocabSize(),
+		"format", format, "params", transformer.TotalParams(), "steps", numIterations, "continued", continuing)
 	for step := 0; step < numIterations; step++ {
 		var loss float32
 		if sampleMasking {
@@ -115,7 +143,7 @@ func main() {
 
 	// 4) Save.
 	meta := checkpoint.Meta{Step: numIterations, ModelConfig: configuration}
-	if err := checkpoint.Save(checkpoint.ModelPath(outputDir, numIterations), meta, model.NamedParameters()); err != nil {
+	if err := checkpoint.Save(checkpoint.ModelPath(outputDir, numIterations), meta, transformer.NamedParameters()); err != nil {
 		logger.Error("save", "err", err)
 		os.Exit(1)
 	}
@@ -188,6 +216,21 @@ func newDocProvider(dir, format string) (data.DocProvider, error) {
 		src := data.NewParquetSource(paths, 128)
 		return func() ([]string, data.State) { return src.Next() }, nil
 	}
+}
+
+// loadInitialCheckpoint loads a .gn checkpoint to continue pretraining from and
+// verifies that its vocabulary matches the tokenizer that will be used. A
+// mismatch would silently train the wrong token ids, so it is a hard error.
+func loadInitialCheckpoint(path string, expectedVocab int) (checkpoint.Meta, map[string]*tensors.Tensor, error) {
+	meta, params, err := checkpoint.Load(path)
+	if err != nil {
+		return checkpoint.Meta{}, nil, fmt.Errorf("load checkpoint %s: %w", path, err)
+	}
+	if meta.ModelConfig.VocabSize != expectedVocab {
+		return meta, nil, fmt.Errorf("checkpoint %s was trained with vocab %d but the tokenizer has %d; use the tokenizer the base model was trained with",
+			path, meta.ModelConfig.VocabSize, expectedVocab)
+	}
+	return meta, params, nil
 }
 
 func tagOrDepth(tag string, depth int) string {

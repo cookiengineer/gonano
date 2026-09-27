@@ -1,7 +1,6 @@
 package data
 
 import (
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,22 +23,55 @@ type MarkdownSource struct {
 }
 
 // NewMarkdownSource walks dir for .md files and returns a source over them.
+// Unlike filepath.WalkDir, it follows symlinked directories (and files), so a
+// corpus can be assembled from links into shared extraction trees. Visited
+// real directories are tracked to make symlink cycles terminate.
 func NewMarkdownSource(dir string, batchSize int) *MarkdownSource {
 	if batchSize <= 0 {
 		batchSize = 128
 	}
-	var paths []string
-	_ = filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
-			paths = append(paths, path)
-		}
-		return nil
-	})
+	paths := collectMarkdownFiles(dir)
 	sort.Strings(paths)
 	return &MarkdownSource{paths: paths, batchSize: batchSize, epoch: 1}
+}
+
+// collectMarkdownFiles recursively gathers .md file paths below root, following
+// symbolic links in both directions. A directory reached through more than one
+// link is traversed only once; a symlink cycle therefore terminates.
+func collectMarkdownFiles(root string) []string {
+	var paths []string
+	visited := make(map[string]bool)
+
+	var walk func(dir string)
+	walk = func(dir string) {
+		if real, err := filepath.EvalSymlinks(dir); err == nil {
+			if visited[real] {
+				return
+			}
+			visited[real] = true
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			path := filepath.Join(dir, entry.Name())
+			info, err := os.Stat(path) // follows symlinks
+			if err != nil {
+				continue
+			}
+			if info.IsDir() {
+				walk(path)
+				continue
+			}
+			if strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
+				paths = append(paths, path)
+			}
+		}
+	}
+
+	walk(root)
+	return paths
 }
 
 // NumFiles returns the number of Markdown files found.

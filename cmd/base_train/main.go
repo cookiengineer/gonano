@@ -35,6 +35,7 @@ func main() {
 	modelTag := flag.String("model-tag", "", "checkpoint directory name (default d<depth>)")
 	domain := flag.String("domain", "", "domain name for the domain model bank; writes to domains/<name>/... and records it in the checkpoint")
 	sampleMasking := flag.Bool("sample-masking", true, "mask attention across packed documents (DeepSeek-V4.1 §4.2.2)")
+	initModel := flag.String("init-model", "", "path to a .gn checkpoint to continue pretraining from; uses that checkpoint's architecture and ignores --depth/--preset/--head-dim/--vocab-size/--max-seq-len")
 	flag.Parse()
 
 	if *baseDir == "" {
@@ -65,7 +66,29 @@ func main() {
 
 	// The preset selects the whole architecture: compression, sparsity,
 	// cross-layer reuse, SWA, CED, MoE, GQA, head-wise Muon, and Sinkhorn.
-	configuration := model.ConfigForPreset(preset, *depth, tokenizer.VocabSize(), 64, *headDim, *maxSeqLen, "SSSL")
+	//
+	// When --init-model is given, the checkpoint's architecture is used verbatim
+	// so every reconstructed parameter has a matching shape; the architecture
+	// flags are ignored. The context length is taken from the checkpoint because
+	// the rotary tables are precomputed for it.
+	var (
+		configuration model.Config
+		initMeta      checkpoint.Meta
+		initParams    map[string]*tensors.Tensor
+		continuing    = *initModel != ""
+	)
+	if continuing {
+		meta, params, err := loadInitialCheckpoint(*initModel, tokenizer.VocabSize())
+		if err != nil {
+			logger.Error("init-model", "err", err)
+			os.Exit(1)
+		}
+		initMeta, initParams = meta, params
+		configuration = meta.ModelConfig
+		*maxSeqLen = configuration.SequenceLen
+	} else {
+		configuration = model.ConfigForPreset(preset, *depth, tokenizer.VocabSize(), 64, *headDim, *maxSeqLen, "SSSL")
+	}
 
 	// Preflight: refuse to build a training run that cannot fit in RAM. The
 	// trainer is fully in-RAM (weights + gradients + optimizer state plus
@@ -89,11 +112,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	model := model.NewTransformer(configuration)
-	model.InitWeights(tensors.NewRNG(42))
+	var transformer *model.Transformer
+	if continuing {
+		transformer = checkpoint.LoadModel(initMeta, initParams)
+		logger.Info("continuing from checkpoint", "path", *initModel, "step", initMeta.Step)
+	} else {
+		transformer = model.NewTransformer(configuration)
+		transformer.InitWeights(tensors.NewRNG(42))
+	}
 
-	// Optimizer groups and training hyperparameters.
-	groups := model.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, preset.UsesSinkhorn())
+	// Optimizer groups and training hyperparameters. The Sinkhorn embedding
+	// update tracks the MoE/preset family, which is read from the (possibly
+	// loaded) configuration rather than the --preset flag.
+	groups := transformer.SetupOptimizer(0.01, 0.1, 0.02, 0.28, 0.5, configuration.MoEEnabled())
 
 	// Data source.
 	var provider data.DocProvider
@@ -126,7 +157,7 @@ func main() {
 	if gradAccum < 1 {
 		gradAccum = 1
 	}
-	trainer := trainer.NewTrainer(model, groups, gradAccum)
+	trainer := trainer.NewTrainer(transformer, groups, gradAccum)
 
 	// Training loop.
 	outputDir := filepath.Join(*baseDir, "base_checkpoints", modelTagOrDepth(*modelTag, *depth))
@@ -137,7 +168,7 @@ func main() {
 	}
 	os.MkdirAll(outputDir, 0o755)
 
-	logger.Info("training", "depth", *depth, "dim", configuration.EmbedDim, "params", model.TotalParams(), "steps", *numIterations)
+	logger.Info("training", "layers", configuration.NumLayer, "dim", configuration.EmbedDim, "params", transformer.TotalParams(), "steps", *numIterations, "continued", continuing)
 	for step := 0; step < *numIterations; step++ {
 		var loss float32
 		if *sampleMasking {
@@ -158,11 +189,26 @@ func main() {
 	if *domain != "" {
 		meta.UserConfig = map[string]any{"domain": *domain}
 	}
-	if err := checkpoint.Save(checkpoint.ModelPath(outputDir, *numIterations), meta, model.NamedParameters()); err != nil {
+	if err := checkpoint.Save(checkpoint.ModelPath(outputDir, *numIterations), meta, transformer.NamedParameters()); err != nil {
 		logger.Error("save checkpoint", "err", err)
 		os.Exit(1)
 	}
 	logger.Info("saved checkpoint", "path", checkpoint.ModelPath(outputDir, *numIterations), "domain", *domain)
+}
+
+// loadInitialCheckpoint loads a .gn checkpoint to continue pretraining from and
+// verifies that its vocabulary matches the tokenizer that will be used. A
+// mismatch would silently train the wrong token ids, so it is a hard error.
+func loadInitialCheckpoint(path string, expectedVocab int) (checkpoint.Meta, map[string]*tensors.Tensor, error) {
+	meta, params, err := checkpoint.Load(path)
+	if err != nil {
+		return checkpoint.Meta{}, nil, fmt.Errorf("load checkpoint %s: %w", path, err)
+	}
+	if meta.ModelConfig.VocabSize != expectedVocab {
+		return meta, nil, fmt.Errorf("checkpoint %s was trained with vocab %d but the tokenizer has %d; use the tokenizer the base model was trained with",
+			path, meta.ModelConfig.VocabSize, expectedVocab)
+	}
+	return meta, params, nil
 }
 
 func modelTagOrDepth(tag string, depth int) string {
