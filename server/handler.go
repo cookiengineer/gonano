@@ -50,7 +50,7 @@ func (server *Server) handleChatCompletions(writer http.ResponseWriter, request 
 		return
 	}
 
-	prompt := server.renderMessages(chatRequest.Messages, chatRequest.Tools, chatRequest.ReasoningEffort, chatRequest.Thinking)
+	prompt := server.renderMessages(chatRequest.Messages, chatRequest.Tools, chatRequest.ReasoningEffort, chatRequest.Thinking, chatRequest.ThinkingStyle)
 	genOptions := resolveOptions(chatRequest, server.Model.Config.SequenceLen)
 
 	generator, domains := server.selectGenerator(chatRequest, prompt)

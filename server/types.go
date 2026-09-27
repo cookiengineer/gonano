@@ -65,6 +65,9 @@ type ChatCompletionRequest struct {
 	// ThinkingBudget caps the number of reasoning tokens. Zero or negative
 	// lets the model decide when to stop.
 	ThinkingBudget *int `json:"thinking_budget,omitempty"`
+	// ThinkingStyle optionally selects a reasoning-trace style instruction
+	// (for example "logical"). Only used when Thinking is enabled.
+	ThinkingStyle string `json:"thinking_style,omitempty"`
 }
 
 // Usage reports token counts.

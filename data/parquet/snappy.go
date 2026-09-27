@@ -68,7 +68,7 @@ func snappyDecode(src []byte) ([]byte, error) {
 				return nil, errCorrupt
 			}
 			copyLength := 4 + int((tag>>2)&0x07)
-			offset := int((tag&0xE0)<<3) | int(src[0])
+			offset := int(tag&0xE0)<<3 | int(src[0])
 			src = src[1:]
 			if offset <= 0 || offset > pos {
 				return nil, errCorrupt

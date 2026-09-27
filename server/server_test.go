@@ -33,7 +33,7 @@ func TestRenderMessagesSystemMerge(test *testing.T) {
 	ids := srv.renderMessages([]ChatMessage{
 		{Role: "system", Content: "You are helpful"},
 		{Role: "user", Content: "hi"},
-	}, nil, nil, nil)
+	}, nil, nil, nil, "")
 	got := srv.Tokenizer.Decode(ids)
 	want := "<|bos|><|user_start|>You are helpful\n\nhi<|user_end|><|assistant_start|>"
 	if got != want {
@@ -46,7 +46,7 @@ func TestRenderMessagesSystemMerge(test *testing.T) {
 func TestRenderMessagesReasoningEffort(test *testing.T) {
 	srv := testServer(test)
 	effort := 75
-	ids := srv.renderMessages([]ChatMessage{{Role: "user", Content: "hi"}}, nil, &effort, nil)
+	ids := srv.renderMessages([]ChatMessage{{Role: "user", Content: "hi"}}, nil, &effort, nil, "")
 	got := srv.Tokenizer.Decode(ids)
 	want := "<|bos|><|user_start|>Reasoning Effort: 75 (range 1--100; higher values request more thorough reasoning)\n\nhi<|user_end|><|assistant_start|>"
 	if got != want {
@@ -60,7 +60,7 @@ func TestRenderMessagesToolRoundTrip(test *testing.T) {
 		{Role: "user", Content: "what is 2+2"},
 		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_0", Type: "function", Function: FunctionCall{Name: "calculator", Arguments: "2+2"}}}},
 		{Role: "tool", Content: "4"},
-	}, nil, nil, nil)
+	}, nil, nil, nil, "")
 	got := srv.Tokenizer.Decode(ids)
 	want := "<|bos|><|user_start|>what is 2+2<|user_end|>" +
 		"<|assistant_start|><|tool_start|>2+2<|tool_end|><|assistant_end|>" +
@@ -90,7 +90,7 @@ func testThinkingServer(test *testing.T) *Server {
 func TestRenderMessagesThinking(test *testing.T) {
 	srv := testThinkingServer(test)
 	enabled := true
-	got := srv.Tokenizer.Decode(srv.renderMessages([]ChatMessage{{Role: "user", Content: "hi"}}, nil, nil, &enabled))
+	got := srv.Tokenizer.Decode(srv.renderMessages([]ChatMessage{{Role: "user", Content: "hi"}}, nil, nil, &enabled, ""))
 	if !strings.HasSuffix(got, "<|assistant_start|><|think_start|>") {
 		test.Fatalf("enabled decoded = %q, want think_start suffix", got)
 	}
@@ -98,7 +98,7 @@ func TestRenderMessagesThinking(test *testing.T) {
 		test.Fatalf("missing enabled instruction: %q", got)
 	}
 	disabled := false
-	gotDisabled := srv.Tokenizer.Decode(srv.renderMessages([]ChatMessage{{Role: "user", Content: "hi"}}, nil, nil, &disabled))
+	gotDisabled := srv.Tokenizer.Decode(srv.renderMessages([]ChatMessage{{Role: "user", Content: "hi"}}, nil, nil, &disabled, ""))
 	if strings.Contains(gotDisabled, "<|think_start|>") {
 		test.Fatalf("disabled render primed think_start: %q", gotDisabled)
 	}
@@ -112,7 +112,7 @@ func TestRenderMessagesReasoningContentReplay(test *testing.T) {
 	got := srv.Tokenizer.Decode(srv.renderMessages([]ChatMessage{
 		{Role: "user", Content: "hi"},
 		{Role: "assistant", ReasoningContent: "thinking", Content: "answer"},
-	}, nil, nil, nil))
+	}, nil, nil, nil, ""))
 	want := "<|assistant_start|><|think_start|>thinking<|think_end|>answer<|assistant_end|>"
 	if !strings.Contains(got, want) {
 		test.Fatalf("decoded = %q, want it to contain %q", got, want)

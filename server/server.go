@@ -301,7 +301,7 @@ func (server *Server) generate(generator tokenGenerator, prompt []int, temperatu
 // for the assistant to complete. thinking is the optional request field: when
 // non-nil it selects the thinking-mode instruction, and when enabled the
 // assistant turn is primed with <|think_start|>.
-func (server *Server) renderMessages(messages []ChatMessage, tools []ToolDef, reasoningEffort *int, thinking *bool) []int {
+func (server *Server) renderMessages(messages []ChatMessage, tools []ToolDef, reasoningEffort *int, thinking *bool, thinkingStyle string) []int {
 	tokenizerImpl := server.Tokenizer
 	ids := []int{tokenizerImpl.BOSTokenID()}
 
@@ -311,6 +311,11 @@ func (server *Server) renderMessages(messages []ChatMessage, tools []ToolDef, re
 	}
 	if thinking != nil {
 		instructions = append(instructions, tokenizer.ThinkingInstruction(*thinking))
+		if *thinking {
+			if instruction := tokenizer.ThinkingStyleInstruction(thinkingStyle); instruction != "" {
+				instructions = append(instructions, instruction)
+			}
+		}
 	}
 	if len(instructions) > 0 {
 		messages = append([]ChatMessage{{Role: "system", Content: strings.Join(instructions, "\n")}}, messages...)

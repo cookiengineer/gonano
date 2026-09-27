@@ -22,8 +22,16 @@ func main() {
 	maxSeqLen := flag.Int("max-seq-len", 512, "max sequence length")
 	outPath := flag.String("out", "", "output checkpoint path")
 	baseDir := flag.String("base-dir", "", "tokenizer directory")
+	dataDir := flag.String("data-dir", "", "JSONL conversation file or directory (reasoning traces); empty uses the synthetic demo set")
+	dataFormat := flag.String("data-format", "jsonl", "conversation data format (jsonl)")
+	thinkingStyle := flag.String("thinking-style", "", "optional thinking style instruction (e.g. logical); applied to every loaded conversation")
 	domain := flag.String("domain", "", "domain name for the model bank; recorded in the checkpoint (default output goes to domains/<name>/chatsft_checkpoints/)")
 	flag.Parse()
+
+	if *dataFormat != "jsonl" {
+		fmt.Fprintln(os.Stderr, "chat_sft: unsupported --data-format (only jsonl)")
+		os.Exit(1)
+	}
 
 	logger := logging.Default(slog.LevelInfo)
 	if *modelPath == "" {
@@ -45,18 +53,12 @@ func main() {
 	}
 	model := checkpoint.LoadModel(meta, params)
 
-	// Synthetic conversation provider for demonstration; a production setup
-	// loads SmolTalk/MMLU/GSM8K via the tasks package.
-	conversations := []*tokenizerpkg.Conversation{
-		{Messages: []tokenizerpkg.Message{{Role: "user", Content: "hi"}, {Role: "assistant", Content: "hello"}}},
-		{Messages: []tokenizerpkg.Message{{Role: "user", Content: "how are you"}, {Role: "assistant", Content: "fine thanks"}}},
+	provider, closeSource, err := conversationProvider(*dataDir, *batchSize, *thinkingStyle, logger)
+	if err != nil {
+		logger.Error("open conversations", "err", err)
+		os.Exit(1)
 	}
-	index := 0
-	provider := func() ([]*tokenizerpkg.Conversation, bool) {
-		conversation := conversations[index%len(conversations)]
-		index++
-		return []*tokenizerpkg.Conversation{conversation}, true
-	}
+	defer closeSource()
 	loader := data.NewSFTLoader(tokenizer, *batchSize, *maxSeqLen, provider, 100)
 
 	groups := model.SetupOptimizer(0.008, 0.2, 0.02, 0.0, 0.5, true)
@@ -84,4 +86,45 @@ func main() {
 		}
 		logger.Info("saved SFT checkpoint", "path", *outPath, "domain", *domain)
 	}
+}
+
+// conversationProvider returns the SFT conversation provider. When dataDir is
+// empty it falls back to the synthetic demonstration set; otherwise it streams
+// the JSONL reasoning conversations, optionally tagging each with a thinking
+// style instruction.
+func conversationProvider(dataDir string, batchSize int, thinkingStyle string, logger *slog.Logger) (data.ConvProvider, func(), error) {
+	if dataDir == "" {
+		conversations := []*tokenizerpkg.Conversation{
+			{Messages: []tokenizerpkg.Message{{Role: "user", Content: "hi"}, {Role: "assistant", Content: "hello"}}},
+			{Messages: []tokenizerpkg.Message{{Role: "user", Content: "how are you"}, {Role: "assistant", Content: "fine thanks"}}},
+		}
+		index := 0
+		provider := func() ([]*tokenizerpkg.Conversation, bool) {
+			conversation := conversations[index%len(conversations)]
+			index++
+			return []*tokenizerpkg.Conversation{conversation}, true
+		}
+		return provider, func() {}, nil
+	}
+
+	source, err := data.OpenConversations(dataDir, batchSize)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	provider := func() ([]*tokenizerpkg.Conversation, bool) {
+		batch, ok := source.Next()
+		if ok && thinkingStyle != "" {
+			for _, conversation := range batch {
+				if conversation.Extra == nil {
+					conversation.Extra = map[string]any{}
+				}
+				conversation.Extra["thinking_style"] = thinkingStyle
+			}
+		}
+		if err := source.Err(); err != nil {
+			logger.Error("conversation source", "err", err)
+		}
+		return batch, ok
+	}
+	return provider, func() { source.Close() }, nil
 }

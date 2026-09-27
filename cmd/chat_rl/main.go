@@ -29,6 +29,7 @@ func main() {
 	samplesPerEffort := flag.Int("samples-per-effort", 4, "rollouts per effort level per example")
 	thinking := flag.Bool("thinking", false, "roll out an explicit <|think_start|> reasoning trace")
 	thinkingBudget := flag.Int("thinking-budget", 0, "cap reasoning tokens per rollout (0 lets the model decide)")
+	formatReward := flag.Float64("format-reward", 0.1, "reward bonus for a well-formed reasoning trace (0 disables)")
 	penaltyK0 := flag.Float64("penalty-k0", 0.1, "basic length-penalty coefficient at the minimum effort")
 	penaltyLambda := flag.Float64("penalty-lambda", 1.0, "rate of exponential penalty decay")
 	penaltyCap := flag.Float64("penalty-cap", 0.5, "maximum length deduction per trajectory")
@@ -104,7 +105,9 @@ func main() {
 			rollouts, _ := engine.GenerateBatchWith(prompt, *numSamples, 32, 1.0, 50, uint64(step), generateOptions)
 			for _, rollout := range rollouts {
 				completion := tokenizer.Decode(rollout[len(prompt):])
-				rewards = append(rewards, gsm8k.Reward(conversation, completion))
+				reward := gsm8k.Reward(conversation, completion) +
+					formatTraceReward(tokenizer, rollout, *thinking, float32(*formatReward))
+				rewards = append(rewards, reward)
 				results = append(results, rollout)
 				promptLengths = append(promptLengths, len(prompt))
 			}
@@ -119,6 +122,7 @@ func main() {
 					completion := tokenizer.Decode(rollout[len(prompt):])
 					reward := gsm8k.Reward(conversation, completion)
 					reward += trainer.ExponentialTokenPenalty(effort, reasoningLength(rollout, len(prompt)), penaltyConfig)
+					reward += formatTraceReward(tokenizer, rollout, *thinking, float32(*formatReward))
 					rewards = append(rewards, reward)
 					results = append(results, rollout)
 					promptLengths = append(promptLengths, len(prompt))
@@ -214,6 +218,31 @@ func parseEfforts(spec string) []int {
 		}
 	}
 	return efforts
+}
+
+// formatTraceReward returns a small bonus when a thinking rollout produced a
+// well-formed, non-empty reasoning trace. It is deliberately format-only (no
+// phrase matching) so it cannot be gamed by a fixed string.
+func formatTraceReward(tok *tokenizer.Tokenizer, rollout []int, thinking bool, bonus float32) float32 {
+	if !thinking || bonus == 0 {
+		return 0
+	}
+	if tok.ReasoningTokenCount(rollout) == 0 {
+		return 0
+	}
+	if !containsToken(rollout, tok.EncodeSpecial("<|think_end|>")) {
+		return 0
+	}
+	return bonus
+}
+
+func containsToken(ids []int, target int) bool {
+	for _, id := range ids {
+		if id == target {
+			return true
+		}
+	}
+	return false
 }
 
 func int32sFrom(rows [][]int) *tensors.Int32s {

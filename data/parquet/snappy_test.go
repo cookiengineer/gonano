@@ -65,6 +65,28 @@ func TestSnappyCopy2(tests *testing.T) {
 	}
 }
 
+// TestSnappyCopy1HighOffsetBits guards against a uint8 shift that truncated the
+// high bits of a 1-byte-offset copy, breaking any offset above 255.
+func TestSnappyCopy1HighOffsetBits(tests *testing.T) {
+	lit := bytes.Repeat([]byte("a"), 256)
+	raw := []byte{0x84, 0x02} // uncompressed length 260 (varint)
+	raw = append(raw, 0xF0)   // literal tag: 60 -> 1-byte length follows
+	raw = append(raw, 0xFF)   // length-1 = 255
+	raw = append(raw, lit...)
+	// Copy 4 bytes from offset 256: type 1, offset high bits = 1 (bit 8).
+	raw = append(raw, 0x21, 0x00)
+	out, err := snappyDecode(raw)
+	if err != nil {
+		tests.Fatalf("snappyDecode: %v", err)
+	}
+	if len(out) != 260 {
+		tests.Fatalf("length %d, want 260", len(out))
+	}
+	if !bytes.Equal(out, append(append([]byte(nil), lit...), 'a', 'a', 'a', 'a')) {
+		tests.Fatal("copy with high offset bits decoded incorrectly")
+	}
+}
+
 func TestSnappyRoundtrip(tests *testing.T) {
 	// A manually compressed stream: "the quick brown fox" with a trailing copy.
 	lit := []byte("the quick brown fox")

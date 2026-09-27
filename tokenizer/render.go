@@ -28,6 +28,41 @@ func (tokenizer *Tokenizer) ThinkingInstruction(enabled bool) string {
 	return ThinkingInstruction(enabled)
 }
 
+// ThinkingStyleLogical is the identifier of the built-in logical-analysis
+// reasoning style.
+const ThinkingStyleLogical = "logical"
+
+// ThinkingStyleInstruction returns the soft style instruction prepended to the
+// system prompt when a conversation requests a thinking style. The built-in
+// "logical" style asks the model to state what the user wants, reason in the
+// first person, question its assumptions, and name logical fallacies. An
+// unknown non-empty style is used verbatim, so callers can supply their own.
+func ThinkingStyleInstruction(style string) string {
+	switch strings.ToLower(strings.TrimSpace(style)) {
+	case ThinkingStyleLogical:
+		return "While reasoning, start by stating what the user wants, think in the first person " +
+			"(\"I think...\", \"Let me check...\"), question your assumptions, and call out any " +
+			"logical fallacies or ambiguities you notice."
+	case "":
+		return ""
+	default:
+		return style
+	}
+}
+
+// thinkingStyle reads the optional "thinking_style" entry from a conversation's
+// Extra metadata.
+func thinkingStyle(conv *Conversation) (string, bool) {
+	if conv == nil || conv.Extra == nil {
+		return "", false
+	}
+	style, ok := conv.Extra["thinking_style"].(string)
+	if !ok || strings.TrimSpace(style) == "" {
+		return "", false
+	}
+	return style, true
+}
+
 // thinkingEnabled reads the optional "thinking" entry from a conversation's
 // Extra metadata. The second result reports whether the entry was present.
 func thinkingEnabled(conv *Conversation) (bool, bool) {
@@ -144,6 +179,13 @@ func (tokenizer *Tokenizer) RenderConversation(conv *Conversation, maxTokens int
 	}
 	if enabled, ok := thinkingEnabled(conv); ok {
 		instructions = append(instructions, ThinkingInstruction(enabled))
+		if enabled {
+			if style, styleOK := thinkingStyle(conv); styleOK {
+				if instruction := ThinkingStyleInstruction(style); instruction != "" {
+					instructions = append(instructions, instruction)
+				}
+			}
+		}
 	}
 	if len(instructions) > 0 {
 		instruction := strings.Join(instructions, "\n")

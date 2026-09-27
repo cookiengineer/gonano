@@ -7,8 +7,8 @@ optimized for long-context inference and training on CPUs with `AVX-512`.
 
 Everything is **float32**, parallelism is goroutine-per-op, and the model is a
 DeepSeek-V4.1-style transformer. On top of that, gonano introduces
-**Mixture-of-Experts Sharding**: a way to run a library of independently trained
-domain models that are loaded on demand.
+**Mixture-of-Experts Sharding**, which is a way to run a library of independently
+trained domain models that are loaded on demand.
 
 ---
 
@@ -31,24 +31,20 @@ expert models**, one per semantic domain:
   expert runs and their next-token logits are combined into one distribution, so
   a single token is still sampled once.
 
-**Why.** The goal is dedicated, scalable CPU compute per expert model while
-using only the RAM that the active experts actually need. A desktop can hold a
-large on-disk library of domain experts and pull in only the relevant ones for a
-request; adding a domain means training and registering one more expert, not
-growing one giant model. Independent experts also mean independent scheduling:
-each expert is a full model that can be run on its own share of the CPU.
+The goal is dedicated, scalable CPU compute per expert model while using only the
+RAM that the active experts actually need. A desktop can hold a large on-disk library
+of domain experts and pull in only the relevant ones for a request.
 
-> **Not the same as DeepSeekMoE.** DeepSeekMoE (implemented here too) routes
-> *within* a layer's feed-forward block to fine-grained experts that all live in
-> one model. Mixture-of-Experts Sharding routes *between whole models* at the
-> bank level. The two compose: a bank expert can itself be a DeepSeekMoE model.
+Adding a domain means training and registering one more expert, not growing one
+giant model. Independent experts also mean independent scheduling. Each expert
+is a full model that can be run on its own share of the CPU.
 
 See [guides/07-moe-sharding.md](guides/07-moe-sharding.md) for the full design
 and the end-to-end workflow.
 
 ---
 
-## The model
+## The Model
 
 gonano's transformer is a decoder-only stack with:
 
@@ -113,7 +109,7 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"model":"gonano","messages":[{"role":"user","content":"what is 2+2?"}]}'
 ```
 
-### Domain bank quickstart
+### Domain Bank Quickstart
 
 Train one expert per domain, train the meta-router, register the bank, and serve
 with routing:
@@ -143,6 +139,61 @@ go run ./cmd/server --bank ~/.cache/gonano/bank/bank.json --max-domains 2 --addr
 
 The router's choice is returned in the `X-Gonano-Domains` response header, and
 requesting a domain by name in the `model` field pins it.
+
+---
+
+## Thinking Quickstart and Reasoning Traces
+
+"Thinking" in gonano is a token-level trace delimited by `<|think_start|>` / `<|think_end|>`
+and returned as `reasoning_content`. It is **not** a KV self-query. The model simply generates
+the trace autoregressively. Because of that, the behaviour is learned from data
+at specific training steps, and the steps are not interchangeable.
+
+| Step         | Command                              | What it teaches                                                                                                                     | Required?    |
+|:-------------|:-------------------------------------|:------------------------------------------------------------------------------------------------------------------------------------|:-------------|
+| Pretraining  | `base_train`                         | Style prior: "The user wants…", "I think…", fallacy-checking. Raw trace text is added to the base corpus.                           | Optional     |
+| **SFT**      | `chat_sft`                           | Trace: `Message.Thinking` is rendered as a real `<|think_start|>...<|think_end|>` block and tokens are supervised by the loss mask. | **Required** |
+| RL           | `chat_rl --thinking --format-reward` | Trace sharpening: The soft format bonus rewards a well-formed and non-empty trace. The effort penalty controls its length.          | Optional     |
+| Distillation | `chat_opd`                           | Transfers a reasoning-capable teacher's distribution into the student.                                                              | Optional     |
+
+The Pretraining alone is not enough. The pretraining loader tokenizes with `Tokenizer.Encode`,
+which does **not** recognise `<|think_start|>`. Control tokens are only produced by `EncodeSpecial`.
+So the base corpus teaches the reasoning *style* but can never teach the delimiter protocol. Only
+SFT (`RenderConversation` calls `addThinking`) emits the real tokens and supervises them.
+
+### End-to-end Training Workflow
+
+[gonano-school](https://github.com/cookiengineer/gonano-school)'s `cmd/reasoning` downloads
+DeepSeek-R1 trace datasets and writes two artifacts. The flattened Markdown for the base corpus
+and a JSONL conversation set for SFT.
+
+The required sources are listed in `gonano-school/datasets/reasoning.json`. Running `cmd/reasoning`
+with no arguments ingests all of them. The reader handles each dataset's schema automatically.
+Pointing `--data-dir` at the `datasets/reasoning` directory trains them together, wherein
+each `.jsonl` is read in separate turns.
+
+```bash
+# In gonano-school: download traces, write Markdown + JSONL.
+go run ./cmd/reasoning --limit 20000;
+
+# In gonano: style prior (optional), then the trace itself (required).
+go run ./cmd/base_train --depth 20 --data-dir ../gonano-school/datasets/base;
+
+go run ./cmd/chat_sft \
+  --model ~/.cache/gonano/base_checkpoints/d20/model_final.gn \
+  --data-dir ../gonano-school/datasets/reasoning \
+  --thinking-style logical --max-seq-len 4096;
+```
+
+Context length: R1 traces are pretty long, so `--max-seq-len` must match (or be within) the base model's
+trained context, and must be large enough for whole traces. The SFT loader pads, so a trace longer than
+the row simply does not fit and is skipped. Train the base model at the same context you SFT at.
+
+The JSONL rows carry the trace in the `thinking` field with Magpie's `intent` prepended, so traces open
+with `The user wants...`. The `chat_sft --thinking-style logical` prepends the matching style instruction,
+and the server exposes the same control as the `thinking_style` request field, so training and serving
+stay aligned. `evaluator.EvaluateTraceFormat` scores how many completions
+produce a non-empty, closed trace.
 
 ---
 
@@ -203,19 +254,18 @@ GOEXPERIMENT=simd go test -short ./...   # skips the slow end-to-end test
 
 The architecture is inspired by, and links directly to:
 
-- **DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression** --
-  <https://arxiv.org/abs/2609.19969> (the long-context attention and KV stack).
-- **DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts
-  Language Models** -- <https://arxiv.org/abs/2401.06066> (in-model routed
-  experts).
-- **Bag of Tricks for Efficient Text Classification (fastText)** --
-  <https://arxiv.org/abs/1607.01759> (the n-gram fast path).
-- **SetFit: Efficient Few-Shot Learning Without Prompts** --
-  <https://arxiv.org/abs/2209.11055> (encoder plus classification head).
-- **Efficient Intent Detection with Dual Sentence Encoders** --
-  <https://arxiv.org/abs/2003.04807> (sentence-encoder routers).
-- **RouteLLM: Learning to Route LLMs with Preference Data** --
-  <https://arxiv.org/abs/2406.18665> (routing between whole models).
+- [DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression](https://arxiv.org/abs/2609.19969)
+  with its long-context attention and KV stack.
+- [DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models](https://arxiv.org/abs/2401.06066)
+  with its in-model routed experts.
+- [Bag of Tricks for Efficient Text Classification](https://arxiv.org/abs/1607.01759)
+  with its n-gram fast path implementation.
+- [SetFit: Efficient Few-Shot Learning Without Prompts](https://arxiv.org/abs/2209.11055)
+  with its encoder plus classification head.
+- [Efficient Intent Detection with Dual Sentence Encoders](https://arxiv.org/abs/2003.04807)
+  with its sentence-encoder routers.
+- [RouteLLM: Learning to Route LLMs with Preference Data](https://arxiv.org/abs/2406.18665)
+  with its routing between whole models using a meta model.
 
 ## License
 

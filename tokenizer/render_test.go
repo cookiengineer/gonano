@@ -2,6 +2,7 @@ package tokenizer
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -133,6 +134,32 @@ func TestThinkingInstruction(t *testing.T) {
 	thinkIDs, _ := tok.RenderConversation(withThinking, 2048)
 	if len(thinkIDs) <= len(baseIDs) {
 		t.Fatalf("thinking render should be longer: %d vs %d", len(thinkIDs), len(baseIDs))
+	}
+}
+
+// TestThinkingStyleInstruction checks the built-in logical style is rendered and
+// only injected when thinking is enabled.
+func TestThinkingStyleInstruction(t *testing.T) {
+	if got := ThinkingStyleInstruction(ThinkingStyleLogical); !strings.Contains(got, "logical fallacies") {
+		t.Fatalf("logical style = %q", got)
+	}
+	if got := ThinkingStyleInstruction(""); got != "" {
+		t.Fatalf("empty style = %q, want empty", got)
+	}
+	custom := "Answer like a pirate."
+	if got := ThinkingStyleInstruction(custom); got != custom {
+		t.Fatalf("custom style = %q, want %q", got, custom)
+	}
+
+	ranks := TrainBPE([]string{"hello"}, 5)
+	tok := NewTokenizer(ranks, SpecialTokens)
+	conversation := &Conversation{Messages: []Message{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "world"},
+	}, Extra: map[string]any{"thinking": true, "thinking_style": ThinkingStyleLogical}}
+	ids, _ := tok.RenderConversation(conversation, 4096)
+	if !strings.Contains(tok.Decode(ids), "logical fallacies") {
+		t.Fatal("rendered conversation missing logical style instruction")
 	}
 }
 
