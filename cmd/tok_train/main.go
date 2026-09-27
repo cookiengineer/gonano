@@ -1,4 +1,5 @@
-// Command tok_train trains a byte-level BPE tokenizer on Parquet text shards.
+// Command tok_train trains a byte-level BPE tokenizer on training data
+// (Parquet shards or Markdown files).
 package main
 
 import (
@@ -9,14 +10,14 @@ import (
 	"path/filepath"
 
 	"github.com/cookiengineer/gonano/data"
-	"github.com/cookiengineer/gonano/data/parquet"
 	"github.com/cookiengineer/gonano/internal/logging"
 	"github.com/cookiengineer/gonano/model"
 	"github.com/cookiengineer/gonano/tokenizer"
 )
 
 func main() {
-	dataDir := flag.String("data-dir", "", "directory of .parquet text shards (required)")
+	dataDir := flag.String("data-dir", "", "directory of training data (.parquet or .md) (required)")
+	dataFormat := flag.String("data-format", "parquet", "data format: parquet|markdown")
 	vocabSize := flag.Int("vocab-size", model.DefaultVocabSize, "vocabulary size")
 	maxChars := flag.Int("max-chars", 2000000, "max characters to train on")
 	baseDir := flag.String("base-dir", "", "output directory (default ~/.cache/gonano)")
@@ -24,51 +25,21 @@ func main() {
 
 	logger := logging.Default(slog.LevelInfo)
 	if *dataDir == "" {
-		fmt.Fprintln(os.Stderr, "usage: tok_train --data-dir <dir>")
+		fmt.Fprintln(os.Stderr, "usage: tok_train --data-dir <dir> [--data-format parquet|markdown]")
 		os.Exit(1)
 	}
 	if *baseDir == "" {
 		*baseDir = data.BaseDir()
 	}
 
-	paths := data.ListParquetFiles(*dataDir)
-	if len(paths) == 0 {
-		logger.Error("no parquet files", "dir", *dataDir)
+	provider, err := newDocProvider(*dataDir, *dataFormat)
+	if err != nil {
+		logger.Error("data", "err", err)
 		os.Exit(1)
 	}
 
-	// Collect document pieces (regex-split) up to maxChars.
-	var pieces []string
-	totalChars := 0
-outer:
-	for _, shardPath := range paths {
-		reader, err := parquet.Open(shardPath)
-		if err != nil {
-			logger.Error("open parquet", "path", shardPath, "err", err)
-			os.Exit(1)
-		}
-		for rowGroupIndex := 0; rowGroupIndex < reader.NumRowGroups(); rowGroupIndex++ {
-			docs, err := reader.ReadColumnStrings(rowGroupIndex, "text")
-			if err != nil {
-				logger.Error("read parquet", "err", err)
-				os.Exit(1)
-			}
-			for _, document := range docs {
-				for _, piece := range tokenizer.SplitPieces(document) {
-					pieces = append(pieces, piece)
-					totalChars += len(piece)
-					if totalChars >= *maxChars {
-						break outer
-					}
-				}
-			}
-		}
-		reader.Close()
-	}
-
-	numMerges := *vocabSize - 256 - len(tokenizer.SpecialTokens)
-	logger.Info("training tokenizer", "pieces", len(pieces), "chars", totalChars, "merges", numMerges)
-	ranks := tokenizer.TrainBPE(pieces, numMerges)
+	logger.Info("training tokenizer", "format", *dataFormat, "vocab", *vocabSize, "max_chars", *maxChars)
+	ranks := data.TrainTokenizer(provider, *vocabSize, *maxChars)
 	tokenizer := tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
 
 	outputDir := filepath.Join(*baseDir, "tokenizer")
@@ -79,4 +50,25 @@ outer:
 		os.Exit(1)
 	}
 	logger.Info("saved tokenizer", "path", outputPath, "vocab", tokenizer.VocabSize())
+}
+
+// newDocProvider builds a document provider for the given directory + format.
+func newDocProvider(dir, format string) (data.DocProvider, error) {
+	switch format {
+	case "markdown":
+		src := data.NewMarkdownSource(dir, 128)
+		if src.NumFiles() == 0 {
+			return nil, fmt.Errorf("no .md files found in %s", dir)
+		}
+		return func() ([]string, data.State) { return src.Next() }, nil
+	case "parquet":
+		paths := data.ListParquetFiles(dir)
+		if len(paths) == 0 {
+			return nil, fmt.Errorf("no .parquet files found in %s", dir)
+		}
+		src := data.NewParquetSource(paths, 128)
+		return func() ([]string, data.State) { return src.Next() }, nil
+	default:
+		return nil, fmt.Errorf("unknown data format %q (want parquet|markdown)", format)
+	}
 }
