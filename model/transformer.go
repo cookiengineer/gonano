@@ -484,6 +484,13 @@ func applySuffixEmbedding(activations, suffixEmbedding *tensors.Tensor, suffixSt
 func (model *Transformer) PrefillCED(indexes *tensors.Int32s, cache *KVBuffer) *tensors.Tensor {
 	config := model.Config
 	batchSize, sequenceLength := indexes.Shape[0], indexes.Shape[1]
+	if cache != nil {
+		// PrefillCED drives cache.sequenceLength directly across its encoder,
+		// replay and final phases. Keep per-row positions in sync so a cache
+		// with row positions (batched scheduler) starts at zero and reports the
+		// full prompt length afterwards.
+		cache.SetPosition(0)
+	}
 	split := config.CEDSplit()
 	embeddingDimension := config.EmbedDim
 	headDimension := config.HeadDim()
@@ -533,7 +540,7 @@ func (model *Transformer) PrefillCED(indexes *tensors.Int32s, cache *KVBuffer) *
 	// Phase 3: decoder bounded replay over the last window tokens. The global
 	// cache is already full, so replay mode writes only the local SWA state.
 	replayIndexes := sliceTokenRange(indexes, replayStart, sequenceLength)
-	cache.sequenceLength = int32(replayStart)
+	cache.SetPosition(replayStart)
 	initialResidual = model.embedAndSmear(replayIndexes, cache, replayLength)
 	// The decoder consumes the encoder's final hidden state, so the replay
 	// starts from its rows for the replayed positions.
@@ -556,7 +563,7 @@ func (model *Transformer) PrefillCED(indexes *tensors.Int32s, cache *KVBuffer) *
 			backoutActivation = activations.Clone()
 		}
 	}
-	cache.sequenceLength = int32(sequenceLength)
+	cache.SetPosition(sequenceLength)
 
 	if backoutActivation != nil {
 		activations = tensors.AddScaled(activations, backoutActivation, -model.backoutLambda.Data[0])

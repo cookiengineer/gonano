@@ -598,6 +598,18 @@ func TestMultiDomainEnsembleSchedulerBatches(t *testing.T) {
 			scheduled[0][0].content, scheduled[1][0].content, referenceA[0].content, referenceB[0].content)
 	}
 
+	multiOptions := options
+	multiOptions.numSamples = 2
+	multi := srv.generate(generatorA, promptA, multiOptions, thinkingOptions{})
+	if len(multi) != 2 {
+		t.Fatalf("ensemble scheduler n=2 rows = %d, want 2", len(multi))
+	}
+	for index, row := range multi {
+		if row.content != referenceA[0].content {
+			t.Fatalf("ensemble scheduler n=2 row %d = %q, want %q", index, row.content, referenceA[0].content)
+		}
+	}
+
 	body := `{"model":"gonano","messages":[{"role":"user","content":"hello"}],"max_tokens":2,"temperature":0,"seed":1}`
 	recorder := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))

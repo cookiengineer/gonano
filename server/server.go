@@ -178,6 +178,7 @@ func (server *Server) ensembleSchedulerFor(scores []router.Score) (*inference.Sc
 		return runner, server.ensembleFallbacks[key], weights, domains
 	}
 	members := make([]inference.ModelWeight, 0, len(domains))
+	cedMembers := 0
 	for index, domain := range domains {
 		transformer, err := server.Bank.Acquire(domain)
 		if err != nil {
@@ -185,14 +186,19 @@ func (server *Server) ensembleSchedulerFor(scores []router.Score) (*inference.Sc
 			return nil, nil, nil, nil
 		}
 		if transformer.Config.CEDEnabled() {
-			return nil, nil, nil, nil
+			cedMembers++
 		}
 		members = append(members, inference.ModelWeight{Model: transformer, Weight: weights[index], Domain: domain})
+	}
+	if cedMembers > 0 && cedMembers != len(members) {
+		slog.Warn("mixed CED/non-CED ensemble is not supported", "domains", domains)
+		return nil, nil, nil, nil
 	}
 	ensemble := inference.NewEnsemble(members, server.Tokenizer)
 	ensemble.Tools = server.Tools
 	scheduler := inference.NewEnsembleScheduler(ensemble, server.domainSchedulerMaxActive)
 	scheduler.PrefillChunk = server.domainSchedulerPrefillChunk
+	scheduler.Preemption = server.SchedulerPreemption
 	runner := inference.NewEnsembleSchedulerRunner(scheduler)
 	runner.Start()
 	server.ensembleRunners[key] = runner
@@ -309,8 +315,14 @@ type ensembleSchedulerGenerator struct {
 }
 
 func (generator *ensembleSchedulerGenerator) GenerateWith(tokens []int, numSamples, maxTokens int, temperature float32, topK int, seed uint64, options inference.GenerateOptions) func(yield func([]int, []int) bool) {
-	if numSamples != 1 {
-		return generator.fallback.GenerateWith(tokens, numSamples, maxTokens, temperature, topK, seed, options)
+	if numSamples < 1 {
+		numSamples = 1
+	}
+	if numSamples > 1 {
+		if options.Logprobs {
+			return generator.fallback.GenerateWith(tokens, numSamples, maxTokens, temperature, topK, seed, options)
+		}
+		return generator.generateSamples(tokens, numSamples, maxTokens, temperature, topK, seed, options)
 	}
 	return func(yield func([]int, []int) bool) {
 		schedulerOptions := options
@@ -337,6 +349,65 @@ func (generator *ensembleSchedulerGenerator) GenerateWith(tokens []int, numSampl
 				options.OnLogprobs([]inference.TokenLogprob{*event.Logprob})
 			}
 			if !yield([]int{event.Token}, []int{event.TokenMask}) {
+				return
+			}
+		}
+	}
+}
+
+// generateSamples submits one scheduler sequence per sample and multiplexes
+// their events into token columns. Distinct seeds keep the samples independent.
+func (generator *ensembleSchedulerGenerator) generateSamples(tokens []int, numSamples, maxTokens int, temperature float32, topK int, seed uint64, options inference.GenerateOptions) func(yield func([]int, []int) bool) {
+	return func(yield func([]int, []int) bool) {
+		schedulerOptions := options
+		schedulerOptions.OnLogprobs = nil
+		submissions := make([]*inference.SchedulerSubmission, numSamples)
+		for index := range submissions {
+			sampleSeed := seed
+			if sampleSeed != 0 {
+				sampleSeed += uint64(index)
+			}
+			submissions[index] = generator.runner.Submit(inference.Request{
+				Prompt:      tokens,
+				MaxTokens:   maxTokens,
+				Temperature: temperature,
+				TopK:        topK,
+				TopP:        options.TopP,
+				MinP:        options.MinP,
+				Seed:        sampleSeed,
+				Options:     schedulerOptions,
+				Constraint:  options.Constraint,
+				Weights:     generator.weights,
+			})
+		}
+		defer func() {
+			for _, submission := range submissions {
+				submission.Cancel()
+			}
+		}()
+
+		done := make([]bool, numSamples)
+		for {
+			column := make([]int, numSamples)
+			mask := make([]int, numSamples)
+			active := 0
+			for index, submission := range submissions {
+				if done[index] {
+					continue
+				}
+				event, ok := submission.Next()
+				if !ok || event.Finished {
+					done[index] = true
+					continue
+				}
+				column[index] = event.Token
+				mask[index] = event.TokenMask
+				active++
+			}
+			if active == 0 {
+				return
+			}
+			if !yield(column, mask) {
 				return
 			}
 		}

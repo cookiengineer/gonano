@@ -396,6 +396,9 @@ func (constraint *JSONConstraint) advanceByte(value byte) bool {
 
 // ConstraintMask builds the allowed-token mask for the current constraint
 // state. Special stop tokens are allowed only after the grammar is complete.
+// Token bytes are traversed through a vocabulary trie so a new constraint state
+// only advances the constraint once per distinct token-byte prefix instead of
+// once per vocabulary entry.
 func ConstraintMask(tokenizerImpl *tokenizer.Tokenizer, constraint Constraint, vocab int, stopTokens []int) []bool {
 	mask := make([]bool, vocab)
 	if constraint == nil {
@@ -404,6 +407,13 @@ func ConstraintMask(tokenizerImpl *tokenizer.Tokenizer, constraint Constraint, v
 		}
 		return mask
 	}
+	return constraintMaskFromTrie(tokenizerImpl, tokenTrieFor(tokenizerImpl), constraint, vocab, stopTokens)
+}
+
+// constraintMaskScan is the reference mask builder. It checks every vocabulary
+// entry independently and is kept for parity tests.
+func constraintMaskScan(tokenizerImpl *tokenizer.Tokenizer, constraint Constraint, vocab int, stopTokens []int) []bool {
+	mask := make([]bool, vocab)
 	finished := constraint.Finished()
 	stop := make(map[int]bool, len(stopTokens))
 	for _, id := range stopTokens {

@@ -16,20 +16,57 @@ type pagedPageResult struct {
 	lse    float32
 }
 
+// mergePagedResults combines per-page attention outputs with an online
+// log-sum-exp. Each merge is associative, so a pairwise tree gives the same
+// result as a serial scan while letting independent pairs merge in parallel.
+// Empty pages (for example, a short final block) are dropped first.
 func mergePagedResults(output, logSumExp []float32, results []pagedPageResult, count int) {
-	clear(output)
-	logSumExp[0] = float32(math.Inf(-1))
+	items := make([]pagedPageResult, 0, count)
 	for index := 0; index < count; index++ {
 		if results[index].output == nil || math.IsInf(float64(results[index].lse), -1) {
 			continue
 		}
+		items = append(items, results[index])
+	}
+	if len(items) == 0 {
+		clear(output)
+		logSumExp[0] = float32(math.Inf(-1))
+		return
+	}
+	if len(items) == 1 || len(items) < pagedAttentionParallelThreshold || parallel.Default().Workers() < 2 {
+		mergePagedResultsSerial(items, output, logSumExp)
+		return
+	}
+	for len(items) > 1 {
+		next := make([]pagedPageResult, (len(items)+1)/2)
+		parallel.KernelPool().For(0, len(next), func(index int) {
+			left := &items[2*index]
+			if 2*index+1 >= len(items) {
+				next[index] = *left
+				return
+			}
+			right := &items[2*index+1]
+			mergeAttentionRow(left.output, left.output, right.output, left.lse, right.lse)
+			left.lse = logAddExp(left.lse, right.lse)
+			next[index] = *left
+		})
+		items = next
+	}
+	copy(output, items[0].output)
+	logSumExp[0] = items[0].lse
+}
+
+func mergePagedResultsSerial(items []pagedPageResult, output, logSumExp []float32) {
+	clear(output)
+	logSumExp[0] = float32(math.Inf(-1))
+	for index := range items {
 		if math.IsInf(float64(logSumExp[0]), -1) {
-			copy(output, results[index].output)
-			logSumExp[0] = results[index].lse
+			copy(output, items[index].output)
+			logSumExp[0] = items[index].lse
 			continue
 		}
-		mergeAttentionRow(output, output, results[index].output, logSumExp[0], results[index].lse)
-		logSumExp[0] = logAddExp(logSumExp[0], results[index].lse)
+		mergeAttentionRow(output, output, items[index].output, logSumExp[0], items[index].lse)
+		logSumExp[0] = logAddExp(logSumExp[0], items[index].lse)
 	}
 }
 

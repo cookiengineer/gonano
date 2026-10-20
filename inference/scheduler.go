@@ -61,15 +61,17 @@ type Sequence struct {
 	FinishReason string
 	Prefilled    int
 	Position     int
-	// Row is the sequence's row in Scheduler.workCache; -1 for solo requests.
+	// Row is the sequence's row in the prefill or decode cache; -1 when the
+	// sequence is not admitted or is running solo.
 	Row int
-	// Solo marks a request that cannot join the mixed work cache (CED or
-	// speculative decoding) and owns a private cache.
+	// Solo marks a request that cannot join the batched paths (speculative
+	// decoding) and owns a private cache.
 	Solo bool
 	// Logprobs holds one entry per sampled token when requested.
 	Logprobs []TokenLogprob
 
 	reservedBlocks int
+	memberReserved []int
 	preempted      int
 	weights        []float32
 	forcedTokens   []int
@@ -78,11 +80,14 @@ type Sequence struct {
 	inThinking     bool
 	thinkingTokens int
 
-	request    Request
-	rng        *tensors.RNG
-	lastLogits []float32
-	content    strings.Builder
-	constraint Constraint
+	request        Request
+	rng            *tensors.RNG
+	lastLogits     []float32
+	specLastHidden *tensors.Tensor
+	specPending    int
+	specHasPending bool
+	content        strings.Builder
+	constraint     Constraint
 }
 
 // Event is emitted when a scheduler step produces a token or finishes a
@@ -111,9 +116,9 @@ type SchedulerStats struct {
 }
 
 // Scheduler interleaves prefill and batches decode across independent
-// sequences. Prefill remains per-sequence and chunked; every running decode row
-// advances together in one model forward. All rows share one paged block
-// manager, so a prefilled row joins the decode cache without copying its KV.
+// sequences. Prefill rows live in a separate cache so they can advance in
+// chunks while decode rows are active; completed rows are adopted by the decode
+// cache without copying their KV. Both caches share one paged block manager.
 type Scheduler struct {
 	Engine       *Engine
 	MaxActive    int
@@ -127,15 +132,24 @@ type Scheduler struct {
 	// Preemption selects whether admission may evict a running request.
 	Preemption PreemptionPolicy
 
-	waiting   []*Sequence
-	running   []*Sequence
-	finished  []*Sequence
-	workCache *model.KVBuffer
-	rows      []*Sequence
-	pools     *model.KVBlockPools
-	reserved  int
-	nextSeed  uint64
-	stats     SchedulerStats
+	waiting      []*Sequence
+	running      []*Sequence
+	finished     []*Sequence
+	workCache    *model.KVBuffer
+	prefillCache *model.KVBuffer
+	cedCache     *model.KVBuffer
+	specCache    *model.KVBuffer
+	rows         []*Sequence
+	prefillRows  []*Sequence
+	pools        *model.KVBlockPools
+	reserved     int
+	nextSeed     uint64
+	stats        SchedulerStats
+
+	// Batch counters are used by parity tests to confirm grouped execution.
+	cedBatches          int
+	speculativeForwards int
+	speculativeRows     int
 }
 
 // NewScheduler builds a scheduler. maxActive <= 0 means unbounded; the decode
@@ -197,25 +211,11 @@ func (scheduler *Scheduler) Cancel(sequence *Sequence) {
 		if candidate != sequence {
 			continue
 		}
-		if sequence.Cache == scheduler.workCache && sequence.Cache != nil {
-			scheduler.workCache.ReleaseRow(sequence.Row)
-			if sequence.Row >= 0 && sequence.Row < len(scheduler.rows) {
-				scheduler.rows[sequence.Row] = nil
-			}
-		} else if sequence.Cache != nil {
-			sequence.Cache.Release()
-		}
-		sequence.Cache = nil
-		sequence.Row = -1
-		sequence.Solo = false
-		scheduler.reserved -= sequence.reservedBlocks
-		if scheduler.reserved < 0 {
-			scheduler.reserved = 0
-		}
-		sequence.reservedBlocks = 0
+		scheduler.releaseSequence(sequence)
 		sequence.Status = SequenceFailed
 		scheduler.running = append(scheduler.running[:index], scheduler.running[index+1:]...)
 		scheduler.compactRows()
+		scheduler.compactPrefillRows()
 		return
 	}
 }
@@ -247,11 +247,11 @@ func (scheduler *Scheduler) Run() []*Sequence {
 	return scheduler.finished
 }
 
-// Step admits waiting requests, advances prefill and decode rows, and runs one
-// mixed T=1 forward when both kinds are active. When only prefills are active,
-// a chunked prefill forward is used instead.
+// Step admits waiting requests, advances detached prefill rows by one chunk and
+// decode rows by one token. Splitting the caches means an active decode batch no
+// longer forces prefills to advance one token per step.
 func (scheduler *Scheduler) Step() []Event {
-	scheduler.ensureDecodeCache()
+	scheduler.ensureCaches()
 	scheduler.admit()
 
 	events := []Event{}
@@ -262,29 +262,18 @@ func (scheduler *Scheduler) Step() []Event {
 			continue
 		}
 		if scheduler.speculativeEligible(sequence) {
-			events = append(events, scheduler.runSpeculative(sequence)...)
-		} else {
-			scheduler.prefill(sequence)
+			scheduler.prefillSpeculative(sequence)
 		}
 	}
 
-	hasDecode := false
-	for _, sequence := range scheduler.running {
-		if !sequence.Solo && sequence.Status == SequenceDecode {
-			hasDecode = true
-			break
-		}
-	}
-	if !hasDecode {
-		prefillEvents, promoted := scheduler.chunkedPrefill()
-		events = append(events, prefillEvents...)
-		for sequence := range promoted {
-			sampled[sequence] = true
-		}
+	prefillEvents, promoted := scheduler.prefillStep()
+	events = append(events, prefillEvents...)
+	for sequence := range promoted {
+		sampled[sequence] = true
 	}
 
 	for _, sequence := range scheduler.running {
-		if sequence.Status != SequenceDecode || sampled[sequence] {
+		if sequence.Status != SequenceDecode || sequence.Solo || sampled[sequence] {
 			continue
 		}
 		events = append(events, scheduler.emit(sequence)...)
@@ -292,14 +281,13 @@ func (scheduler *Scheduler) Step() []Event {
 
 	scheduler.reap()
 	scheduler.compactRows()
+	scheduler.compactPrefillRows()
 
-	runMixed := hasDecode || len(sampled) > 0
-	if runMixed {
-		scheduler.mixedForward()
-	}
-	scheduler.forwardSolo()
+	scheduler.decodeForward()
+	events = append(events, scheduler.speculativeForward()...)
 	scheduler.reap()
 	scheduler.compactRows()
+	scheduler.compactPrefillRows()
 
 	for _, event := range events {
 		if event.TokenMask == 1 {
@@ -309,29 +297,47 @@ func (scheduler *Scheduler) Step() []Event {
 	return events
 }
 
-// chunkedPrefill advances every non-solo prefill row by one common chunk. It is
-// only used when no work-cache decode rows are active.
-func (scheduler *Scheduler) chunkedPrefill() ([]Event, map[*Sequence]bool) {
+// prefillStep advances every detached prefill row. CED rows are grouped by
+// prompt length and prefilled together; normal rows advance by one common
+// chunk, even while decode rows are active.
+func (scheduler *Scheduler) prefillStep() ([]Event, map[*Sequence]bool) {
 	events := []Event{}
 	promoted := make(map[*Sequence]bool)
-	scheduler.compactRows()
+	scheduler.compactPrefillRows()
+	config := scheduler.Engine.Model.Config
 
-	active := make([]*Sequence, 0, len(scheduler.rows))
-	for _, sequence := range scheduler.rows {
-		if sequence != nil && sequence.Status == SequencePrefill {
-			active = append(active, sequence)
+	if config.CEDEnabled() {
+		scheduler.cedPrefillStep(&events, promoted)
+		return events, promoted
+	}
+
+	// Retry promotions left over from an earlier step.
+	for _, sequence := range scheduler.prefillRows {
+		if sequence == nil || sequence.Status != SequencePrefill || sequence.Prefilled < len(sequence.Tokens) {
+			continue
 		}
+		if scheduler.promote(sequence) {
+			events = append(events, scheduler.emit(sequence)...)
+			promoted[sequence] = true
+		}
+	}
+	// Promotions above can leave holes; batch forwards index cache rows by
+	// position, so compact before building the active row set.
+	scheduler.compactPrefillRows()
+
+	active := make([]*Sequence, 0, len(scheduler.prefillRows))
+	for _, sequence := range scheduler.prefillRows {
+		if sequence == nil || sequence.Status != SequencePrefill || sequence.Prefilled >= len(sequence.Tokens) {
+			continue
+		}
+		active = append(active, sequence)
 	}
 	if len(active) == 0 {
 		return events, promoted
 	}
-	config := scheduler.Engine.Model.Config
 	chunk := 0
 	for _, sequence := range active {
 		remaining := len(sequence.Tokens) - sequence.Prefilled
-		if remaining <= 0 {
-			continue
-		}
 		if chunk == 0 || remaining < chunk {
 			chunk = remaining
 		}
@@ -344,7 +350,7 @@ func (scheduler *Scheduler) chunkedPrefill() ([]Event, map[*Sequence]bool) {
 	}
 	if scheduler.Prefix != nil {
 		for _, sequence := range active {
-			position := scheduler.workCache.PositionAt(sequence.Row)
+			position := scheduler.prefillCache.PositionAt(sequence.Row)
 			distance := model.KVBlockSize - position%model.KVBlockSize
 			if distance < chunk {
 				chunk = distance
@@ -361,103 +367,169 @@ func (scheduler *Scheduler) chunkedPrefill() ([]Event, map[*Sequence]bool) {
 	}
 	scheduler.stats.PrefillTokens += int64(len(active) * chunk)
 	ids := tensors.NewInt32sWithData([]int{len(active), chunk}, data)
-	logits := scheduler.Engine.Model.Forward(ids, scheduler.workCache)
+	logits := scheduler.Engine.Model.Forward(ids, scheduler.prefillCache)
 	vocab := config.VocabSize
 	for index, sequence := range active {
 		sequence.Prefilled += chunk
 		sequence.lastLogits = logitsRow(logits, index*chunk+chunk-1, vocab)
-		position := scheduler.workCache.PositionAt(sequence.Row)
+		position := scheduler.prefillCache.PositionAt(sequence.Row)
 		if scheduler.Prefix != nil && position > 0 && position%model.KVBlockSize == 0 {
-			if snapshot := scheduler.workCache.CloneRow(sequence.Row); snapshot != nil {
+			if snapshot := scheduler.prefillCache.CloneRow(sequence.Row); snapshot != nil {
 				scheduler.Prefix.Store(sequence.Tokens[:position], snapshot)
 				snapshot.Release()
 			}
 		}
 		if sequence.Prefilled == len(sequence.Tokens) {
-			sequence.Status = SequenceDecode
-			events = append(events, scheduler.emit(sequence)...)
-			promoted[sequence] = true
+			if scheduler.promote(sequence) {
+				events = append(events, scheduler.emit(sequence)...)
+				promoted[sequence] = true
+			}
 		}
 	}
 	return events, promoted
 }
 
-// mixedForward advances every work-cache row by one token in a single forward:
-// decode rows feed their sampled token, prefill rows feed their next prompt
-// token.
-func (scheduler *Scheduler) mixedForward() {
-	active := make([]*Sequence, 0, len(scheduler.rows))
-	for _, sequence := range scheduler.rows {
-		if sequence != nil {
-			active = append(active, sequence)
+// cedPrefillStep batches CED prefills that share a token length. CED's encoder
+// must see the full prompt, and padding would contaminate compressed blocks, so
+// different lengths run as separate batches.
+func (scheduler *Scheduler) cedPrefillStep(events *[]Event, promoted map[*Sequence]bool) {
+	type prefillGroup struct {
+		length    int
+		sequences []*Sequence
+	}
+	groups := make([]prefillGroup, 0)
+	groupIndex := make(map[int]int)
+	for _, sequence := range scheduler.prefillRows {
+		if sequence == nil || sequence.Status != SequencePrefill || sequence.Prefilled >= len(sequence.Tokens) {
+			continue
+		}
+		length := len(sequence.Tokens)
+		index, ok := groupIndex[length]
+		if !ok {
+			index = len(groups)
+			groupIndex[length] = index
+			groups = append(groups, prefillGroup{length: length})
+		}
+		groups[index].sequences = append(groups[index].sequences, sequence)
+	}
+	config := scheduler.Engine.Model.Config
+	for _, group := range groups {
+		count := len(group.sequences)
+		for row := 0; row < count; row++ {
+			scheduler.cedCache.ReleaseRow(row)
+		}
+		data := make([]int32, count*group.length)
+		for row, sequence := range group.sequences {
+			copy(data[row*group.length:(row+1)*group.length], toI32(sequence.Tokens))
+		}
+		ids := tensors.NewInt32sWithData([]int{count, group.length}, data)
+		logits := scheduler.Engine.Model.PrefillCED(ids, scheduler.cedCache)
+		scheduler.cedBatches++
+		scheduler.stats.PrefillTokens += int64(count * group.length)
+		failed := false
+		for row, sequence := range group.sequences {
+			if failed {
+				sequence.Prefilled = 0
+				sequence.lastLogits = nil
+				continue
+			}
+			sequence.Prefilled = group.length
+			sequence.lastLogits = logitsRow(logits, row*group.length+group.length-1, config.VocabSize)
+			if !scheduler.promoteCEDAt(sequence, row) {
+				sequence.Prefilled = 0
+				sequence.lastLogits = nil
+				failed = true
+				continue
+			}
+			*events = append(*events, scheduler.emit(sequence)...)
+			promoted[sequence] = true
+		}
+		for row := 0; row < count; row++ {
+			scheduler.cedCache.ReleaseRow(row)
 		}
 	}
+}
+
+// promote moves a completed prefill row into the decode cache without copying
+// KV blocks, then frees the prefill row.
+func (scheduler *Scheduler) promote(sequence *Sequence) bool {
+	if sequence == nil || sequence.Cache != scheduler.prefillCache {
+		return false
+	}
+	row := scheduler.freeRow()
+	if row < 0 {
+		return false
+	}
+	prefillRow := sequence.Row
+	if !scheduler.workCache.AdoptRowFrom(row, scheduler.prefillCache, prefillRow) {
+		return false
+	}
+	scheduler.prefillCache.ReleaseRow(prefillRow)
+	if prefillRow >= 0 && prefillRow < len(scheduler.prefillRows) {
+		scheduler.prefillRows[prefillRow] = nil
+	}
+	sequence.Cache = scheduler.workCache
+	sequence.Row = row
+	scheduler.rows[row] = sequence
+	sequence.Status = SequenceDecode
+	return true
+}
+
+// promoteCEDAt moves one CED batch row into the decode cache and releases its
+// prefill marker row.
+func (scheduler *Scheduler) promoteCEDAt(sequence *Sequence, sourceRow int) bool {
+	if sequence == nil || scheduler.cedCache == nil || sequence.Cache != scheduler.prefillCache {
+		return false
+	}
+	row := scheduler.freeRow()
+	if row < 0 {
+		return false
+	}
+	if !scheduler.workCache.AdoptRowFrom(row, scheduler.cedCache, sourceRow) {
+		return false
+	}
+	scheduler.cedCache.ReleaseRow(sourceRow)
+	prefillRow := sequence.Row
+	scheduler.prefillCache.ReleaseRow(prefillRow)
+	if prefillRow >= 0 && prefillRow < len(scheduler.prefillRows) {
+		scheduler.prefillRows[prefillRow] = nil
+	}
+	sequence.Cache = scheduler.workCache
+	sequence.Row = row
+	scheduler.rows[row] = sequence
+	sequence.Status = SequenceDecode
+	return true
+}
+
+// decodeForward advances every decode row by its sampled token in one forward.
+func (scheduler *Scheduler) decodeForward() {
+	active := scheduler.activeRows()
 	if len(active) == 0 {
 		return
 	}
-	tokens := make([]int32, len(active))
-	positions := make([]*Sequence, len(active))
-	count := 0
+	tokens := make([]int32, 0, len(active))
+	positions := make([]*Sequence, 0, len(active))
 	for _, sequence := range active {
-		switch sequence.Status {
-		case SequenceDecode:
-			tokens[count] = int32(sequence.Tokens[len(sequence.Tokens)-1])
-			scheduler.stats.DecodeTokens++
-		case SequencePrefill:
-			if sequence.Prefilled >= len(sequence.Tokens) {
-				sequence.Status = SequenceDecode
-				continue
-			}
-			tokens[count] = int32(sequence.Tokens[sequence.Prefilled])
-			scheduler.stats.PrefillTokens++
-		default:
+		if sequence.Status != SequenceDecode {
 			continue
 		}
-		positions[count] = sequence
-		count++
+		tokens = append(tokens, int32(sequence.Tokens[len(sequence.Tokens)-1]))
+		positions = append(positions, sequence)
+		scheduler.stats.DecodeTokens++
 	}
-	if count == 0 {
+	if len(positions) == 0 {
 		return
 	}
-	ids := tensors.NewInt32sWithData([]int{count, 1}, tokens[:count])
+	ids := tensors.NewInt32sWithData([]int{len(positions), 1}, tokens)
 	logits := scheduler.Engine.Model.Forward(ids, scheduler.workCache)
 	vocab := scheduler.Engine.Model.Config.VocabSize
-	for index := 0; index < count; index++ {
-		sequence := positions[index]
+	for index, sequence := range positions {
 		sequence.lastLogits = logitsRow(logits, index, vocab)
-		if sequence.Status != SequencePrefill {
-			continue
-		}
-		sequence.Prefilled++
-		position := scheduler.workCache.PositionAt(sequence.Row)
-		if scheduler.Prefix != nil && position > 0 && position%model.KVBlockSize == 0 {
-			if snapshot := scheduler.workCache.CloneRow(sequence.Row); snapshot != nil {
-				scheduler.Prefix.Store(sequence.Tokens[:position], snapshot)
-				snapshot.Release()
-			}
-		}
-		if sequence.Prefilled == len(sequence.Tokens) {
-			sequence.Status = SequenceDecode
-		}
 	}
 }
 
-// forwardSolo advances solo CED rows after they have been sampled.
-func (scheduler *Scheduler) forwardSolo() {
-	config := scheduler.Engine.Model.Config
-	for _, sequence := range scheduler.running {
-		if !sequence.Solo || sequence.Status != SequenceDecode || len(sequence.Tokens) == 0 {
-			continue
-		}
-		token := sequence.Tokens[len(sequence.Tokens)-1]
-		ids := tensors.NewInt32sWithData([]int{1, 1}, []int32{int32(token)})
-		logits := scheduler.Engine.Model.Forward(ids, sequence.Cache)
-		sequence.lastLogits = lastLogits(logits, config.VocabSize)
-	}
-}
-
-func (scheduler *Scheduler) ensureDecodeCache() {
-	if scheduler.workCache != nil {
+func (scheduler *Scheduler) ensureCaches() {
+	if scheduler.workCache != nil && scheduler.prefillCache != nil {
 		return
 	}
 	maxRows := scheduler.MaxActive
@@ -479,11 +551,24 @@ func (scheduler *Scheduler) ensureDecodeCache() {
 			}
 			extra = entries * blocksPerRow
 		}
+		// Both caches share this manager, but a sequence only ever occupies a
+		// row in one of them, so the budget remains one row per active request.
 		scheduler.Blocks = model.NewKVBlockManager(maxRows*(blocksPerRow+8) + extra)
 	}
 	scheduler.pools = model.NewKVBlockPools(scheduler.Blocks, config.NumLayer, config.NumKVHead, config.HeadDim())
 	scheduler.workCache = newCacheForModelWithPools(scheduler.Blocks, scheduler.pools, config, maxRows, config.SequenceLen)
+	scheduler.prefillCache = newCacheForModelWithPools(scheduler.Blocks, scheduler.pools, config, maxRows, config.SequenceLen)
+	if config.CEDEnabled() {
+		// CED prefills are grouped by prompt length and run through this
+		// scratch cache before joining the decode cache.
+		scheduler.cedCache = newCacheForModelWithPools(scheduler.Blocks, scheduler.pools, config, maxRows, config.SequenceLen)
+	}
+	if scheduler.Engine.Speculative &&
+		(scheduler.Engine.DFlash != nil || scheduler.Engine.DSpark != nil || scheduler.Engine.Drafter != nil) {
+		scheduler.specCache = newCacheForModelWithPools(scheduler.Blocks, scheduler.pools, config, maxRows, config.SequenceLen)
+	}
 	scheduler.rows = make([]*Sequence, maxRows)
+	scheduler.prefillRows = make([]*Sequence, maxRows)
 }
 
 func (scheduler *Scheduler) admit() {
@@ -500,7 +585,7 @@ func (scheduler *Scheduler) admit() {
 			capacity = len(sequence.Prompt)
 		}
 
-		if config.CEDEnabled() || scheduler.speculativeEligible(sequence) {
+		if scheduler.speculativeEligible(sequence) {
 			needed := scheduler.blocksFor(capacity)
 			if !scheduler.ensureBudget(sequence, needed) {
 				scheduler.waiting = append([]*Sequence{sequence}, scheduler.waiting...)
@@ -516,7 +601,7 @@ func (scheduler *Scheduler) admit() {
 			continue
 		}
 
-		row := scheduler.freeRow()
+		row := scheduler.freePrefillRow()
 		if row < 0 {
 			scheduler.waiting = append([]*Sequence{sequence}, scheduler.waiting...)
 			break
@@ -524,7 +609,7 @@ func (scheduler *Scheduler) admit() {
 		needed := scheduler.blocksFor(capacity)
 		var snapshot *model.KVBuffer
 		matched := 0
-		if scheduler.Prefix != nil {
+		if scheduler.Prefix != nil && !config.CEDEnabled() {
 			if cached, hit := scheduler.Prefix.Lookup(sequence.Tokens); cached != nil {
 				if cached.BlockManager() == scheduler.Blocks {
 					snapshot = cached
@@ -544,12 +629,12 @@ func (scheduler *Scheduler) admit() {
 		}
 		scheduler.reserved += needed
 		sequence.reservedBlocks = needed
-		sequence.Cache = scheduler.workCache
+		sequence.Cache = scheduler.prefillCache
 		sequence.Row = row
-		scheduler.rows[row] = sequence
-		scheduler.workCache.SetPositionAt(row, 0)
+		scheduler.prefillRows[row] = sequence
+		scheduler.prefillCache.SetPositionAt(row, 0)
 		if snapshot != nil {
-			if scheduler.workCache.AdoptRow(row, snapshot) {
+			if scheduler.prefillCache.AdoptRow(row, snapshot) {
 				sequence.Prefilled = matched
 			} else {
 				additional := scheduler.blocksFor(capacity) - needed
@@ -558,6 +643,7 @@ func (scheduler *Scheduler) admit() {
 			}
 			snapshot.Release()
 		}
+		sequence.Solo = false
 		sequence.Status = SequencePrefill
 		scheduler.running = append(scheduler.running, sequence)
 	}
@@ -606,13 +692,22 @@ func (scheduler *Scheduler) preemptionVictim() *Sequence {
 	return victim
 }
 
-func (scheduler *Scheduler) preempt(sequence *Sequence) {
-	if sequence.Cache == scheduler.workCache && sequence.Cache != nil {
+// releaseSequence frees whichever cache row the sequence owns and returns its
+// reserved block budget.
+func (scheduler *Scheduler) releaseSequence(sequence *Sequence) {
+	switch {
+	case sequence.Cache == nil:
+	case sequence.Cache == scheduler.workCache:
 		scheduler.workCache.ReleaseRow(sequence.Row)
 		if sequence.Row >= 0 && sequence.Row < len(scheduler.rows) {
 			scheduler.rows[sequence.Row] = nil
 		}
-	} else if sequence.Cache != nil {
+	case sequence.Cache == scheduler.prefillCache:
+		scheduler.prefillCache.ReleaseRow(sequence.Row)
+		if sequence.Row >= 0 && sequence.Row < len(scheduler.prefillRows) {
+			scheduler.prefillRows[sequence.Row] = nil
+		}
+	default:
 		sequence.Cache.Release()
 	}
 	sequence.Cache = nil
@@ -623,6 +718,10 @@ func (scheduler *Scheduler) preempt(sequence *Sequence) {
 		scheduler.reserved = 0
 	}
 	sequence.reservedBlocks = 0
+}
+
+func (scheduler *Scheduler) preempt(sequence *Sequence) {
+	scheduler.releaseSequence(sequence)
 	sequence.Prefilled = 0
 	sequence.lastLogits = nil
 	sequence.Status = SequencePrefill
@@ -636,10 +735,20 @@ func (scheduler *Scheduler) preempt(sequence *Sequence) {
 	}
 	scheduler.waiting = append([]*Sequence{sequence}, scheduler.waiting...)
 	scheduler.compactRows()
+	scheduler.compactPrefillRows()
 }
 
 func (scheduler *Scheduler) freeRow() int {
 	for index, sequence := range scheduler.rows {
+		if sequence == nil {
+			return index
+		}
+	}
+	return -1
+}
+
+func (scheduler *Scheduler) freePrefillRow() int {
+	for index, sequence := range scheduler.prefillRows {
 		if sequence == nil {
 			return index
 		}
@@ -672,72 +781,198 @@ func (scheduler *Scheduler) speculativeEligible(sequence *Sequence) bool {
 	return sequence.Prefilled == 0
 }
 
-// runSpeculative drives the engine's exact greedy speculative loop against the
-// sequence's prefill cache. It runs to completion in one scheduler step and is
-// used for requests that cannot safely join the batched decode group.
-func (scheduler *Scheduler) runSpeculative(sequence *Sequence) []Event {
-	var events []Event
-	scheduler.Engine.speculativeGenerateWithCache(sequence.Tokens, sequence.request.MaxTokens, sequence.Cache, func(column, mask []int) bool {
-		if len(column) == 0 {
-			return true
-		}
-		token := column[0]
-		tokenMask := 1
-		if len(mask) > 0 {
-			tokenMask = mask[0]
-		}
-		sequence.Generated = append(sequence.Generated, token)
-		sequence.Masks = append(sequence.Masks, tokenMask)
-		sequence.Tokens = append(sequence.Tokens, token)
-		sequence.Position = len(sequence.Tokens)
-		events = append(events, Event{Sequence: sequence, Token: token, TokenMask: tokenMask})
-		return true
-	})
-	sequence.Status = SequenceFinished
-	if sequence.request.MaxTokens > 0 && len(sequence.Generated) >= sequence.request.MaxTokens {
-		sequence.FinishReason = "length"
+// prefillSpeculative loads the prompt into a speculative request's private
+// cache and captures the target hidden state DFlash needs for drafting.
+func (scheduler *Scheduler) prefillSpeculative(sequence *Sequence) {
+	config := scheduler.Engine.Model.Config
+	ids := tensors.NewInt32sWithData([]int{1, len(sequence.Tokens)}, toI32(sequence.Tokens))
+	var logits *tensors.Tensor
+	if scheduler.Engine.DFlash != nil {
+		var hidden *tensors.Tensor
+		logits, hidden = scheduler.Engine.Model.ForwardHiddenAtLayers(ids, sequence.Cache, scheduler.Engine.DFlash.TargetIDs)
+		sequence.specLastHidden = lastHiddenRow(hidden)
 	} else {
-		sequence.FinishReason = "stop"
+		logits = scheduler.Engine.Model.Forward(ids, sequence.Cache)
 	}
-	events = append(events, Event{Sequence: sequence, Finished: true, FinishReason: sequence.FinishReason})
-	return events
+	scheduler.stats.PrefillTokens += int64(len(sequence.Tokens))
+	sequence.Prefilled = len(sequence.Tokens)
+	sequence.lastLogits = lastLogits(logits, config.VocabSize)
+	sequence.Status = SequenceDecode
 }
 
-func (scheduler *Scheduler) prefill(sequence *Sequence) {
-	config := scheduler.Engine.Model.Config
-	if config.CEDEnabled() {
-		ids := tensors.NewInt32sWithData([]int{1, len(sequence.Tokens)}, toI32(sequence.Tokens))
-		logits := scheduler.Engine.Model.PrefillCED(ids, sequence.Cache)
-		scheduler.stats.PrefillTokens += int64(len(sequence.Tokens))
-		sequence.Prefilled = len(sequence.Tokens)
-		sequence.lastLogits = lastLogits(logits, config.VocabSize)
-	} else {
-		for start := sequence.Prefilled; start < len(sequence.Tokens); {
-			end := len(sequence.Tokens)
-			if scheduler.PrefillChunk > 0 && start+scheduler.PrefillChunk < end {
-				end = start + scheduler.PrefillChunk
-			}
-			if scheduler.Prefix != nil {
-				position := sequence.Cache.Position()
-				boundary := ((position / model.KVBlockSize) + 1) * model.KVBlockSize
-				if boundary > position && boundary-position < end-start {
-					end = start + (boundary - position)
-				}
-			}
-			ids := tensors.NewInt32sWithData([]int{1, end - start}, toI32(sequence.Tokens[start:end]))
-			logits := scheduler.Engine.Model.Forward(ids, sequence.Cache)
-			sequence.Prefilled = end
-			sequence.lastLogits = lastLogits(logits, config.VocabSize)
-			start = end
-			if scheduler.Prefix != nil {
-				position := sequence.Cache.Position()
-				if position > 0 && position%model.KVBlockSize == 0 {
-					scheduler.Prefix.Store(sequence.Tokens[:position], sequence.Cache)
-				}
-			}
+func finishSpeculative(sequence *Sequence, reason string) []Event {
+	sequence.Status = SequenceFinished
+	sequence.FinishReason = reason
+	return []Event{{Sequence: sequence, Finished: true, FinishReason: reason}}
+}
+
+func (scheduler *Scheduler) terminalToken(token int) bool {
+	return token == scheduler.Engine.Tokenizer.EncodeSpecial("<|assistant_end|>") || token == scheduler.Engine.Tokenizer.BOSTokenID()
+}
+
+// speculativeForward verifies one draft block for every speculative decode row
+// in a single target forward. Rows with unequal draft lengths are padded; rows
+// that needed padding or partial acceptance are rolled back and replayed over
+// only their accepted prefix.
+func (scheduler *Scheduler) speculativeForward() []Event {
+	if scheduler.specCache == nil {
+		return nil
+	}
+	rows := make([]*Sequence, 0, len(scheduler.running))
+	for _, sequence := range scheduler.running {
+		if sequence.Solo && sequence.Status == SequenceDecode {
+			rows = append(rows, sequence)
 		}
 	}
-	sequence.Status = SequenceDecode
+	if len(rows) == 0 {
+		return nil
+	}
+	config := scheduler.Engine.Model.Config
+	draftLength := scheduler.Engine.DraftLength
+	if draftLength < 2 {
+		draftLength = defaultDraftLength
+	}
+
+	type speculativeRow struct {
+		sequence   *Sequence
+		candidates []int
+		mark       model.KVMark
+		base       int
+	}
+	prepared := make([]speculativeRow, 0, len(rows))
+	events := []Event{}
+	maxLength := 0
+	for _, sequence := range rows {
+		base := sequence.Cache.Position()
+		room := config.SequenceLen - base
+		remaining := sequence.request.MaxTokens - len(sequence.Generated)
+		if room <= 0 || remaining <= 0 {
+			reason := "stop"
+			if remaining <= 0 {
+				reason = "length"
+			}
+			events = append(events, finishSpeculative(sequence, reason)...)
+			continue
+		}
+		first := sequence.specPending
+		if !sequence.specHasPending {
+			first = argmaxSlice(sequence.lastLogits)
+		}
+		sequence.specHasPending = false
+		blockSize := draftLength
+		if blockSize > room {
+			blockSize = room
+		}
+		if blockSize > remaining {
+			blockSize = remaining
+		}
+		if blockSize < 1 {
+			blockSize = 1
+		}
+		candidates := scheduler.Engine.draftCandidates(sequence.Tokens, first, sequence.specLastHidden, blockSize-1)
+		if len(candidates) > remaining {
+			candidates = candidates[:remaining]
+		}
+		if len(candidates) > room {
+			candidates = candidates[:room]
+		}
+		if len(candidates) == 0 {
+			events = append(events, finishSpeculative(sequence, "length")...)
+			continue
+		}
+		row := len(prepared)
+		mark := sequence.Cache.Mark()
+		if !scheduler.specCache.AdoptRowFrom(row, sequence.Cache, 0) {
+			continue
+		}
+		prepared = append(prepared, speculativeRow{sequence: sequence, candidates: candidates, mark: mark, base: base})
+		if len(candidates) > maxLength {
+			maxLength = len(candidates)
+		}
+	}
+	if len(prepared) == 0 {
+		return events
+	}
+	scheduler.speculativeForwards++
+	scheduler.speculativeRows += len(prepared)
+
+	data := make([]int32, len(prepared)*maxLength)
+	for row, current := range prepared {
+		copy(data[row*maxLength:(row+1)*maxLength], toI32(current.candidates))
+	}
+	ids := tensors.NewInt32sWithData([]int{len(prepared), maxLength}, data)
+	var verified *tensors.Tensor
+	var verifiedHidden *tensors.Tensor
+	if scheduler.Engine.DFlash != nil {
+		verified, verifiedHidden = scheduler.Engine.Model.ForwardHiddenAtLayers(ids, scheduler.specCache, scheduler.Engine.DFlash.TargetIDs)
+	} else {
+		verified = scheduler.Engine.Model.Forward(ids, scheduler.specCache)
+	}
+
+	for row, current := range prepared {
+		sequence := current.sequence
+		blockSize := len(current.candidates)
+		matched := 0
+		for matched < blockSize-1 && argmaxRow(verified, row*maxLength+matched) == current.candidates[matched+1] {
+			matched++
+		}
+		accepted := 1 + matched
+		if !sequence.Cache.AdoptRowFrom(0, scheduler.specCache, row) {
+			scheduler.specCache.ReleaseRow(row)
+			continue
+		}
+		needsReplay := accepted < blockSize || blockSize < maxLength
+		if needsReplay {
+			sequence.Cache.Rollback(current.mark)
+			acceptedIDs := tensors.NewInt32sWithData([]int{1, accepted}, toI32(current.candidates[:accepted]))
+			var replayHidden *tensors.Tensor
+			if scheduler.Engine.DFlash != nil {
+				_, replayHidden = scheduler.Engine.Model.ForwardHiddenAtLayers(acceptedIDs, sequence.Cache, scheduler.Engine.DFlash.TargetIDs)
+				sequence.specLastHidden = lastHiddenRow(replayHidden)
+			} else {
+				scheduler.Engine.Model.Forward(acceptedIDs, sequence.Cache)
+			}
+		} else if scheduler.Engine.DFlash != nil && verifiedHidden != nil {
+			sequence.specLastHidden = hiddenRow(verifiedHidden, row*maxLength+accepted-1)
+		}
+		sequence.Cache.SetPosition(current.base + accepted)
+		scheduler.Engine.Model.SetPreviousEmbeddingForToken(sequence.Cache, current.candidates[accepted-1])
+		scheduler.specCache.ReleaseRow(row)
+		scheduler.stats.DecodeTokens += int64(accepted)
+
+		var next int
+		if matched < blockSize-1 {
+			next = argmaxRow(verified, row*maxLength+matched)
+		} else {
+			next = argmaxRow(verified, row*maxLength+blockSize-1)
+		}
+		sequence.specPending = next
+		sequence.specHasPending = true
+
+		finished := false
+		for index := 0; index < accepted; index++ {
+			token := current.candidates[index]
+			if scheduler.terminalToken(token) {
+				events = append(events, finishSpeculative(sequence, "stop")...)
+				finished = true
+				break
+			}
+			sequence.Generated = append(sequence.Generated, token)
+			sequence.Masks = append(sequence.Masks, 1)
+			sequence.Tokens = append(sequence.Tokens, token)
+			sequence.Position = len(sequence.Tokens)
+			events = append(events, Event{Sequence: sequence, Token: token, TokenMask: 1})
+			if sequence.request.MaxTokens > 0 && len(sequence.Generated) >= sequence.request.MaxTokens {
+				events = append(events, finishSpeculative(sequence, "length")...)
+				finished = true
+				break
+			}
+		}
+		if finished {
+			sequence.specHasPending = false
+		}
+	}
+	return events
 }
 
 func (scheduler *Scheduler) emit(sequence *Sequence) []Event {
@@ -867,22 +1102,7 @@ func (scheduler *Scheduler) reap() {
 	active := scheduler.running[:0]
 	for _, sequence := range scheduler.running {
 		if sequence.Status == SequenceFinished || sequence.Status == SequenceFailed {
-			if sequence.Cache == scheduler.workCache && sequence.Cache != nil {
-				scheduler.workCache.ReleaseRow(sequence.Row)
-				if sequence.Row >= 0 && sequence.Row < len(scheduler.rows) {
-					scheduler.rows[sequence.Row] = nil
-				}
-			} else if sequence.Cache != nil {
-				sequence.Cache.Release()
-			}
-			sequence.Cache = nil
-			sequence.Row = -1
-			sequence.Solo = false
-			scheduler.reserved -= sequence.reservedBlocks
-			if scheduler.reserved < 0 {
-				scheduler.reserved = 0
-			}
-			sequence.reservedBlocks = 0
+			scheduler.releaseSequence(sequence)
 			scheduler.finished = append(scheduler.finished, sequence)
 			continue
 		}
@@ -915,6 +1135,34 @@ func (scheduler *Scheduler) compactRows() {
 		}
 		scheduler.rows[free] = sequence
 		scheduler.rows[high] = nil
+		sequence.Row = free
+	}
+}
+
+func (scheduler *Scheduler) compactPrefillRows() {
+	if scheduler.prefillCache == nil {
+		return
+	}
+	for free := 0; free < len(scheduler.prefillRows); free++ {
+		if scheduler.prefillRows[free] != nil {
+			continue
+		}
+		high := -1
+		for index := len(scheduler.prefillRows) - 1; index > free; index-- {
+			if scheduler.prefillRows[index] != nil {
+				high = index
+				break
+			}
+		}
+		if high < 0 {
+			break
+		}
+		sequence := scheduler.prefillRows[high]
+		if !scheduler.prefillCache.MoveRow(free, high) {
+			break
+		}
+		scheduler.prefillRows[free] = sequence
+		scheduler.prefillRows[high] = nil
 		sequence.Row = free
 	}
 }

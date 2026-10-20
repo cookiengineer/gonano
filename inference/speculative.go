@@ -117,35 +117,7 @@ func (engine *Engine) speculativeGenerateWithCache(tokens []int, maxTokens int, 
 			return
 		}
 		draftCount := blockSize - 1
-		candidates := make([]int, 0, blockSize)
-		candidates = append(candidates, first)
-		if draftCount > 0 {
-			draftContext := append(append([]int(nil), sequence...), first)
-			switch {
-			case engine.DFlash != nil:
-				drafted, confidences := engine.DFlash.Draft(draftContext, lastHidden, draftCount)
-				candidates = append(candidates, drafted...)
-				threshold := engine.ConfidenceThreshold
-				if threshold <= 0 {
-					threshold = defaultConfidenceThreshold
-				}
-				if limit := scheduledLength(confidences, threshold); limit < len(candidates) {
-					candidates = candidates[:limit]
-				}
-			case engine.DSpark != nil:
-				drafted, confidences := engine.DSpark.Draft(draftContext, draftCount)
-				candidates = append(candidates, drafted...)
-				threshold := engine.ConfidenceThreshold
-				if threshold <= 0 {
-					threshold = defaultConfidenceThreshold
-				}
-				if limit := scheduledLength(confidences, threshold); limit < len(candidates) {
-					candidates = candidates[:limit]
-				}
-			default:
-				candidates = append(candidates, engine.Drafter.DraftTokens(draftContext, draftCount)...)
-			}
-		}
+		candidates := engine.draftCandidates(sequence, first, lastHidden, draftCount)
 		blockSize = len(candidates)
 
 		basePosition := cache.Position()
@@ -205,6 +177,40 @@ func (engine *Engine) speculativeGenerateWithCache(tokens []int, maxTokens int, 
 		pending = next
 		hasPending = true
 	}
+}
+
+// draftCandidates builds the verification block for one row: the target's own
+// next token followed by up to draftCount drafted tokens. Confidence scheduling
+// may shorten the block for DFlash and DSpark.
+func (engine *Engine) draftCandidates(context []int, first int, lastHidden *tensors.Tensor, draftCount int) []int {
+	candidates := make([]int, 0, draftCount+1)
+	candidates = append(candidates, first)
+	if draftCount <= 0 {
+		return candidates
+	}
+	draftContext := append(append([]int(nil), context...), first)
+	threshold := engine.ConfidenceThreshold
+	if threshold <= 0 {
+		threshold = defaultConfidenceThreshold
+	}
+	var confidences []float32
+	switch {
+	case engine.DFlash != nil:
+		drafted, draftedConfidences := engine.DFlash.Draft(draftContext, lastHidden, draftCount)
+		candidates = append(candidates, drafted...)
+		confidences = draftedConfidences
+	case engine.DSpark != nil:
+		drafted, draftedConfidences := engine.DSpark.Draft(draftContext, draftCount)
+		candidates = append(candidates, drafted...)
+		confidences = draftedConfidences
+	default:
+		candidates = append(candidates, engine.Drafter.DraftTokens(draftContext, draftCount)...)
+		return candidates
+	}
+	if limit := scheduledLength(confidences, threshold); limit < len(candidates) {
+		candidates = candidates[:limit]
+	}
+	return candidates
 }
 
 // lastHiddenRow returns the last sequence row of a [1, T, D] hidden tensor.

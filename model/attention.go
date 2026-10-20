@@ -164,16 +164,29 @@ func (attention *CausalSelfAttention) projectKeyValue(input *tensors.Tensor) (ke
 // gate does not apply to the global branch because it reads the layer's own
 // hidden state.
 func (attention *CausalSelfAttention) cedGlobalKeyValue(encoderHidden, cosine, sine *tensors.Tensor, positionOffset int) (keyHeadMajor, valueHeadMajor, keyRotary *tensors.Tensor) {
+	return attention.cedGlobalKeyValueForCache(encoderHidden, cosine, sine, positionOffset, nil)
+}
+
+// cedGlobalKeyValueForCache is cedGlobalKeyValue with per-row rotary positions
+// when a cache is present, so batched CED decode rows at different context
+// positions apply the correct RoPE to their global keys.
+func (attention *CausalSelfAttention) cedGlobalKeyValueForCache(encoderHidden, cosine, sine *tensors.Tensor, positionOffset int, cache *KVBuffer) (keyHeadMajor, valueHeadMajor, keyRotary *tensors.Tensor) {
 	batchSize, sequenceLength := encoderHidden.Shape[0], encoderHidden.Shape[1]
+	applyRotary := func(activations *tensors.Tensor) *tensors.Tensor {
+		if cache != nil {
+			return ApplyRotaryPositions(activations, cosine, sine, cache.Positions(activations.Shape[0]))
+		}
+		return ApplyRotary(activations, cosine, sine, positionOffset)
+	}
 	if attention.mla != nil {
 		key, value := attention.mlaProjectKeyValue(encoderHidden)
-		key = ApplyRotary(key, cosine, sine, positionOffset)
+		key = applyRotary(key)
 		return toBatchHeadLayout(key), toBatchHeadLayout(value), key
 	}
 	key, value := attention.projectKeyValue(encoderHidden)
 	key = key.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
 	value = value.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
-	key = ApplyRotary(key, cosine, sine, positionOffset)
+	key = applyRotary(key)
 	keyRotary = key
 	key = tensors.Scale(normalizeLastDim(key), qkScale)
 	return toBatchHeadLayout(key), toBatchHeadLayout(value), keyRotary
@@ -289,7 +302,7 @@ func (attention *CausalSelfAttention) Forward(input, valueEmbedding, cosine, sin
 		var encoderHidden, cedKeySequence, cedValueSequence *tensors.Tensor
 		if attention.ced && share != nil && share.encoderHidden != nil {
 			encoderHidden = share.encoderHidden
-			keyHead, valueHead, _ := attention.cedGlobalKeyValue(encoderHidden, cosine, sine, positionOffset)
+			keyHead, valueHead, _ := attention.cedGlobalKeyValueForCache(encoderHidden, cosine, sine, positionOffset, cache)
 			cedKeySequence = toBatchSequenceLayout(keyHead)
 			cedValueSequence = toBatchSequenceLayout(valueHead)
 		}

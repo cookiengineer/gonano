@@ -130,3 +130,137 @@ func TestEnsembleSchedulerRegexConstraint(t *testing.T) {
 		t.Fatalf("constrained output = %q, want ab", text)
 	}
 }
+
+func TestEnsembleSchedulerDecoupledPrefillDecode(t *testing.T) {
+	config := model.Config{
+		SequenceLen: 32, VocabSize: 32, NumLayer: 2, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L",
+	}
+	first := model.NewTransformer(config)
+	first.InitWeights(tensors.NewRNG(42))
+	second := model.NewTransformer(config)
+	second.InitWeights(tensors.NewRNG(99))
+	perturbSpeculative(first, 11)
+	perturbSpeculative(second, 22)
+	tokenizerImpl := testSpeculativeTokenizer()
+	ensemble := NewEnsemble([]ModelWeight{
+		{Model: first, Weight: 0.6, Domain: "math"},
+		{Model: second, Weight: 0.4, Domain: "physics"},
+	}, tokenizerImpl)
+	scheduler := NewEnsembleScheduler(ensemble, 2)
+	scheduler.PrefillChunk = 2
+	scheduler.Submit(Request{ID: "a", Prompt: []int{1, 5, 2, 8, 3, 7}, MaxTokens: 6, Seed: 1})
+	scheduler.Submit(Request{ID: "b", Prompt: []int{1, 2}, MaxTokens: 6, Seed: 2})
+	scheduler.Step()
+
+	var prefill *Sequence
+	var decode *Sequence
+	for _, sequence := range scheduler.running {
+		switch sequence.Status {
+		case SequencePrefill:
+			prefill = sequence
+		case SequenceDecode:
+			decode = sequence
+		}
+	}
+	if prefill == nil || decode == nil {
+		t.Fatalf("expected mixed prefill/decode rows, got %v", scheduler.running)
+	}
+	if prefill.Cache != scheduler.prefillCaches[0] {
+		t.Fatal("prefill row is not in the detached ensemble prefill cache")
+	}
+	if decode.Cache != scheduler.caches[0] {
+		t.Fatal("decode row is not in the ensemble decode cache")
+	}
+	prefilled := prefill.Prefilled
+	generated := len(decode.Generated)
+
+	scheduler.Step()
+	if prefill.Prefilled != prefilled+2 {
+		t.Fatalf("prefill advanced %d tokens, want a chunk of 2", prefill.Prefilled-prefilled)
+	}
+	if len(decode.Generated) != generated+1 {
+		t.Fatalf("decode generated %d tokens, want 1", len(decode.Generated)-generated)
+	}
+}
+
+func TestEnsembleSchedulerPreemptsAndReplays(t *testing.T) {
+	config := model.Config{
+		SequenceLen: 32, VocabSize: 32, NumLayer: 2, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L",
+	}
+	first := model.NewTransformer(config)
+	first.InitWeights(tensors.NewRNG(42))
+	second := model.NewTransformer(config)
+	second.InitWeights(tensors.NewRNG(99))
+	perturbSpeculative(first, 11)
+	perturbSpeculative(second, 22)
+	tokenizerImpl := testSpeculativeTokenizer()
+	ensemble := NewEnsemble([]ModelWeight{
+		{Model: first, Weight: 0.6, Domain: "math"},
+		{Model: second, Weight: 0.4, Domain: "physics"},
+	}, tokenizerImpl)
+	scheduler := NewEnsembleScheduler(ensemble, 2)
+	scheduler.Preemption = PreemptLongest
+	scheduler.Blocks = []*model.KVBlockManager{
+		model.NewKVBlockManager(9),
+		model.NewKVBlockManager(9),
+	}
+	promptA := []int{1, 5, 2, 8, 3, 7}
+	promptB := []int{1, 2}
+	scheduler.Submit(Request{ID: "a", Prompt: promptA, MaxTokens: 4, Seed: 1})
+	scheduler.Step()
+	scheduler.Step()
+	scheduler.Submit(Request{ID: "b", Prompt: promptB, MaxTokens: 4, Seed: 2})
+	finished := scheduler.Run()
+	if len(finished) != 2 {
+		t.Fatalf("finished = %d, want 2", len(finished))
+	}
+	SortFinished(finished)
+	for index, prompt := range [][]int{promptA, promptB} {
+		want, _ := ensemble.GenerateBatch(prompt, 1, 4, 0, 0, uint64(index+1))
+		assertSameTokens(t, finished[index].Generated, want[0][len(prompt):])
+	}
+	if scheduler.Stats().Preemptions == 0 {
+		t.Fatal("ensemble scheduler did not report a preemption")
+	}
+	for index, manager := range scheduler.Blocks {
+		if manager.InUse() != 0 {
+			t.Fatalf("ensemble member %d leaked %d blocks", index, manager.InUse())
+		}
+	}
+}
+
+func TestEnsembleSchedulerCEDMatchesSequential(t *testing.T) {
+	config := model.ConfigForPreset(model.PresetFlash, 4, 32, 16, 32, 64, "SSSL")
+	first := model.NewTransformer(config)
+	first.InitWeights(tensors.NewRNG(42))
+	second := model.NewTransformer(config)
+	second.InitWeights(tensors.NewRNG(99))
+	perturbSpeculative(first, 11)
+	perturbSpeculative(second, 22)
+	tokenizerImpl := testSpeculativeTokenizer()
+	ensemble := NewEnsemble([]ModelWeight{
+		{Model: first, Weight: 0.6, Domain: "math"},
+		{Model: second, Weight: 0.4, Domain: "physics"},
+	}, tokenizerImpl)
+	scheduler := NewEnsembleScheduler(ensemble, 2)
+	prompts := [][]int{{1, 5, 2, 8, 3, 7}, {1, 2}}
+	for index, prompt := range prompts {
+		scheduler.Submit(Request{ID: string(rune('a' + index)), Prompt: prompt, MaxTokens: 6, Seed: uint64(index + 1)})
+	}
+	finished := scheduler.Run()
+	if len(finished) != 2 {
+		t.Fatalf("finished = %d, want 2", len(finished))
+	}
+	SortFinished(finished)
+	for index, prompt := range prompts {
+		want, _ := ensemble.GenerateBatch(prompt, 1, 6, 0, 0, uint64(index+1))
+		assertSameTokens(t, finished[index].Generated, want[0][len(prompt):])
+	}
+	for index, manager := range scheduler.Blocks {
+		if manager.InUse() != 0 {
+			t.Fatalf("ensemble member %d leaked %d blocks", index, manager.InUse())
+		}
+	}
+}

@@ -103,7 +103,7 @@ func TestSchedulerBatchesDecodeRows(t *testing.T) {
 	backbone, _, tokenizerImpl := testSpeculativeModel()
 	engine := NewEngine(backbone, tokenizerImpl)
 	scheduler := NewScheduler(engine, 2)
-	scheduler.Submit(Request{ID: "a", Prompt: []int{1, 5, 2, 8, 3, 7}, MaxTokens: 8, Seed: 1})
+	scheduler.Submit(Request{ID: "a", Prompt: []int{1, 5}, MaxTokens: 8, Seed: 1})
 	scheduler.Submit(Request{ID: "b", Prompt: []int{1, 2}, MaxTokens: 8, Seed: 2})
 	scheduler.Step()
 
@@ -120,7 +120,10 @@ func TestSchedulerBatchesDecodeRows(t *testing.T) {
 		t.Fatal("work rows are not contiguous after batching")
 	}
 	if scheduler.rows[0].Cache != scheduler.workCache || scheduler.rows[1].Cache != scheduler.workCache {
-		t.Fatal("sequences do not share the mixed work cache")
+		t.Fatal("sequences do not share the decode work cache")
+	}
+	if scheduler.prefillRows[0] != nil || scheduler.prefillRows[1] != nil {
+		t.Fatal("completed prefills were not released")
 	}
 
 	scheduler.Run()
@@ -358,15 +361,18 @@ func TestSchedulerMixedPrefillDecodeForward(t *testing.T) {
 	if prefill == nil || decode == nil {
 		t.Fatalf("expected mixed prefill/decode rows, got %v", scheduler.running)
 	}
-	if prefill.Cache != scheduler.workCache || decode.Cache != scheduler.workCache {
-		t.Fatal("mixed rows do not share the work cache")
+	if prefill.Cache != scheduler.prefillCache {
+		t.Fatal("prefill row is not in the detached prefill cache")
+	}
+	if decode.Cache != scheduler.workCache {
+		t.Fatal("decode row is not in the work cache")
 	}
 	prefilled := prefill.Prefilled
 	generated := len(decode.Generated)
 
 	scheduler.Step()
-	if prefill.Prefilled != prefilled+1 {
-		t.Fatalf("prefill advanced %d tokens, want 1 in mixed mode", prefill.Prefilled-prefilled)
+	if prefill.Prefilled != prefilled+2 {
+		t.Fatalf("prefill advanced %d tokens, want a chunk of 2", prefill.Prefilled-prefilled)
 	}
 	if len(decode.Generated) != generated+1 {
 		t.Fatalf("decode generated %d tokens, want 1", len(decode.Generated)-generated)
@@ -569,4 +575,160 @@ func TestSchedulerRegexConstraintEnforced(t *testing.T) {
 	if text := tokenizerImpl.Decode(finished[0].Generated); text != "ab" {
 		t.Fatalf("constrained output = %q, want ab", text)
 	}
+}
+
+func TestSchedulerBatchesCEDDecodeRows(t *testing.T) {
+	config := model.ConfigForPreset(model.PresetFlash, 4, 32, 16, 32, 64, "SSSL")
+	backbone := model.NewTransformer(config)
+	backbone.InitWeights(tensors.NewRNG(42))
+	perturbSpeculative(backbone, 11)
+	engine := NewEngine(backbone, testSpeculativeTokenizer())
+	scheduler := NewScheduler(engine, 2)
+	scheduler.Submit(Request{ID: "a", Prompt: []int{1, 5, 2, 8}, MaxTokens: 6, Seed: 1})
+	scheduler.Submit(Request{ID: "b", Prompt: []int{1, 3, 7}, MaxTokens: 6, Seed: 2})
+
+	scheduler.Step()
+	active := 0
+	for _, sequence := range scheduler.rows {
+		if sequence != nil {
+			active++
+		}
+	}
+	if active != 2 {
+		t.Fatalf("active CED decode rows = %d, want 2", active)
+	}
+	for _, sequence := range scheduler.prefillRows {
+		if sequence != nil {
+			t.Fatal("CED prefill row was not released after promotion")
+		}
+	}
+	for _, sequence := range scheduler.rows {
+		if sequence != nil && sequence.Cache != scheduler.workCache {
+			t.Fatal("CED decode row did not join the work cache")
+		}
+	}
+
+	scheduler.Run()
+	if blocks := scheduler.Blocks.InUse(); blocks != 0 {
+		t.Fatalf("scheduler leaked %d blocks", blocks)
+	}
+}
+
+func TestSchedulerMixedPrefillDecodeCompressedMatchesReference(t *testing.T) {
+	config := model.ConfigForPreset(model.PresetFlash, 4, 32, 16, 32, 64, "SSSL")
+	config.CED = false
+	config.PrefillLayer = 0
+	backbone := model.NewTransformer(config)
+	backbone.InitWeights(tensors.NewRNG(42))
+	perturbSpeculative(backbone, 11)
+	prompts := [][]int{{1, 5, 2, 8, 3, 7}, {1, 2}}
+	scheduleComparison(t, backbone, testSpeculativeTokenizer(), prompts, 6, 2, 2, greedyReferenceCompressed)
+}
+
+func TestSchedulerBatchesCEDPrefill(t *testing.T) {
+	config := model.ConfigForPreset(model.PresetFlash, 4, 32, 16, 32, 64, "SSSL")
+	backbone := model.NewTransformer(config)
+	backbone.InitWeights(tensors.NewRNG(42))
+	perturbSpeculative(backbone, 11)
+	engine := NewEngine(backbone, testSpeculativeTokenizer())
+	scheduler := NewScheduler(engine, 2)
+	scheduler.Submit(Request{ID: "a", Prompt: []int{1, 5, 2, 8}, MaxTokens: 4, Seed: 1})
+	scheduler.Submit(Request{ID: "b", Prompt: []int{1, 3, 7, 9}, MaxTokens: 4, Seed: 2})
+
+	scheduler.Step()
+	if scheduler.cedBatches != 1 {
+		t.Fatalf("CED prefill batches = %d, want 1 for equal-length prompts", scheduler.cedBatches)
+	}
+	active := 0
+	for _, sequence := range scheduler.rows {
+		if sequence != nil {
+			active++
+		}
+	}
+	if active != 2 {
+		t.Fatalf("active CED rows = %d, want 2", active)
+	}
+	for _, sequence := range scheduler.prefillRows {
+		if sequence != nil {
+			t.Fatal("CED prefill row was not released")
+		}
+	}
+	scheduler.Run()
+	if blocks := scheduler.Blocks.InUse(); blocks != 0 {
+		t.Fatalf("scheduler leaked %d blocks", blocks)
+	}
+}
+
+func TestSchedulerBatchesSpeculativeDecode(t *testing.T) {
+	backbone, drafter, tokenizerImpl := testSpeculativeModel()
+	engine := NewEngine(backbone, tokenizerImpl)
+	engine.Speculative = true
+	engine.Drafter = drafter
+	engine.DraftLength = 3
+	scheduler := NewScheduler(engine, 2)
+	prompts := [][]int{{1, 5, 2, 8, 3, 7}, {1, 2}}
+	for index, prompt := range prompts {
+		scheduler.Submit(Request{ID: string(rune('a' + index)), Prompt: prompt, MaxTokens: 8, Seed: uint64(index + 1)})
+	}
+	finished := scheduler.Run()
+	if len(finished) != 2 {
+		t.Fatalf("finished = %d, want 2", len(finished))
+	}
+	SortFinished(finished)
+	for index, prompt := range prompts {
+		want := greedyReference(backbone, prompt, 8)
+		assertSameTokens(t, finished[index].Generated, want)
+	}
+	if scheduler.speculativeForwards == 0 || scheduler.speculativeRows <= scheduler.speculativeForwards {
+		t.Fatalf("speculative batches = %d forwards for %d rows, want batched verification",
+			scheduler.speculativeForwards, scheduler.speculativeRows)
+	}
+	if blocks := scheduler.Blocks.InUse(); blocks != 0 {
+		t.Fatalf("scheduler leaked %d blocks", blocks)
+	}
+}
+
+func TestSchedulerBatchesSpeculativeDFlash(t *testing.T) {
+	config := model.ConfigForPreset(model.PresetFlash, 4, 32, 16, 32, 64, "SSSL")
+	config.CED = false
+	config.PrefillLayer = 0
+	backbone := model.NewTransformer(config)
+	backbone.InitWeights(tensors.NewRNG(42))
+	perturbSpeculative(backbone, 11)
+	dflash := model.NewDFlash(backbone)
+	dflash.InitWeights(tensors.NewRNG(77))
+	engine := NewEngine(backbone, testSpeculativeTokenizer())
+	engine.DFlash = dflash
+	engine.Speculative = true
+	engine.DraftLength = 3
+	scheduler := NewScheduler(engine, 2)
+	prompts := [][]int{{1, 5, 2, 8, 3, 7}, {1, 2}}
+	for index, prompt := range prompts {
+		scheduler.Submit(Request{ID: string(rune('a' + index)), Prompt: prompt, MaxTokens: 6, Seed: uint64(index + 1)})
+	}
+	finished := scheduler.Run()
+	if len(finished) != 2 {
+		t.Fatalf("finished = %d, want 2", len(finished))
+	}
+	SortFinished(finished)
+	for index, prompt := range prompts {
+		want := greedyReferenceCompressed(backbone, prompt, 6)
+		assertSameTokens(t, finished[index].Generated, want)
+	}
+	if scheduler.speculativeForwards == 0 || scheduler.speculativeRows <= scheduler.speculativeForwards {
+		t.Fatalf("DFlash speculative batches = %d forwards for %d rows",
+			scheduler.speculativeForwards, scheduler.speculativeRows)
+	}
+	if blocks := scheduler.Blocks.InUse(); blocks != 0 {
+		t.Fatalf("scheduler leaked %d blocks", blocks)
+	}
+}
+
+func TestSchedulerBatchedCEDDecodeMatchesReference(t *testing.T) {
+	config := model.ConfigForPreset(model.PresetFlash, 4, 32, 16, 32, 64, "SSSL")
+	backbone := model.NewTransformer(config)
+	backbone.InitWeights(tensors.NewRNG(42))
+	perturbSpeculative(backbone, 11)
+	prompts := [][]int{{1, 5, 2, 8, 3, 7}, {1, 2}}
+	scheduleComparison(t, backbone, testSpeculativeTokenizer(), prompts, 6, 2, 0, greedyReferenceCompressed)
 }

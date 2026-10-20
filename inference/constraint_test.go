@@ -409,19 +409,72 @@ func TestConstraintMaskCacheMatchesScanForAllGrammars(t *testing.T) {
 		{"ebnf", ebnf, "abb"},
 	}
 	for _, testCase := range cases {
-		scanned := ConstraintMask(tokenizerImpl, testCase.constraint, tokenizerImpl.VocabSize(), stop)
+		scanned := constraintMaskScan(tokenizerImpl, testCase.constraint, tokenizerImpl.VocabSize(), stop)
+		built := ConstraintMask(tokenizerImpl, testCase.constraint, tokenizerImpl.VocabSize(), stop)
 		cached := ConstraintMaskCached(tokenizerImpl, testCase.constraint, tokenizerImpl.VocabSize(), stop)
 		for index := range scanned {
+			if scanned[index] != built[index] {
+				t.Fatalf("%s: trie mask mismatch at %d", testCase.name, index)
+			}
 			if scanned[index] != cached[index] {
 				t.Fatalf("%s: cached mask mismatch at %d", testCase.name, index)
 			}
 		}
 		testCase.constraint.Advance([]byte(testCase.advance))
-		scanned = ConstraintMask(tokenizerImpl, testCase.constraint, tokenizerImpl.VocabSize(), stop)
+		scanned = constraintMaskScan(tokenizerImpl, testCase.constraint, tokenizerImpl.VocabSize(), stop)
+		built = ConstraintMask(tokenizerImpl, testCase.constraint, tokenizerImpl.VocabSize(), stop)
 		cached = ConstraintMaskCached(tokenizerImpl, testCase.constraint, tokenizerImpl.VocabSize(), stop)
 		for index := range scanned {
+			if scanned[index] != built[index] {
+				t.Fatalf("%s: advanced trie mask mismatch at %d", testCase.name, index)
+			}
 			if scanned[index] != cached[index] {
 				t.Fatalf("%s: advanced cached mask mismatch at %d", testCase.name, index)
+			}
+		}
+	}
+}
+
+func TestConstraintMaskTrieMultibyte(t *testing.T) {
+	ranks := map[string]int{}
+	next := 0
+	for _, token := range []string{"a", "é", "€", "🙂", "🙂🙂", "ab", "aé", "b"} {
+		ranks[token] = next
+		next++
+	}
+	tokenizerImpl := tokenizer.NewTokenizer(ranks, tokenizer.SpecialTokens)
+	stop := []int{tokenizerImpl.EncodeSpecial("<|assistant_end|>")}
+
+	regex, err := NewRegexConstraint(`(a|é|€|🙂)+`)
+	if err != nil {
+		t.Fatalf("regex: %v", err)
+	}
+	jsonConstraint := NewJSONConstraint()
+	jsonConstraint.Advance([]byte(`"`))
+	cases := []struct {
+		name       string
+		constraint Constraint
+		advance    string
+	}{
+		{"regex", regex, "aé"},
+		{"regex-multibyte", regex, "🙂"},
+		{"json-string", jsonConstraint, "a"},
+		{"json-multibyte", jsonConstraint, "é€"},
+	}
+	for _, testCase := range cases {
+		scanned := constraintMaskScan(tokenizerImpl, testCase.constraint, tokenizerImpl.VocabSize(), stop)
+		built := ConstraintMask(tokenizerImpl, testCase.constraint, tokenizerImpl.VocabSize(), stop)
+		for index := range scanned {
+			if scanned[index] != built[index] {
+				t.Fatalf("%s: trie mask mismatch at %d", testCase.name, index)
+			}
+		}
+		testCase.constraint.Advance([]byte(testCase.advance))
+		scanned = constraintMaskScan(tokenizerImpl, testCase.constraint, tokenizerImpl.VocabSize(), stop)
+		built = ConstraintMask(tokenizerImpl, testCase.constraint, tokenizerImpl.VocabSize(), stop)
+		for index := range scanned {
+			if scanned[index] != built[index] {
+				t.Fatalf("%s: advanced trie mask mismatch at %d", testCase.name, index)
 			}
 		}
 	}
