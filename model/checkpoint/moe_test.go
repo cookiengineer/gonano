@@ -2,6 +2,7 @@ package checkpoint
 
 import (
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/cookiengineer/gonano/model"
@@ -38,7 +39,7 @@ func TestSaveLoadRoundtripMoE(tester *testing.T) {
 	if err != nil {
 		tester.Fatalf("Load: %v", err)
 	}
-	if meta.ModelConfig != config {
+	if !reflect.DeepEqual(meta.ModelConfig, config) {
 		tester.Fatalf("config = %+v, want %+v", meta.ModelConfig, config)
 	}
 	if len(gotParams) != len(params) {
@@ -72,7 +73,7 @@ func TestExportGGUFMoE(tester *testing.T) {
 	if err != nil {
 		tester.Fatalf("LoadGGUF: %v", err)
 	}
-	if meta.ModelConfig != config {
+	if !reflect.DeepEqual(meta.ModelConfig, config) {
 		tester.Fatalf("config = %+v, want %+v", meta.ModelConfig, config)
 	}
 	if meta.ModelConfig.NumExperts != 4 || meta.ModelConfig.NumExpertsPerToken != 2 {

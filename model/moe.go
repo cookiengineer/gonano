@@ -3,6 +3,7 @@ package model
 import (
 	"github.com/cookiengineer/gonano/model/layers"
 	"github.com/cookiengineer/gonano/tensors"
+	"math"
 )
 
 // Router is the per-token expert gate of a DeepSeekMoE feed-forward. Its
@@ -32,6 +33,10 @@ type MoE struct {
 	// BalanceWeight is the sequence-level load-balancing auxiliary loss weight
 	// (DeepSeek-V4.1 §4.2.2). Zero disables it.
 	BalanceWeight float32
+	// Scoring selects softmax or sqrtsoftplus router scoring.
+	Scoring string
+	// NormTopKProb normalizes the selected routed weights.
+	NormTopKProb bool
 
 	router     *Router
 	gateWeight *tensors.Tensor // [E, Hidden, Dim]
@@ -57,6 +62,8 @@ func NewMoE(configuration Config) *MoE {
 		Hidden:        hidden,
 		Clamp:         configuration.MoEEffectiveClamp(),
 		BalanceWeight: configuration.MoEBalanceLossWeight(),
+		Scoring:       configuration.MoEScoring,
+		NormTopKProb:  configuration.MoENormTopKProb,
 		router: &Router{
 			weight: layers.NewLinear(configuration.EmbedDim, experts),
 			bias:   tensors.New(experts),
@@ -83,11 +90,13 @@ type expertForward struct {
 
 // moeContext holds the routing and expert state saved by forwardTraining.
 type moeContext struct {
-	shape   []int
-	rows    int
-	input   *tensors.Tensor // [rows, Dim]
-	probs   *tensors.Tensor // [rows, E]
-	experts []expertForward
+	shape           []int
+	rows            int
+	input           *tensors.Tensor // [rows, Dim]
+	probs           *tensors.Tensor // [rows, E] (softmax probabilities or sqrtsoftplus scores)
+	selected        *tensors.Int32s // [rows, TopK]
+	selectedWeights *tensors.Tensor // [rows, TopK]
+	experts         []expertForward
 
 	// sequenceLength is the per-sequence token count used to group rows for the
 	// sequence-level balance loss (0 disables the loss).
@@ -121,7 +130,14 @@ func (moe *MoE) forward(input *tensors.Tensor, training bool, sequenceLength int
 	flat := input.Reshape(rows, moe.Dim)
 
 	logits := moe.router.weight.Forward(flat) // [rows, E]
-	probs, selected, selectedWeights := tensors.MoEGateTopK(logits, moe.router.bias, rows, moe.NumExperts, moe.TopK)
+	var probs *tensors.Tensor
+	var selected *tensors.Int32s
+	var selectedWeights *tensors.Tensor
+	if moe.Scoring == "sqrtsoftplus" {
+		probs, selected, selectedWeights = tensors.MoEGateTopKSqrtSoftplus(logits, moe.router.bias, rows, moe.NumExperts, moe.TopK)
+	} else {
+		probs, selected, selectedWeights = tensors.MoEGateTopK(logits, moe.router.bias, rows, moe.NumExperts, moe.TopK)
+	}
 
 	// Count and offset the selected experts, then gather the selected rows into
 	// expert-major order (one row per (token, selected expert) pair).
@@ -192,7 +208,7 @@ func (moe *MoE) forward(input *tensors.Tensor, training bool, sequenceLength int
 		moe.loadCounts[expert] += float64(count)
 		moe.loadTotal += float64(count)
 	}
-	context := &moeContext{shape: shape, rows: rows, input: flat, probs: probs, experts: experts, sequenceLength: sequenceLength}
+	context := &moeContext{shape: shape, rows: rows, input: flat, probs: probs, selected: selected, selectedWeights: selectedWeights, experts: experts, sequenceLength: sequenceLength}
 	context.balanceLoss, context.balanceGradProbs = moe.sequenceBalance(probs, experts, rows, sequenceLength)
 	return output.Reshape(shape...), context
 }
@@ -248,17 +264,49 @@ func (moe *MoE) backwardTraining(outputGradient *tensors.Tensor, context *moeCon
 		}
 	}
 
-	// Router softmax backward: dLogits = probs * (dProbs - <dProbs, probs>).
 	gradLogits := tensors.New(rows, moe.NumExperts)
-	for row := 0; row < rows; row++ {
-		base := row * moe.NumExperts
-		var dot float64
-		for expert := 0; expert < moe.NumExperts; expert++ {
-			dot += float64(context.probs.Data[base+expert]) * gradProbs[base+expert]
+	if moe.Scoring == "sqrtsoftplus" {
+		// dL/dscore for the normalized top-k weights, then
+		// dscore/dlogit = sigmoid(logit) / (2*sqrtsoftplus(logit)).
+		routerLogits := moe.router.weight.Forward(context.input)
+		for row := 0; row < rows; row++ {
+			base := row * moe.NumExperts
+			var weightedGradient float64
+			var totalScore float64
+			for slot := 0; slot < moe.TopK; slot++ {
+				expert := int(context.selected.Data[row*moe.TopK+slot])
+				weight := float64(context.selectedWeights.Data[row*moe.TopK+slot])
+				weightedGradient += gradProbs[base+expert] * weight
+				totalScore += float64(context.probs.Data[base+expert])
+			}
+			if totalScore <= 0 {
+				continue
+			}
+			for slot := 0; slot < moe.TopK; slot++ {
+				expert := int(context.selected.Data[row*moe.TopK+slot])
+				score := float64(context.probs.Data[base+expert])
+				dScore := (gradProbs[base+expert] - weightedGradient) / totalScore
+				logit := float64(routerLogits.Data[base+expert])
+				sigmoid := 1 / (1 + math.Exp(-logit))
+				softplus := score * score
+				if softplus <= 0 {
+					continue
+				}
+				gradLogits.Data[base+expert] += float32(dScore * sigmoid / (2 * score))
+			}
 		}
-		for expert := 0; expert < moe.NumExperts; expert++ {
-			probability := float64(context.probs.Data[base+expert])
-			gradLogits.Data[base+expert] = float32(probability * (gradProbs[base+expert] - dot))
+	} else {
+		// Router softmax backward: dLogits = probs * (dProbs - <dProbs, probs>).
+		for row := 0; row < rows; row++ {
+			base := row * moe.NumExperts
+			var dot float64
+			for expert := 0; expert < moe.NumExperts; expert++ {
+				dot += float64(context.probs.Data[base+expert]) * gradProbs[base+expert]
+			}
+			for expert := 0; expert < moe.NumExperts; expert++ {
+				probability := float64(context.probs.Data[base+expert])
+				gradLogits.Data[base+expert] = float32(probability * (gradProbs[base+expert] - dot))
+			}
 		}
 	}
 	gradRouterInput := moe.router.weight.Backward(context.input, gradLogits)
@@ -274,7 +322,7 @@ func (moe *MoE) backwardTraining(outputGradient *tensors.Tensor, context *moeCon
 // loss is the sequence mean scaled by BalanceWeight. The top-k selection is
 // treated as constant (straight-through) for the gradient.
 func (moe *MoE) sequenceBalance(probs *tensors.Tensor, experts []expertForward, rows, sequenceLength int) (float64, []float64) {
-	if moe.BalanceWeight <= 0 || sequenceLength <= 0 || rows <= 0 || rows%sequenceLength != 0 {
+	if moe.BalanceWeight <= 0 || sequenceLength <= 0 || rows <= 0 || rows%sequenceLength != 0 || (moe.Scoring != "" && moe.Scoring != "softmax") {
 		return 0, nil
 	}
 	expertCount := moe.NumExperts

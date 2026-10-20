@@ -844,34 +844,37 @@ func compressedAttentionBackwardMasked(queryHeadMajor, keyCompressed, valueCompr
 	}
 }
 
-// compressTail compresses every row's completed tail block into the cache.
-func (attention *CausalSelfAttention) compressTail(cache *KVBuffer, layer, batchSize, embeddingDimension, headDimension int) {
+// compressTailRow compresses one row's completed tail block into the cache.
+func (attention *CausalSelfAttention) compressTailRow(cache *KVBuffer, layer, batch, embeddingDimension, headDimension int) {
 	ratio := attention.compressionRatio
 	kvHeadCount := attention.keyValueHeadCount
-	for batch := 0; batch < batchSize; batch++ {
-		hidden := tensors.NewWithData([]int{1, ratio, embeddingDimension}, cache.TailHidden(layer, batch))
-		for head := 0; head < kvHeadCount; head++ {
-			index := batch*kvHeadCount + head
-			keyHead := tensors.NewWithData([]int{1, ratio, headDimension}, cache.TailKey(layer, index))
-			valueHead := tensors.NewWithData([]int{1, ratio, headDimension}, cache.TailValue(layer, index))
-			compressedKey, _ := attention.compressor.Forward(hidden, keyHead, nil)
-			compressedValue, _ := attention.compressor.Forward(hidden, valueHead, nil)
-			cache.AppendCompressed(layer, batch, head, compressedKey.Data, compressedValue.Data)
-			if attention.indexer != nil {
-				projected := attention.indexer.key.Forward(compressedKey)
-				cache.AppendIndexerKey(layer, batch, head, projected.Data)
-			}
+	hidden := tensors.NewWithData([]int{1, ratio, embeddingDimension}, cache.TailHidden(layer, batch))
+	for head := 0; head < kvHeadCount; head++ {
+		index := batch*kvHeadCount + head
+		keyHead := tensors.NewWithData([]int{1, ratio, headDimension}, cache.TailKey(layer, index))
+		valueHead := tensors.NewWithData([]int{1, ratio, headDimension}, cache.TailValue(layer, index))
+		compressedKey, _ := attention.compressor.Forward(hidden, keyHead, nil)
+		compressedValue, _ := attention.compressor.Forward(hidden, valueHead, nil)
+		cache.AppendCompressed(layer, batch, head, compressedKey.Data, compressedValue.Data)
+		if attention.indexer != nil {
+			projected := attention.indexer.key.Forward(compressedKey)
+			cache.AppendIndexerKey(layer, batch, head, projected.Data)
 		}
 	}
-	cache.AdvanceCompressedCount(layer)
+	cache.AdvanceCompressedCountAt(layer, batch)
+	cache.ResetTail(layer, batch)
+}
+
+// compressTail compresses every row's completed tail block into the cache.
+func (attention *CausalSelfAttention) compressTail(cache *KVBuffer, layer, batchSize, embeddingDimension, headDimension int) {
 	for batch := 0; batch < batchSize; batch++ {
-		cache.ResetTail(layer, batch)
+		attention.compressTailRow(cache, layer, batch, embeddingDimension, headDimension)
 	}
 }
 
 // appendGlobalTail appends a chunk of rows to a layer's global compression
-// buffer, flushing each completed block into the layer's compressed cache. It
-// is shared by incremental inference and by the CED prefill global-cache fill.
+// buffer, flushing each row's completed block independently. It is shared by
+// incremental inference and by the CED prefill global-cache fill.
 func (attention *CausalSelfAttention) appendGlobalTail(cache *KVBuffer, layer int, hidden, key, value *tensors.Tensor, batchSize, sequenceLength, embeddingDimension, headDimension int) {
 	ratio := attention.compressionRatio
 	kvHeadCount := attention.keyValueHeadCount
@@ -882,9 +885,9 @@ func (attention *CausalSelfAttention) appendGlobalTail(cache *KVBuffer, layer in
 			keyRow := key.Data[row*kvHeadCount*headDimension : row*kvHeadCount*headDimension+kvHeadCount*headDimension]
 			valueRow := value.Data[row*kvHeadCount*headDimension : row*kvHeadCount*headDimension+kvHeadCount*headDimension]
 			cache.AppendTailRow(layer, batch, hiddenRow, keyRow, valueRow)
-		}
-		if cache.TailLength(layer, 0) == ratio {
-			attention.compressTail(cache, layer, batchSize, embeddingDimension, headDimension)
+			if cache.TailLength(layer, batch) == ratio {
+				attention.compressTailRow(cache, layer, batch, embeddingDimension, headDimension)
+			}
 		}
 	}
 }
@@ -905,19 +908,34 @@ func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value
 	queryHeadMajor := toBatchHeadLayout(query) // [B, Hq, T, D]
 	outputHeadMajor := tensors.New(batchSize, queryHeadCount, sequenceLength, headDimension)
 
+	replay := share != nil && share.replay
+	localFloor := 0
+	if replay {
+		localFloor = positionOffset
+	}
+
 	// The local sliding-window branch reads raw keys/values from the layer's
 	// own cache prefix. SWA KV is layer-local (DeepSeek-V4.1 §2.3.1): every
 	// mode computes its own, independent of the shared global compressed KV.
+	useRing := cache.RingEnabled(layer)
+	pagedDecode := cache.IsPaged() && sequenceLength == 1
 	var localKV []keyValueSlice
 	if attention.swaWindow > 0 {
 		keyHeadMajor := toBatchHeadLayout(key)
 		valueHeadMajor := toBatchHeadLayout(value)
 		localKV = make([]keyValueSlice, batchSize*kvHeadCount)
 		for batch := 0; batch < batchSize; batch++ {
+			rowPosition := cache.PositionAt(batch)
 			for head := 0; head < kvHeadCount; head++ {
 				slot := batch*kvHeadCount + head
 				keyNew := headSlice(keyHeadMajor.Data, slot, sequenceLength, headDimension)
 				valueNew := headSlice(valueHeadMajor.Data, slot, sequenceLength, headDimension)
+				if useRing {
+					keyLocal, valueLocal, relative := cache.LocalPrefix(layer, batch, head, rowPosition, sequenceLength, attention.swaWindow, localFloor, keyNew, valueNew)
+					cache.appendRawKV(layer, batch, head, rowPosition, keyNew, valueNew)
+					localKV[slot] = keyValueSlice{key: keyLocal, value: valueLocal, length: len(keyLocal) / headDimension, offset: relative}
+					continue
+				}
 				keyFull, valueFull := cache.writeKeyValue(layer, batch, head, keyNew, valueNew)
 				localKV[slot] = keyValueSlice{key: keyFull, value: valueFull}
 			}
@@ -930,7 +948,6 @@ func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value
 	if attention.reuseMode != ReuseFull {
 		cacheLayer = share.producer
 	}
-	replay := share != nil && share.replay
 	if attention.reuseMode == ReuseFull && !replay {
 		// CED decoder layers buffer the encoder hidden state together with the
 		// global keys/values projected from it instead of the layer's own
@@ -957,18 +974,16 @@ func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value
 		localOutput := make([]float32, headDimension)
 		globalLogSumExp := make([]float32, 1)
 		localLogSumExp := make([]float32, 1)
-		// During bounded replay the local window is truncated to the replay
-		// segment, so cached slots before positionOffset are excluded.
-		localFloor := 0
-		if replay {
-			localFloor = positionOffset
+		var logSumExp *tensors.Tensor
+		if attention.sink != nil {
+			logSumExp = tensors.New(batchSize, queryHeadCount, sequenceLength)
 		}
 		for batch := 0; batch < batchSize; batch++ {
 			for queryHead := 0; queryHead < queryHeadCount; queryHead++ {
 				keyValueHead := queryHead / headRatio
 				queryIndex := batch*queryHeadCount + queryHead
 				for position := 0; position < sequenceLength; position++ {
-					absolutePosition := positionOffset + position
+					absolutePosition := cache.PositionAt(batch) + position
 					count := absolutePosition / ratio
 					if available := cache.CompressedCount(cacheLayer, batch); count > available {
 						count = available
@@ -976,28 +991,41 @@ func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value
 					rowBase := (queryIndex*sequenceLength + position) * headDimension
 					outputRow := outputHeadMajor.Data[rowBase : rowBase+headDimension]
 					queryRow := queryHeadMajor.Data[rowBase : rowBase+headDimension]
+					rowIndex := queryIndex*sequenceLength + position
+					switch {
+					case pagedDecode:
+						pagedCompressedAttention(cache, cacheLayer, batch, keyValueHead, count, queryRow, globalOutput, globalLogSumExp)
+					case count == 0:
+						clear(globalOutput)
+						globalLogSumExp[0] = float32(math.Inf(-1))
+					default:
+						keySlice := cache.CompressedKey(cacheLayer, batch, keyValueHead, count)
+						valueSlice := cache.CompressedValue(cacheLayer, batch, keyValueHead, count)
+						tensors.AttentionForward(queryRow, keySlice, valueSlice, globalOutput, globalLogSumExp, 1, count, headDimension, count, -1)
+					}
 					if attention.swaWindow > 0 {
-						if count == 0 {
-							globalLogSumExp[0] = float32(math.Inf(-1))
-						} else {
-							keySlice := cache.CompressedKey(cacheLayer, batch, keyValueHead, count)
-							valueSlice := cache.CompressedValue(cacheLayer, batch, keyValueHead, count)
-							tensors.AttentionForward(queryRow, keySlice, valueSlice, globalOutput, globalLogSumExp, 1, count, headDimension, count, -1)
-						}
 						local := localKV[batch*kvHeadCount+keyValueHead]
-						localAttentionRow(queryRow, local.key, local.value, absolutePosition, localFloor, attention.swaWindow, headDimension, localOutput, localLogSumExp)
+						localPosition := absolutePosition
+						localStartFloor := localFloor
+						if useRing {
+							localPosition = local.offset + position
+							localStartFloor = 0
+						}
+						localAttentionRow(queryRow, local.key, local.value, localPosition, localStartFloor, attention.swaWindow, headDimension, localOutput, localLogSumExp)
 						mergeAttentionRow(outputRow, globalOutput, localOutput, globalLogSumExp[0], localLogSumExp[0])
+						if logSumExp != nil {
+							logSumExp.Data[rowIndex] = logAddExp(globalLogSumExp[0], localLogSumExp[0])
+						}
 						continue
 					}
-					if count == 0 {
-						clear(outputRow)
-						continue
+					if logSumExp != nil {
+						logSumExp.Data[rowIndex] = globalLogSumExp[0]
 					}
-					keySlice := cache.CompressedKey(cacheLayer, batch, keyValueHead, count)
-					valueSlice := cache.CompressedValue(cacheLayer, batch, keyValueHead, count)
-					tensors.AttentionForward(queryRow, keySlice, valueSlice, outputRow, nil, 1, count, headDimension, count, -1)
 				}
 			}
+		}
+		if logSumExp != nil {
+			applyAttentionSink(outputHeadMajor, logSumExp, attention.sink, batchSize, queryHeadCount, sequenceLength, headDimension)
 		}
 	}
 
@@ -1010,6 +1038,7 @@ func (attention *CausalSelfAttention) forwardCompressed(input, query, key, value
 // query heads that map to one key/value head. localKV holds the layer's raw
 // key/value prefix for the local sliding-window branch (nil when disabled).
 func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMajor *tensors.Tensor, cache *KVBuffer, layer, cacheLayer, positionOffset int, outputHeadMajor *tensors.Tensor, share *compressionShare, localKV []keyValueSlice) {
+	useRing := cache.RingEnabled(layer)
 	batchSize := input.Shape[0]
 	sequenceLength := input.Shape[1]
 	embeddingDimension := input.Shape[2]
@@ -1045,11 +1074,16 @@ func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMa
 	if share != nil && share.replay {
 		localFloor = positionOffset
 	}
+	var logSumExp *tensors.Tensor
+	if attention.sink != nil {
+		logSumExp = tensors.New(batchSize, queryHeadCount, sequenceLength)
+	}
 
 	for batch := 0; batch < batchSize; batch++ {
 		available := cache.CompressedCount(cacheLayer, batch)
 		hiddenSlice := tensors.NewWithData([]int{1, sequenceLength, embeddingDimension},
 			input.Data[batch*sequenceLength*embeddingDimension:(batch+1)*sequenceLength*embeddingDimension])
+		rowPosition := cache.PositionAt(batch)
 		for keyValueHead := 0; keyValueHead < kvHeadCount; keyValueHead++ {
 			selectionIndex := batch*kvHeadCount + keyValueHead
 			var selection [][]int
@@ -1085,10 +1119,10 @@ func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMa
 						if selectionIndex < len(share.candidatePool) {
 							candidatePool = share.candidatePool[selectionIndex]
 						}
-						selection = attention.indexer.SelectWithinPool(hiddenSlice, projectedKeys, available, positionOffset, ratio, topK, candidatePool)
+						selection = attention.indexer.SelectWithinPool(hiddenSlice, projectedKeys, available, rowPosition, ratio, topK, candidatePool)
 					} else {
 						var candidates [][]int
-						selection, candidates = attention.indexer.SelectProjectedWithCandidates(hiddenSlice, projectedKeys, available, positionOffset, ratio, topK, pool, budget)
+						selection, candidates = attention.indexer.SelectProjectedWithCandidates(hiddenSlice, projectedKeys, available, rowPosition, ratio, topK, pool, budget)
 						if candidatePools != nil {
 							candidatePools[selectionIndex] = candidates
 						}
@@ -1109,27 +1143,37 @@ func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMa
 					rowBase := (queryIndex*sequenceLength + position) * headDimension
 					outputRow := outputHeadMajor.Data[rowBase : rowBase+headDimension]
 					queryRow := queryHeadMajor.Data[rowBase : rowBase+headDimension]
+					rowIndex := queryIndex*sequenceLength + position
 					globalOutput := outputRow
-					var branchLogSumExp []float32
 					if attention.swaWindow > 0 {
 						globalOutput = globalScratch
-						branchLogSumExp = globalLogSumExp
-						globalLogSumExp[0] = float32(math.Inf(-1))
 					}
+					globalLogSumExp[0] = float32(math.Inf(-1))
 					if available != 0 && len(selection) != 0 && len(selection[position]) != 0 {
 						selected := selection[position]
 						for index, block := range selected {
 							copy(keyBuffer[index*headDimension:(index+1)*headDimension], keyData[block*headDimension:(block+1)*headDimension])
 							copy(valueBuffer[index*headDimension:(index+1)*headDimension], valueData[block*headDimension:(block+1)*headDimension])
 						}
-						tensors.AttentionForward(queryRow, keyBuffer[:len(selected)*headDimension], valueBuffer[:len(selected)*headDimension], globalOutput, branchLogSumExp, 1, len(selected), headDimension, len(selected), -1)
+						tensors.AttentionForward(queryRow, keyBuffer[:len(selected)*headDimension], valueBuffer[:len(selected)*headDimension], globalOutput, globalLogSumExp, 1, len(selected), headDimension, len(selected), -1)
 					} else if attention.swaWindow == 0 {
 						clear(outputRow)
 					}
 					if attention.swaWindow > 0 {
 						local := localKV[batch*kvHeadCount+keyValueHead]
-						localAttentionRow(queryRow, local.key, local.value, positionOffset+position, localFloor, attention.swaWindow, headDimension, localScratch, localLogSumExp)
+						localPosition := cache.PositionAt(batch) + position
+						localStartFloor := localFloor
+						if useRing {
+							localPosition = local.offset + position
+							localStartFloor = 0
+						}
+						localAttentionRow(queryRow, local.key, local.value, localPosition, localStartFloor, attention.swaWindow, headDimension, localScratch, localLogSumExp)
 						mergeAttentionRow(outputRow, globalOutput, localScratch, globalLogSumExp[0], localLogSumExp[0])
+						if logSumExp != nil {
+							logSumExp.Data[rowIndex] = logAddExp(globalLogSumExp[0], localLogSumExp[0])
+						}
+					} else if logSumExp != nil {
+						logSumExp.Data[rowIndex] = globalLogSumExp[0]
 					}
 				}
 			}
@@ -1142,6 +1186,9 @@ func (attention *CausalSelfAttention) forwardCompressedSparse(input, queryHeadMa
 		// Publish the coarse candidate pool for the group's Reindex layers;
 		// clear any stale pool when the hierarchical indexer is disabled.
 		share.candidatePool = candidatePools
+	}
+	if logSumExp != nil {
+		applyAttentionSink(outputHeadMajor, logSumExp, attention.sink, batchSize, queryHeadCount, sequenceLength, headDimension)
 	}
 }
 
@@ -1161,17 +1208,17 @@ func (attention *CausalSelfAttention) cacheReusedIndexerKeys(cache *KVBuffer, la
 	if attention.indexer == nil {
 		return
 	}
-	producerCount := cache.CompressedCount(producer, 0)
-	ownCount := cache.CompressedCount(layer, 0)
-	for block := ownCount; block < producerCount; block++ {
-		for batch := 0; batch < batchSize; batch++ {
+	for batch := 0; batch < batchSize; batch++ {
+		producerCount := cache.CompressedCount(producer, batch)
+		ownCount := cache.CompressedCount(layer, batch)
+		for block := ownCount; block < producerCount; block++ {
 			for head := 0; head < attention.keyValueHeadCount; head++ {
 				compressed := tensors.NewWithData([]int{1, 1, headDimension}, cache.CompressedBlock(producer, batch, head, block))
 				projected := attention.indexer.key.Forward(compressed)
 				cache.AppendIndexerKey(layer, batch, head, projected.Data)
 			}
+			cache.AdvanceCompressedCountAt(layer, batch)
 		}
-		cache.AdvanceCompressedCount(layer)
 	}
 }
 

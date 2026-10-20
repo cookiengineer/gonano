@@ -67,15 +67,17 @@ preset (or runtime API) that turns each concept on.
 
 ### 2.1 Causal Encoder-Decoder (CED)
 
-The paper splits the 40-layer backbone into a 20-layer causal **encoder** and a
-20-layer **decoder**; the decoder's *global* keys/values are projected from the
-encoder's final hidden state `H_{L/2}` instead of from each decoder layer's own
-hidden state, so prefill drops from `O(N*L)` to roughly `O(N*L/2)`
-(paper Sec. 2.2).
+The paper splits the backbone into a causal **encoder** and a **decoder**; the
+decoder's *global* keys/values are projected from the encoder's final hidden
+state instead of from each decoder layer's own hidden state, so prefill drops
+from `O(N*L)` to roughly `O(N*L/2)` (paper Sec. 2.2).
 
 In gonano:
 
-- `Config.CED` enables the split; `Config.CEDSplit()` returns `NumLayer/2`.
+- `Config.CED` enables the split. `Config.PrefillLayer` sets the first
+  decoder/consumer layer explicitly; when it is zero, `Config.CEDSplit()` keeps
+  the historical `NumLayer/2` behavior. The `flash` preset uses an explicit
+  YOCO boundary and a per-layer layout (see Sec. 2.2).
 - Training (`model/train_transformer.go`) captures `encoderHidden` at the split
   and hands it to each decoder group through `compressionShare.encoderHidden`.
   `model/train.go` (`cedGlobalKeyValue`, `cedKeyProjectionBackward`,
@@ -102,11 +104,21 @@ building block through the prefix cache (Sec. 6).
 
 ### 2.2 Dense KV compression (HCA) and sparse attention (CSA)
 
-Every compressed layer owns a `ChannelCompressor` (`model/compress.go`). It maps
-the hidden state to per-channel logits, adds a learnable per-position bias
+The `flash` preset uses a per-layer DeepSeek-V4.1 layout instead of one uniform
+ratio. `Config.CompressionRatios` assigns each layer a ratio: `0` is a
+sliding-window-only encoder layer, `1` is a C1 packed-KV layer (identity
+compression, no row merging), and values above `1` merge that many rows into
+one compressed entry. `Config.PrefillLayer` marks the first consumer layer of
+the YOCO split. Legacy checkpoints leave `CompressionRatios` empty and keep the
+uniform `CompressionRatio` behavior.
+
+Every layer with a packed/compressed path owns a `ChannelCompressor`
+(`model/compress.go`) unless it reuses another layer's state. It maps the hidden
+state to per-channel logits, adds a learnable per-position bias
 `bias [ratio, channels]`, and merges each block of `ratio` consecutive rows into
-one compressed entry with a per-channel softmax over the block. This is the
-dense HCA path.
+one compressed entry with a per-channel softmax over the block. For C1 the
+softmax has one row, so the operation is the identity; it still gives the layer
+the packed-KV, sparse-indexer, and reuse plumbing. This is the dense HCA path.
 
 When `--sparse-topk K` is set, each query instead attends to the top-`K`
 compressed blocks selected by a **lightning indexer** (`SparseIndexer`,
@@ -361,8 +373,9 @@ and per-token weight bytes.
 
 **Scope note:** the low-rank query/KV latent (`--query-compression-dim`,
 `--kv-latent-dim`) reduces **compute and parameters, not cache bytes**; it keeps
-the full per-head KV cache. Both are genuine architectural changes and must be
-trained from scratch.
+the full per-head KV cache. The `flash` preset's absorbed MLA composes with the
+per-layer compression/SWA/sparse/reuse stack. Both are genuine architectural
+changes and must be trained from scratch.
 
 **Absorbed MLA latent cache.** `--mla-latent R` enables a separate absorbed MLA
 mode: the content key/value latent is shared (`c_kv`, width `R`) and a decoupled
@@ -502,8 +515,8 @@ Units: `TestDistillationMatchesCrossEntropyForOneHotTeacher`,
 `TestDistillMaskRestrictsGradient`, `TestDistillLoop`.
 
 **DSpark speculative decoding.** `cmd/dspark_train` builds a `model.DSpark`: a
-small trunk (3 blocks, context capped at 128 tokens) distilled from a frozen,
-uncompressed backbone, plus a low-rank **Markov head** and a **confidence head**
+small trunk (3 blocks, context capped at 128 tokens) distilled from a frozen
+backbone, plus a low-rank **Markov head** and a **confidence head**
 trained on top of the frozen trunk. `DSpark.Draft` is **semi-autoregressive**
 (DeepSeek-V4.1 Sec. 2.4.3): it runs a *single* trunk forward over the context
 followed by `count-1` learned **draft-mask positions**
@@ -521,9 +534,10 @@ per-position conditional acceptance confidences) against
 in a single forward, and the longest matching prefix is accepted. Output is
 bit-for-bit identical to greedy decoding regardless of the scheduler (verified
 by `TestSpeculativeMatchesGreedy` and `TestSpeculativeWithDSparkMatchesGreedy`).
-It is limited to single-row, greedy (`--temperature 0`), uncompressed models and
-does not run the tool-call state machine; other requests transparently use the
-normal path. `cmd/infer_bench` (`--drafter ... --speculative`) and `cmd/chat_cli`
+It is limited to single-row, greedy (`--temperature 0`) requests and does not
+run the tool-call state machine; other requests transparently use the normal
+path. Compressed and MLA targets use a cache mark/rollback transaction: rejected
+drafts are rewound and only the accepted prefix is replayed. `cmd/infer_bench` (`--drafter ... --speculative`) and `cmd/chat_cli`
 expose it, and a DSpark checkpoint is detected via `checkpoint.IsDSpark`.
 
 `cmd/dspark_train` first distills the trunk from the frozen backbone, then
@@ -670,7 +684,7 @@ feature flags at all.
 
 | Preset | Default | What it enables |
 |---|---|---|
-| `flash` | yes | HCA compression (ratio 4), CSA sparse attention (top-k 8), hierarchical indexer (pool 8), cross-layer reuse (`FRU`), SWA (128), CED, SwiGLU DeepSeekMoE, GQA, head-wise Muon, partial RoPE, Sinkhorn embeddings/head |
+| `flash` | yes | Per-layer C1/C2 layout (sliding-window-only encoder, C1 boundary, C2 decoder), explicit YOCO boundary, absorbed MLA, CSA sparse attention (top-k 8), hierarchical indexer (pool 8), cross-layer reuse (`FRU`), SWA (128), CED, attention sinks, YaRN-capable per-layer RoPE, SwiGLU DeepSeekMoE with `sqrtsoftplus`/`noaux_tc`, single KV head, DFlash/MTP drafting, Sinkhorn embeddings/head |
 | `latent` | | Absorbed MLA + SwiGLU DeepSeekMoE + GQA + partial RoPE + Sinkhorn |
 | `dense` | | The historical dense nanochat decoder (full attention, ReLU^2 MLP, no MoE) |
 
@@ -679,6 +693,8 @@ switches: `--depth`, `--max-seq-len`, `--vocab-size`, `--num-iterations`,
 `--device-batch-size`, `--total-batch-size`, `--data-dir`, `--data-format`,
 `--model-tag`, `--base-dir` (plus the tokenizer flags on `cmd/trainer`).
 
+The per-layer layout is set by the preset (`Config.CompressionRatios` and
+`Config.PrefillLayer`); legacy configs still use a uniform `CompressionRatio`.
 The former per-feature flags (`--compression-ratio`, `--sparse-topk`,
 `--indexer-*`, `--reuse-pattern`, `--swa-window`, `--ced`, `--head-wise-muon`,
 `--sinkhorn-embeddings`, `--query-compression-dim`, `--kv-latent-dim`,

@@ -14,6 +14,23 @@ type Config struct {
 	NumKVHead     int    `json:"n_kv_head"`      // number of key/value heads (GQA)
 	EmbedDim      int    `json:"n_embd"`         // transformer width (n_embd)
 	WindowPattern string `json:"window_pattern"` // sliding-window pattern (L=long, S=short)
+	// RopeTheta is the RoPE frequency base (default 100000).
+	RopeTheta float64 `json:"rope_theta,omitempty"`
+	// CompressRopeTheta is the frequency base for compressed layers; zero uses
+	// RopeTheta.
+	CompressRopeTheta float64 `json:"compress_rope_theta,omitempty"`
+	// RopeScaling selects the rotary scaling mode: empty/"none" (base RoPE) or
+	// "yarn".
+	RopeScaling string `json:"rope_scaling,omitempty"`
+	// RopeScalingFactor is the YaRN context-extension factor.
+	RopeScalingFactor float64 `json:"rope_scaling_factor,omitempty"`
+	// RopeOriginalMaxPosition is the original trained context length for YaRN.
+	RopeOriginalMaxPosition int `json:"rope_original_max_position,omitempty"`
+	// RopeBetaFast and RopeBetaSlow are the YaRN correction bounds.
+	RopeBetaFast float64 `json:"rope_beta_fast,omitempty"`
+	RopeBetaSlow float64 `json:"rope_beta_slow,omitempty"`
+	// RopeMScale applies the YaRN magnitude scale to the rotary tables.
+	RopeMScale bool `json:"rope_mscale,omitempty"`
 	// RotaryDims is the number of trailing head dimensions that receive RoPE
 	// (partial rotary embedding, as used by DeepSeek-V4). Zero means the full
 	// head dimension, preserving the historical behavior.
@@ -21,8 +38,21 @@ type Config struct {
 	// CompressionRatio enables HCA-style dense KV compression on every layer
 	// when > 1: each ratio consecutive key/value rows are merged into one
 	// compressed entry, and queries attend to strictly preceding compressed
-	// blocks. Zero or one disables compression.
+	// blocks. Zero or one disables compression. CompressionRatios, when set,
+	// overrides this field with a per-layer layout.
 	CompressionRatio int `json:"compression_ratio,omitempty"`
+	// CompressionRatios is the optional per-layer compression layout used by
+	// DeepSeek-V4.1-style models. Each entry is one layer's ratio:
+	//   0 - sliding-window-only layer (no packed global KV)
+	//   1 - C1 packed KV layer (identity compression, no row merging)
+	//  >=2 - compressed layer (each ratio rows merge into one entry)
+	// When empty, CompressionRatio applies uniformly to every layer, preserving
+	// the legacy checkpoint behavior.
+	CompressionRatios []int `json:"compression_ratios,omitempty"`
+	// PrefillLayer is the first decoder/consumer layer of the causal
+	// encoder-decoder split (DeepSeek-V4.1 YOCO). It is only meaningful when
+	// CED is enabled; zero derives the historical NumLayer/2 split.
+	PrefillLayer int `json:"prefill_layer,omitempty"`
 	// SparseTopK enables CSA-style sparse attention on compressed layers: each
 	// query attends only to the top-k compressed blocks selected by the
 	// lightning indexer. Zero disables sparsity (dense compressed attention).
@@ -63,6 +93,13 @@ type Config struct {
 	// The decoder's local sliding-window branch still reads its own hidden
 	// state. CED requires compression and a local window.
 	CED bool `json:"ced,omitempty"`
+	// AttentionSink enables a learnable per-query-head sink logit in the
+	// attention softmax (DeepSeek-V4.1 §2.3). The sink participates in the
+	// denominator but has a zero value vector, so it absorbs probability mass
+	// without contributing to the output.
+	AttentionSink bool `json:"attention_sink,omitempty"`
+	// AttentionSinkInit is the initial sink logit value (default 0).
+	AttentionSinkInit float32 `json:"attention_sink_init,omitempty"`
 	// HeadWiseMuon splits the query and key projection weights by attention
 	// head and orthogonalizes each head independently with Muon (DeepSeek-V4.1
 	// §2.5). It is a training-only setting; it adds no inference cost.
@@ -105,6 +142,14 @@ type Config struct {
 	// SharedExpertHiddenDim is the intermediate width of the always-active
 	// shared expert. Zero defaults to ExpertHiddenDim.
 	SharedExpertHiddenDim int `json:"shared_expert_hidden_dim,omitempty"`
+	// MoEScoring selects the router scoring function: empty/"softmax" (legacy)
+	// or "sqrtsoftplus" (DeepSeek-V4.1).
+	MoEScoring string `json:"moe_scoring,omitempty"`
+	// MoETopKMethod selects the selection method: empty/"noaux_tc" keeps the
+	// DeepSeek-V4.1 correction-bias selection.
+	MoETopKMethod string `json:"moe_topk_method,omitempty"`
+	// MoENormTopKProb normalizes the selected routed weights to sum to one.
+	MoENormTopKProb bool `json:"moe_norm_topk_prob,omitempty"`
 	// MoEClamp is the SwiGLU clamp threshold; gate is clamped above it and up
 	// into [-MoEClamp, MoEClamp]. Zero uses the paper's default of 10; a
 	// negative value disables clamping.
@@ -115,6 +160,18 @@ type Config struct {
 	// RouterBiasUpdate is the auxiliary-loss-free load-balancing bias update
 	// speed (DeepSeek-V4.1 §2.1.1, §4.2.2). Zero defaults to 0.001.
 	RouterBiasUpdate float32 `json:"router_bias_update,omitempty"`
+	// NumNextNPredictLayers is the number of DFlash/MTP draft stages attached to
+	// the backbone. Zero disables DFlash.
+	NumNextNPredictLayers int `json:"num_nextn_predict_layers,omitempty"`
+	// DFlashTargetLayerIDs lists the backbone layers whose hidden states feed
+	// the DFlash projection.
+	DFlashTargetLayerIDs []int `json:"dflash_target_layer_ids,omitempty"`
+	// DFlashBlockSize is the number of draft tokens proposed per step.
+	DFlashBlockSize int `json:"dflash_block_size,omitempty"`
+	// DFlashNoiseToken is the placeholder token id used for draft positions.
+	DFlashNoiseToken int `json:"dflash_noise_token,omitempty"`
+	// DFlashMarkovRank is the low-rank width of the Markov correction head.
+	DFlashMarkovRank int `json:"dflash_markov_rank,omitempty"`
 	// MoEBalanceWeight is the weight of the small sequence-level load-balancing
 	// auxiliary loss (DeepSeek-V4.1 §4.2.2, weight 1e-4) that prevents extreme
 	// expert imbalance within a single training sequence. Zero uses the paper's
@@ -281,9 +338,13 @@ func (config Config) MLARotaryDimension() int {
 
 // CEDSplit returns the first decoder layer index, or 0 when CED is disabled.
 // The encoder is layers [0, CEDSplit) and the decoder is [CEDSplit, NumLayer).
+// An explicit PrefillLayer overrides the historical half-depth split.
 func (config Config) CEDSplit() int {
 	if !config.CED {
 		return 0
+	}
+	if config.PrefillLayer > 0 && config.PrefillLayer < config.NumLayer {
+		return config.PrefillLayer
 	}
 	return config.NumLayer / 2
 }
@@ -323,16 +384,138 @@ func (config Config) reuseHalfStart(layer int) int {
 	return 0
 }
 
-// ReuseModeAt returns the reuse mode of a layer, cycling the configured
-// pattern. An empty pattern yields ReuseFull for every layer. Under CED the
-// pattern is applied independently to the encoder and decoder halves.
+// LayeredCompression reports whether the config carries an explicit per-layer
+// compression layout rather than the legacy uniform CompressionRatio.
+func (config Config) LayeredCompression() bool {
+	return len(config.CompressionRatios) > 0
+}
+
+// LayerRatioAt returns the effective compression ratio of one layer. A ratio
+// of zero is a sliding-window-only layer, one is a C1 packed layer (no row
+// merging), and values above one merge that many rows into one entry.
+func (config Config) LayerRatioAt(layer int) int {
+	if config.LayeredCompression() {
+		if layer < 0 || layer >= len(config.CompressionRatios) {
+			return 0
+		}
+		ratio := config.CompressionRatios[layer]
+		if ratio < 0 {
+			return 0
+		}
+		return ratio
+	}
+	if layer < 0 || layer >= config.NumLayer {
+		return config.Compression()
+	}
+	return config.Compression()
+}
+
+// HasCompressionAt reports whether a layer uses the packed/global KV path. C1
+// layers (ratio 1) have packed KV but do not merge rows.
+func (config Config) HasCompressionAt(layer int) bool {
+	if config.LayeredCompression() {
+		return config.LayerRatioAt(layer) >= 1
+	}
+	return config.Compression() > 1
+}
+
+// CompressesAt reports whether a layer actually merges rows.
+func (config Config) CompressesAt(layer int) bool {
+	return config.LayerRatioAt(layer) > 1
+}
+
+// SparseAt reports whether a layer owns the lightning indexer.
+func (config Config) SparseAt(layer int) bool {
+	return config.SparseTopK > 0 && config.HasCompressionAt(layer)
+}
+
+// AnyCompression reports whether at least one layer uses the packed global KV
+// path.
+func (config Config) AnyCompression() bool {
+	if !config.LayeredCompression() {
+		return config.Compression() > 1
+	}
+	for layer := range config.CompressionRatios {
+		if config.CompressionRatios[layer] >= 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// AnySparse reports whether at least one layer owns a lightning indexer.
+func (config Config) AnySparse() bool {
+	if config.SparseTopK <= 0 {
+		return false
+	}
+	if !config.LayeredCompression() {
+		return config.Compression() > 1
+	}
+	for layer := range config.CompressionRatios {
+		if config.CompressionRatios[layer] >= 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// LayerRatios returns the effective per-layer compression layout. Legacy
+// configs are expanded to a uniform list so cache allocation can use one path.
+func (config Config) LayerRatios() []int {
+	ratios := make([]int, config.NumLayer)
+	for layer := 0; layer < config.NumLayer; layer++ {
+		ratios[layer] = config.LayerRatioAt(layer)
+	}
+	return ratios
+}
+
+// CompressedMaxBlocks returns the maximum number of compressed entries each
+// layer can hold for a cache capacity of capacity tokens.
+func (config Config) CompressedMaxBlocks(capacity int) []int {
+	maxBlocks := make([]int, config.NumLayer)
+	for layer := 0; layer < config.NumLayer; layer++ {
+		ratio := config.LayerRatioAt(layer)
+		if ratio < 1 {
+			continue
+		}
+		maxBlocks[layer] = capacity/ratio + 1
+	}
+	// A reindex/reuse layer shares its producer's compressed KV and, for
+	// reindex layers, caches indexer keys for every producer entry. Its
+	// buffers must therefore cover the producer's capacity even when its own
+	// compression ratio is higher.
+	for layer := 0; layer < config.NumLayer; layer++ {
+		if !config.HasCompressionAt(layer) || config.OwnsCompressed(layer) {
+			continue
+		}
+		producer := config.ReuseProducer(layer)
+		if producer >= 0 && producer < len(maxBlocks) && maxBlocks[producer] > maxBlocks[layer] {
+			maxBlocks[layer] = maxBlocks[producer]
+		}
+	}
+	return maxBlocks
+}
+
+// ReuseModeAt returns the reuse mode of a compressed layer, cycling the
+// configured pattern over the compressed layers of its encoder/decoder segment.
+// An empty pattern yields ReuseFull for every layer. Sliding-window-only layers
+// are never reuse layers and always return ReuseFull.
 func (config Config) ReuseModeAt(layer int) ReuseMode {
+	if !config.HasCompressionAt(layer) {
+		return ReuseFull
+	}
 	pattern := config.ReusePattern
 	if len(pattern) == 0 {
 		return ReuseFull
 	}
 	start := config.reuseHalfStart(layer)
-	switch pattern[(layer-start)%len(pattern)] {
+	position := 0
+	for index := start; index < layer; index++ {
+		if config.HasCompressionAt(index) {
+			position++
+		}
+	}
+	switch pattern[position%len(pattern)] {
 	case 'R', 'r':
 		return ReuseReindex
 	case 'U', 'u':
@@ -343,26 +526,28 @@ func (config Config) ReuseModeAt(layer int) ReuseMode {
 }
 
 // OwnsCompressed reports whether a layer produces its own compressed KV rather
-// than borrowing the producing layer's.
+// than borrowing the producing layer's. Sliding-window-only layers own no
+// compressed KV.
 func (config Config) OwnsCompressed(layer int) bool {
-	return config.ReuseModeAt(layer) == ReuseFull
+	return config.HasCompressionAt(layer) && config.ReuseModeAt(layer) == ReuseFull
 }
 
 // OwnsIndexer reports whether a layer owns a lightning indexer. Full and
-// reindex layers do when sparsity is enabled; pure reuse layers do not.
+// reindex compressed layers do when sparsity is enabled; pure reuse layers do
+// not.
 func (config Config) OwnsIndexer(layer int) bool {
-	return config.SparseTopK > 0 && config.ReuseModeAt(layer) != ReuseReuse
+	return config.SparseAt(layer) && config.ReuseModeAt(layer) != ReuseReuse
 }
 
-// ReuseProducer returns the index of the producing full layer for a reuse
-// layer, or the layer itself when it is full. It assumes Validate has passed,
-// which guarantees at least one preceding full layer.
+// ReuseProducer returns the index of the producing full compressed layer for a
+// reuse layer, or the layer itself when it is full. It assumes Validate has
+// passed, which guarantees a preceding full compressed layer in the segment.
 func (config Config) ReuseProducer(layer int) int {
 	if config.ReuseModeAt(layer) == ReuseFull {
 		return layer
 	}
 	for index := layer - 1; index >= config.reuseHalfStart(layer); index-- {
-		if config.ReuseModeAt(index) == ReuseFull {
+		if config.HasCompressionAt(index) && config.ReuseModeAt(index) == ReuseFull {
 			return index
 		}
 	}
@@ -403,12 +588,23 @@ func (config Config) indexerDefaults() (dim, heads int) {
 	return dim, heads
 }
 
-// Compression returns the effective KV compression ratio (>= 1).
+// Compression returns the maximum effective KV compression ratio (>= 1).
+// Legacy configs use the uniform CompressionRatio; layered configs report the
+// widest layer ratio for accounting and legacy callers.
 func (config Config) Compression() int {
-	if config.CompressionRatio <= 1 {
-		return 1
+	maxRatio := 1
+	if config.LayeredCompression() {
+		for _, ratio := range config.CompressionRatios {
+			if ratio > maxRatio {
+				maxRatio = ratio
+			}
+		}
+		return maxRatio
 	}
-	return config.CompressionRatio
+	if config.CompressionRatio > maxRatio {
+		return config.CompressionRatio
+	}
+	return maxRatio
 }
 
 // SWAWindowSize returns the local sliding-window width used by compressed
@@ -443,6 +639,46 @@ func (config Config) RotaryDimension() int {
 	return config.RotaryDims
 }
 
+// EffectiveRopeTheta returns the base rotary frequency, defaulting to 100000.
+func (config Config) EffectiveRopeTheta() float64 {
+	if config.RopeTheta > 0 {
+		return config.RopeTheta
+	}
+	return 100000
+}
+
+// EffectiveCompressRopeTheta returns the compressed-layer rotary frequency.
+func (config Config) EffectiveCompressRopeTheta() float64 {
+	if config.CompressRopeTheta > 0 {
+		return config.CompressRopeTheta
+	}
+	return config.EffectiveRopeTheta()
+}
+
+// ropeScalingConfig returns the YaRN configuration used for the rotary tables.
+func (config Config) ropeScalingConfig() RopeScalingConfig {
+	mode := config.RopeScaling
+	if mode == "none" {
+		mode = ""
+	}
+	return RopeScalingConfig{
+		Mode:                mode,
+		Factor:              config.RopeScalingFactor,
+		OriginalMaxPosition: config.RopeOriginalMaxPosition,
+		BetaFast:            config.RopeBetaFast,
+		BetaSlow:            config.RopeBetaSlow,
+		MScale:              config.RopeMScale,
+	}
+}
+
+// RopeThetaForLayer returns the rotary frequency of one layer.
+func (config Config) RopeThetaForLayer(layer int) float64 {
+	if config.CompressesAt(layer) {
+		return config.EffectiveCompressRopeTheta()
+	}
+	return config.EffectiveRopeTheta()
+}
+
 // HeadDim returns the per-head dimension d = n_embd / n_head.
 func (config Config) HeadDim() int { return config.EmbedDim / config.NumHead }
 
@@ -462,8 +698,27 @@ func (config Config) Validate() {
 			panic(fmt.Sprintf("model: invalid window pattern %q", config.WindowPattern))
 		}
 	}
-	if config.SparseTopK > 0 && config.Compression() <= 1 {
-		panic("model: SparseTopK requires CompressionRatio > 1")
+	if config.LayeredCompression() {
+		if len(config.CompressionRatios) != config.NumLayer {
+			panic(fmt.Sprintf("model: CompressionRatios length %d != NumLayer %d", len(config.CompressionRatios), config.NumLayer))
+		}
+		for layer, ratio := range config.CompressionRatios {
+			if ratio < 0 {
+				panic(fmt.Sprintf("model: layer %d compression ratio %d must be >= 0", layer, ratio))
+			}
+			if ratio == 1 && config.SWAWindowSize() <= 0 {
+				panic(fmt.Sprintf("model: C1 layer %d requires SWAWindow > 0", layer))
+			}
+		}
+	}
+	if config.PrefillLayer < 0 || config.PrefillLayer > config.NumLayer {
+		panic(fmt.Sprintf("model: PrefillLayer %d must be in [0, NumLayer=%d]", config.PrefillLayer, config.NumLayer))
+	}
+	if config.PrefillLayer > 0 && !config.CED {
+		panic("model: PrefillLayer requires CED")
+	}
+	if config.SparseTopK > 0 && !config.AnyCompression() {
+		panic("model: SparseTopK requires at least one packed/compressed layer")
 	}
 	if config.SWAWindow < 0 {
 		panic(fmt.Sprintf("model: SWAWindow %d must be >= 0", config.SWAWindow))
@@ -481,18 +736,6 @@ func (config Config) Validate() {
 		panic(fmt.Sprintf("model: MLARotaryDims %d must be >= 0", config.MLARotaryDims))
 	}
 	if config.MLAEnabled() {
-		if config.Compression() > 1 {
-			panic("model: MLA is not supported with compression")
-		}
-		if config.CED {
-			panic("model: MLA is not supported with CED")
-		}
-		if config.SparseTopK > 0 {
-			panic("model: MLA is not supported with sparse attention")
-		}
-		if config.ReusePattern != "" {
-			panic("model: MLA is not supported with cross-layer reuse")
-		}
 		if config.QueryCompressionDim > 0 || config.KVLatentDim > 0 {
 			panic("model: MLA is incompatible with QueryCompressionDim/KVLatentDim")
 		}
@@ -504,8 +747,8 @@ func (config Config) Validate() {
 		}
 	}
 	if config.ReusePattern != "" {
-		if config.Compression() <= 1 {
-			panic("model: ReusePattern requires CompressionRatio > 1")
+		if !config.AnyCompression() {
+			panic("model: ReusePattern requires at least one packed/compressed layer")
 		}
 		for _, patternChar := range config.ReusePattern {
 			switch patternChar {
@@ -514,22 +757,32 @@ func (config Config) Validate() {
 				panic(fmt.Sprintf("model: invalid reuse pattern %q", config.ReusePattern))
 			}
 		}
-		if config.ReuseModeAt(0) != ReuseFull {
-			panic(fmt.Sprintf("model: reuse pattern %q must start with F", config.ReusePattern))
+		starts := []int{0}
+		if config.CED && config.CEDSplit() > 0 {
+			starts = append(starts, config.CEDSplit())
+		}
+		for _, start := range starts {
+			for layer := start; layer < config.NumLayer; layer++ {
+				if config.HasCompressionAt(layer) {
+					if config.ReuseModeAt(layer) != ReuseFull {
+						panic(fmt.Sprintf("model: reuse pattern %q must start each segment with F (layer %d)", config.ReusePattern, layer))
+					}
+					break
+				}
+			}
 		}
 	}
 	if config.CED {
-		if config.Compression() <= 1 {
-			panic("model: CED requires CompressionRatio > 1")
+		for layer := config.CEDSplit(); layer < config.NumLayer; layer++ {
+			if !config.HasCompressionAt(layer) {
+				panic(fmt.Sprintf("model: CED decoder layer %d requires packed/compressed KV", layer))
+			}
 		}
 		if config.SWAWindowSize() <= 0 {
 			panic("model: CED requires SWAWindow > 0")
 		}
 		if config.NumLayer < 2 {
 			panic(fmt.Sprintf("model: CED requires NumLayer >= 2, got %d", config.NumLayer))
-		}
-		if config.ReusePattern != "" && config.ReuseModeAt(config.CEDSplit()) != ReuseFull {
-			panic(fmt.Sprintf("model: CED reuse pattern %q must start each half with F", config.ReusePattern))
 		}
 	}
 	if config.NumExperts < 0 {
@@ -632,6 +885,17 @@ func (config Config) WindowSizes() [][2]int {
 	shortWindow := -((-config.SequenceLen / 4) / 128) * 128 // ceil(T/4/128)*128
 	sizes := make([][2]int, config.NumLayer)
 	for layerIndex := 0; layerIndex < config.NumLayer; layerIndex++ {
+		// A layered V4.1 encoder uses sliding-window-only layers. Compressed
+		// layers use the global compressed branch plus the local SWAWindow, so
+		// this per-layer window is only consumed by non-compressed layers.
+		if config.LayeredCompression() && !config.HasCompressionAt(layerIndex) && config.SWAWindowSize() > 0 {
+			sizes[layerIndex] = [2]int{config.SWAWindowSize(), 0}
+			continue
+		}
+		if len(pattern) == 0 {
+			sizes[layerIndex] = [2]int{longWindow, 0}
+			continue
+		}
 		patternChar := pattern[layerIndex%len(pattern)]
 		switch patternChar {
 		case 'L', 'l':
@@ -640,6 +904,32 @@ func (config Config) WindowSizes() [][2]int {
 			sizes[layerIndex] = [2]int{shortWindow, 0}
 		}
 	}
-	sizes[config.NumLayer-1] = [2]int{longWindow, 0}
+	if !config.LayeredCompression() || config.HasCompressionAt(config.NumLayer-1) {
+		sizes[config.NumLayer-1] = [2]int{longWindow, 0}
+	}
 	return sizes
+}
+
+// RingWindows returns the per-layer local sliding-window width that can be
+// served from a bounded ring instead of storing every raw K/V row. Zero means
+// the layer needs the full-context raw cache (or has no local branch).
+func (config Config) RingWindows() []int {
+	windows := config.WindowSizes()
+	result := make([]int, config.NumLayer)
+	for layer := 0; layer < config.NumLayer; layer++ {
+		if config.HasCompressionAt(layer) {
+			// Compressed layers read raw K/V only for the local branch.
+			if config.SWAWindowSize() > 0 && config.SWAWindowSize() < config.SequenceLen {
+				result[layer] = config.SWAWindowSize()
+			}
+			continue
+		}
+		if layer < len(windows) {
+			width := windows[layer][0]
+			if width > 0 && width < config.SequenceLen {
+				result[layer] = width
+			}
+		}
+	}
+	return result
 }

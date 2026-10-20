@@ -33,9 +33,10 @@ func TestReplaySWARebuildsExactWhenWindowCoversPrefix(t *testing.T) {
 
 	headDim := config.HeadDim()
 	for layer := 0; layer < config.NumLayer; layer++ {
-		for index := range cache.keyCache[layer] {
+		for head := 0; head < config.NumKVHead; head++ {
+			key, _ := cache.storage.readRaw(layer, 0, head, len(prompt))
 			for element := 0; element < len(prompt)*headDim; element++ {
-				if math.IsNaN(float64(cache.keyCache[layer][index].Data[element])) {
+				if math.IsNaN(float64(key[element])) {
 					t.Fatal("original key cache is non-finite")
 				}
 			}
@@ -52,17 +53,15 @@ func TestReplaySWARebuildsExactWhenWindowCoversPrefix(t *testing.T) {
 		t.Fatalf("position after replay = %d, want %d", stripped.Position(), len(prompt))
 	}
 	for layer := 0; layer < config.NumLayer; layer++ {
-		for index := range cache.keyCache[layer] {
+		for head := 0; head < config.NumKVHead; head++ {
+			gotKey, gotValue := stripped.storage.readRaw(layer, 0, head, len(prompt))
+			wantKey, wantValue := cache.storage.readRaw(layer, 0, head, len(prompt))
 			for element := 0; element < len(prompt)*headDim; element++ {
-				got := stripped.keyCache[layer][index].Data[element]
-				want := cache.keyCache[layer][index].Data[element]
-				if math.Abs(float64(got-want)) > 1e-5 {
-					t.Fatalf("replayed key layer %d index %d element %d = %v, want %v", layer, index, element, got, want)
+				if math.Abs(float64(gotKey[element]-wantKey[element])) > 1e-5 {
+					t.Fatalf("replayed key layer %d head %d element %d = %v, want %v", layer, head, element, gotKey[element], wantKey[element])
 				}
-				gotValue := stripped.valueCache[layer][index].Data[element]
-				wantValue := cache.valueCache[layer][index].Data[element]
-				if math.Abs(float64(gotValue-wantValue)) > 1e-5 {
-					t.Fatalf("replayed value layer %d index %d element %d = %v, want %v", layer, index, element, gotValue, wantValue)
+				if math.Abs(float64(gotValue[element]-wantValue[element])) > 1e-5 {
+					t.Fatalf("replayed value layer %d head %d element %d = %v, want %v", layer, head, element, gotValue[element], wantValue[element])
 				}
 			}
 		}
@@ -108,12 +107,13 @@ func TestReplaySWARepopulatesTailWindow(t *testing.T) {
 	}
 	headDim := config.HeadDim()
 	for layer := 0; layer < config.NumLayer; layer++ {
-		for index := range stripped.keyCache[layer] {
+		for head := 0; head < config.NumKVHead; head++ {
+			key, _ := stripped.storage.readRaw(layer, 0, head, len(prompt))
 			nonZero := false
 			for position := len(prompt) - window; position < len(prompt); position++ {
 				base := position * headDim
 				for element := 0; element < headDim; element++ {
-					value := stripped.keyCache[layer][index].Data[base+element]
+					value := key[base+element]
 					if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
 						t.Fatal("replayed window key is non-finite")
 					}

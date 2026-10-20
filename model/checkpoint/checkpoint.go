@@ -142,6 +142,24 @@ func IsDSpark(meta Meta) bool {
 	return dspark
 }
 
+// IsDFlash reports whether a checkpoint holds a DFlash/MTP drafter.
+func IsDFlash(meta Meta) bool {
+	dflash, _ := meta.UserConfig["dflash"].(bool)
+	return dflash
+}
+
+// LoadDFlash reconstructs a DFlash drafter from a checkpoint.
+func LoadDFlash(meta Meta, params map[string]*tensors.Tensor) *model.DFlash {
+	dflash := model.NewDFlashFromConfig(meta.ModelConfig)
+	parametersByName := dflash.NamedParameters()
+	for name, param := range params {
+		if target, ok := parametersByName[name]; ok {
+			copy(target.Data, param.Data)
+		}
+	}
+	return dflash
+}
+
 // LoadModel reconstructs a Transformer from a checkpoint's metadata and params.
 func LoadModel(meta Meta, params map[string]*tensors.Tensor) *model.Transformer {
 	transformer := model.NewTransformer(meta.ModelConfig)

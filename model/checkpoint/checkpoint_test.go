@@ -3,6 +3,7 @@ package checkpoint
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/cookiengineer/gonano/model"
@@ -37,7 +38,7 @@ func TestSaveLoadRoundtrip(tester *testing.T) {
 	if gotMeta.Step != 123 {
 		tester.Fatalf("step = %d, want 123", gotMeta.Step)
 	}
-	if gotMeta.ModelConfig != config {
+	if !reflect.DeepEqual(gotMeta.ModelConfig, config) {
 		tester.Fatalf("config = %+v, want %+v", gotMeta.ModelConfig, config)
 	}
 	if len(gotParams) != len(params) {

@@ -49,6 +49,45 @@ func (backend *Backend) MoEGateTopK(logits, bias, probs []float32, selected []in
 	}
 }
 
+// MoEGateTopKSqrtSoftplus computes the DeepSeek-V4.1 sqrtsoftplus/noaux_tc
+// router scores and the normalized top-k weights. See kernels.MoE.
+func (backend *Backend) MoEGateTopKSqrtSoftplus(logits, bias, scores []float32, selected []int32, selectedWeights []float32, rowCount, expertCount, k int) {
+	for index, value := range logits {
+		scores[index] = sqrtSoftplus(value)
+	}
+	selection := make([]float32, rowCount*expertCount)
+	for index := range selection {
+		selection[index] = scores[index] + bias[index%expertCount]
+	}
+	backend.TopKIndices(selected, selection, rowCount, expertCount, k)
+	limit := k
+	if limit > expertCount {
+		limit = expertCount
+	}
+	for row := 0; row < rowCount; row++ {
+		var total float32
+		for slot := 0; slot < limit; slot++ {
+			total += scores[row*expertCount+int(selected[row*k+slot])]
+		}
+		for slot := 0; slot < limit; slot++ {
+			if total > 0 {
+				selectedWeights[row*k+slot] = scores[row*expertCount+int(selected[row*k+slot])] / total
+			} else {
+				selectedWeights[row*k+slot] = 0
+			}
+		}
+	}
+}
+
+// sqrtSoftplus returns sqrt(log(1+exp(x))), computed stably.
+func sqrtSoftplus(value float32) float32 {
+	softplus := value
+	if value <= 20 {
+		softplus = float32(math.Log1p(math.Exp(float64(value))))
+	}
+	return float32(math.Sqrt(float64(softplus)))
+}
+
 // GroupedMatMulTransposed computes one matmul per expert over rows grouped by
 // expert. See kernels.MoE.
 func (backend *Backend) GroupedMatMulTransposed(destination, input, weight []float32, tokenCounts []int32, expertCount, columnCount, innerCount int) {

@@ -2,6 +2,7 @@ package model
 
 import (
 	"math"
+	"reflect"
 	"testing"
 
 	"github.com/cookiengineer/gonano/tensors"
@@ -131,7 +132,7 @@ func TestConfigForDepthRatio(t *testing.T) {
 	}
 	// Ratio 1 reproduces MHA and matches ConfigForDepth exactly.
 	mha := ConfigForDepth(12, 32000, 64, 128, 2048, "SSSL")
-	if mha != ConfigForDepthRatio(12, 32000, 64, 128, 2048, "SSSL", 1) {
+	if !reflect.DeepEqual(mha, ConfigForDepthRatio(12, 32000, 64, 128, 2048, "SSSL", 1)) {
 		t.Fatal("ratio 1 must equal ConfigForDepth")
 	}
 }
@@ -694,18 +695,18 @@ func TestReuseCacheAllocation(t *testing.T) {
 	cache.EnableCompressionLayers(2, config.EmbedDim, config.NumKVHead*config.HeadDim(), 8, compressionMask)
 	cache.EnableIndexerKeysLayers(config.IndexerDim, indexerMask)
 
-	if cache.compressedKey[0] == nil {
+	if !cache.compressedAlloc[0] {
 		t.Fatal("full layer should own compressed KV")
 	}
 	for _, layerIndex := range []int{1, 2, 3} {
-		if cache.compressedKey[layerIndex] != nil {
+		if cache.compressedAlloc[layerIndex] {
 			t.Fatalf("layer %d should not own compressed KV", layerIndex)
 		}
 	}
-	if cache.indexerKey[0] == nil || cache.indexerKey[1] == nil {
+	if !cache.indexerAlloc[0] || !cache.indexerAlloc[1] {
 		t.Fatal("full and reindex layers should cache indexer keys")
 	}
-	if cache.indexerKey[2] != nil || cache.indexerKey[3] != nil {
+	if cache.indexerAlloc[2] || cache.indexerAlloc[3] {
 		t.Fatal("reuse layers should not cache indexer keys")
 	}
 }
@@ -734,6 +735,20 @@ func TestReuseReducesCompressedCacheBytes(t *testing.T) {
 
 	full := newCache("")
 	reuse := newCache("FRUU")
+	for _, cache := range []*KVBuffer{full, reuse} {
+		for layer := 0; layer < cache.layerCount; layer++ {
+			if !cache.compressedAlloc[layer] {
+				continue
+			}
+			for head := 0; head < cache.keyValueHeadCount; head++ {
+				cache.storage.appendCompressed(layer, 0, head, 0,
+					make([]float32, cache.headDimension), make([]float32, cache.headDimension))
+				if cache.indexerAlloc[layer] {
+					cache.storage.appendIndexer(layer, 0, head, 0, make([]float32, cache.indexerKeyWidth))
+				}
+			}
+		}
+	}
 	if reuse.CompressedBytesAllocated() >= full.CompressedBytesAllocated() {
 		t.Fatalf("reuse cache %d bytes must be fewer than full %d", reuse.CompressedBytesAllocated(), full.CompressedBytesAllocated())
 	}

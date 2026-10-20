@@ -60,17 +60,21 @@ The `flash` preset turns on the full DeepSeek-V4.1-Flash long-context stack:
 | Concept | What it does |
 |:--|:--|
 | Causal Encoder-Decoder (CED) | Decoder global KV is projected from the encoder's final hidden state; prefill reuses the encoder. |
-| HCA dense KV compression | Merges each block of `ratio` key/value rows into one compressed entry. |
+| Per-layer C1/C2 layout | Sliding-window-only encoder, one C1 packed boundary layer, and C2-compressed decoder layers. Legacy configs keep the uniform compression ratio. |
+| HCA dense KV compression | C2 merges each block of two key/value rows into one compressed entry; C1 keeps one entry per token while retaining the sparse/reuse plumbing. |
 | CSA sparse attention | Each query attends to the top-`k` compressed blocks selected by a lightning indexer. |
 | Cross-layer reuse (`FRU`) | `Full`/`Reindex`/`Reuse` layers share compressed KV and indexer work. |
 | Hierarchical sparse indexer | Coarse-to-fine block selection keeps deeper indexing constant-cost. |
 | Local sliding window (SWA) | Bounded local attention merged into the same softmax as the global branch. |
-| DeepSeekMoE | One shared expert plus routed fine-grained experts per block. |
-| Grouped-query attention / partial RoPE | Smaller KV cache and DeepSeek-style rotary. |
-| MLA | Absorbed low-rank query/KV latent (the `latent` preset). |
+| DeepSeekMoE | One shared expert plus routed fine-grained experts per block, with `sqrtsoftplus` / `noaux_tc` routing in `flash`. |
+| MLA | Absorbed low-rank query/KV latent, composed with the compression/SWA/sparse stack in `flash`. |
+| Attention sink / YaRN | Learnable per-head sink logits and optional YaRN rotary scaling, including a separate compressed-layer RoPE base. |
+| DFlash/MTP | Target-hidden-conditioned draft blocks with Markov and confidence heads for speculative decoding. |
+| Grouped-query attention / partial RoPE | Smaller KV cache and DeepSeek-style rotary; `flash` uses a single KV head. |
 
-Presets: `flash` (default, the DeepSeek-V4.1 long-context + MoE stack),
-`latent` (absorbed MLA + MoE), and `dense` (the classic decoder).
+Presets: `flash` (default, the DeepSeek-V4.1 long-context + MoE + MLA stack),
+`latent` (absorbed MLA without the compression stack), and `dense` (the classic
+decoder).
 
 ---
 
@@ -108,6 +112,11 @@ curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"gonano","messages":[{"role":"user","content":"what is 2+2?"}]}'
 ```
+
+Add `--scheduler-max-active 4` to batch concurrent single-model completions.
+Scheduler mode uses paged KV blocks, batched decode, a solo speculative path
+and in-memory block-aligned prefix reuse; it does not use the engine's on-disk
+prefix cache.
 
 ### Domain Bank Quickstart
 
@@ -228,10 +237,10 @@ produce a non-empty, closed trace.
 | `tokenizer` | Byte-level BPE training/inference and chat rendering. |
 | `data` | Parquet/Markdown sources and BOS-aligned dataloaders. |
 | `trainer` | Scaling laws, schedules, and the pretraining/SFT/RL/distillation loops. |
-| `inference` | KV-cache engine, sampler, tools, and the blended `Ensemble`. |
+| `inference` | KV-cache engine, sampler, speculative decoding, continuous scheduler, grammar constraints, tools, and the blended `Ensemble`. |
 | `router` | The domain meta-router: n-gram fast path + transformer classifier. |
 | `bank` | The domain model bank: manifest, on-demand loading, LRU eviction. |
-| `server` | OpenAI-compatible HTTP API, single-model or bank mode. |
+| `server` | OpenAI-compatible HTTP API with stop strings, JSON mode, top-p/min-p and logprobs, single-model or bank mode. |
 | `evaluator`, `evaluator/tasks` | BPB, CORE, ChatCORE, and the task datasets. |
 | `executor` | Sandboxed Python execution (HumanEval). |
 | `internal/parallel`, `internal/device`, `internal/logging` | Worker pool, hardware detection, logging. |

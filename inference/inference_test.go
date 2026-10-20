@@ -500,3 +500,29 @@ func TestMeasureTrafficAccounting(test *testing.T) {
 		test.Fatalf("traffic accounting must be positive")
 	}
 }
+
+func TestChunkedPrefillMatchesFullPrefill(t *testing.T) {
+	backbone, _, tokenizerImpl := testSpeculativeModel()
+	prompt := []int{1, 5, 2, 8, 3, 7}
+	fullEngine := NewEngine(backbone, tokenizerImpl)
+	full, _ := fullEngine.GenerateBatch(prompt, 1, 8, 0, 0, 1)
+
+	chunkedEngine := NewEngine(backbone, tokenizerImpl)
+	chunkedEngine.PrefillChunk = 3
+	chunked, _ := chunkedEngine.GenerateBatch(prompt, 1, 8, 0, 0, 1)
+	assertSameTokens(t, chunked[0], full[0])
+}
+
+func TestSampleNextTokenTopPAndMinP(t *testing.T) {
+	logits := tensors.NewWithData([]int{1, 4}, []float32{0, 0, 10, 0})
+	for index := 0; index < 64; index++ {
+		got := SampleNextTokenWithOptions(logits, tensors.NewRNG(uint64(index)), SamplingOptions{Temperature: 1, TopP: 0.5})
+		if got.Data[0] != 2 {
+			t.Fatalf("top-p sampled token %d, want 2", got.Data[0])
+		}
+		got = SampleNextTokenWithOptions(logits, tensors.NewRNG(uint64(index)), SamplingOptions{Temperature: 1, MinP: 0.5})
+		if got.Data[0] != 2 {
+			t.Fatalf("min-p sampled token %d, want 2", got.Data[0])
+		}
+	}
+}

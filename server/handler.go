@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -59,7 +60,7 @@ func (server *Server) handleChatCompletions(writer http.ResponseWriter, request 
 	}
 
 	if chatRequest.Stream {
-		server.streamCompletion(writer, generator, prompt, chatRequest, genOptions)
+		server.streamCompletion(request.Context(), writer, generator, prompt, chatRequest, genOptions)
 		return
 	}
 	server.complete(writer, generator, prompt, chatRequest, genOptions)
@@ -68,16 +69,20 @@ func (server *Server) handleChatCompletions(writer http.ResponseWriter, request 
 // complete writes a single non-streaming chat completion response.
 func (server *Server) complete(writer http.ResponseWriter, generator tokenGenerator, prompt []int, chatRequest ChatCompletionRequest, genOptions generationOptions) {
 	thinking := resolveThinking(chatRequest)
-	rows := server.generate(generator, prompt, genOptions.temperature, genOptions.topK, genOptions.maxTokens, genOptions.numSamples, genOptions.seed, thinking)
+	rows := server.generate(generator, prompt, genOptions, thinking)
 
 	choices := make([]Choice, len(rows))
 	var totalPrompt, totalCompletion int
 	for index, row := range rows {
-		choices[index] = Choice{
+		choice := Choice{
 			Index:        index,
 			Message:      ResponseMessage{Role: "assistant", Content: row.content, ReasoningContent: row.reasoning, ToolCalls: row.toolCalls},
 			FinishReason: row.finish,
 		}
+		if len(row.logprobs) > 0 {
+			choice.Logprobs = &ChoiceLogprobs{Content: row.logprobs}
+		}
+		choices[index] = choice
 		totalPrompt += row.promptLen
 		totalCompletion += row.completion
 	}
@@ -92,7 +97,7 @@ func (server *Server) complete(writer http.ResponseWriter, generator tokenGenera
 }
 
 // streamCompletion writes a server-sent-events stream of completion chunks.
-func (server *Server) streamCompletion(writer http.ResponseWriter, generator tokenGenerator, prompt []int, chatRequest ChatCompletionRequest, genOptions generationOptions) {
+func (server *Server) streamCompletion(ctx context.Context, writer http.ResponseWriter, generator tokenGenerator, prompt []int, chatRequest ChatCompletionRequest, genOptions generationOptions) {
 	flusher, ok := writer.(http.Flusher)
 	if !ok {
 		http.Error(writer, "streaming unsupported", http.StatusInternalServerError)
@@ -130,11 +135,52 @@ func (server *Server) streamCompletion(writer http.ResponseWriter, generator tok
 		inThinking[index] = primedThinking
 	}
 	finished := make([]bool, genOptions.numSamples)
+	toolCallTokens := make([][]int, genOptions.numSamples)
 	completion := 0
+	toolCallCounter := 0
+	toolCallsEmitted := false
+	contentBuffers := make([]string, genOptions.numSamples)
+	logprobBuffers := make([][]ChatLogprob, genOptions.numSamples)
+	maxStopLength := 0
+	for _, stop := range genOptions.stop {
+		if len(stop) > maxStopLength {
+			maxStopLength = len(stop)
+		}
+	}
+	stopped := false
+	emitContent := func(index int, text string) {
+		if text == "" {
+			return
+		}
+		choice := StreamChoice{Index: index, Delta: StreamDelta{Content: text}}
+		if len(logprobBuffers[index]) > 0 {
+			choice.Logprobs = &ChoiceLogprobs{Content: logprobBuffers[index]}
+			logprobBuffers[index] = nil
+		}
+		writeSSE(writer, flusher, ChatCompletionChunk{
+			ID: id, Object: "chat.completion.chunk", Created: created, Model: server.ModelName,
+			Choices: []StreamChoice{choice},
+		})
+	}
 
 	generate := generator.GenerateWith(prompt, genOptions.numSamples, genOptions.maxTokens, genOptions.temperature, genOptions.topK, genOptions.seed,
-		inference.GenerateOptions{Thinking: thinking.enabled || thinking.budget > 0, ThinkingBudget: thinking.budget})
+		inference.GenerateOptions{
+			Thinking: thinking.enabled || thinking.budget > 0, ThinkingBudget: thinking.budget,
+			TopP: genOptions.topP, MinP: genOptions.minP, Constraint: genOptions.constraint,
+			Logprobs: genOptions.logprobs, TopLogprobs: genOptions.topLogprobs,
+			ExternalTools: true,
+			OnLogprobs: func(rows []inference.TokenLogprob) {
+				for index, row := range rows {
+					if index < len(logprobBuffers) {
+						logprobBuffers[index] = append(logprobBuffers[index], convertLogprob(tokenizerImpl, row))
+					}
+				}
+			},
+		})
 	generate(func(column, mask []int) bool {
+		if ctx.Err() != nil {
+			return false
+		}
 		for index := 0; index < genOptions.numSamples; index++ {
 			if finished[index] {
 				continue
@@ -156,27 +202,59 @@ func (server *Server) streamCompletion(writer http.ResponseWriter, generator tok
 			switch token {
 			case toolStart:
 				inToolCall[index] = true
+				toolCallTokens[index] = nil
 			case toolEnd:
+				if inToolCall[index] {
+					if call, ok := server.parseToolCall(toolCallTokens[index]); ok {
+						call.ID = fmt.Sprintf("call_%d", toolCallCounter)
+						toolCallCounter++
+						toolCallsEmitted = true
+						writeSSE(writer, flusher, ChatCompletionChunk{
+							ID: id, Object: "chat.completion.chunk", Created: created, Model: server.ModelName,
+							Choices: []StreamChoice{{Index: index, Delta: StreamDelta{ToolCalls: []ToolCall{call}}}},
+						})
+						finished[index] = true
+					}
+				}
 				inToolCall[index] = false
+				toolCallTokens[index] = nil
 			case assistantEnd, bosToken:
 				finished[index] = true
 			default:
 				if inToolCall[index] {
+					toolCallTokens[index] = append(toolCallTokens[index], token)
 					continue // tool-call expression; hidden from the stream
 				}
 				text := tokenizerImpl.Decode([]int{token})
 				completion++
-				delta := StreamDelta{Content: text}
 				if inThinking[index] {
-					delta = StreamDelta{ReasoningContent: text}
+					writeSSE(writer, flusher, ChatCompletionChunk{
+						ID:      id,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   server.ModelName,
+						Choices: []StreamChoice{{Index: index, Delta: StreamDelta{ReasoningContent: text}}},
+					})
+					continue
 				}
-				writeSSE(writer, flusher, ChatCompletionChunk{
-					ID:      id,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   server.ModelName,
-					Choices: []StreamChoice{{Index: index, Delta: delta}},
-				})
+				if maxStopLength == 0 {
+					emitContent(index, text)
+					continue
+				}
+				contentBuffers[index] += text
+				if cutoff := stopIndex(contentBuffers[index], genOptions.stop); cutoff >= 0 {
+					emitContent(index, contentBuffers[index][:cutoff])
+					contentBuffers[index] = ""
+					finished[index] = true
+					stopped = true
+					continue
+				}
+				hold := maxStopLength - 1
+				if len(contentBuffers[index]) > hold {
+					emit := contentBuffers[index][:len(contentBuffers[index])-hold]
+					contentBuffers[index] = contentBuffers[index][len(contentBuffers[index])-hold:]
+					emitContent(index, emit)
+				}
 			}
 		}
 		for _, done := range finished {
@@ -187,9 +265,19 @@ func (server *Server) streamCompletion(writer http.ResponseWriter, generator tok
 		return false
 	})
 
+	// Flush any held-back content now that decoding is complete.
+	for index := 0; index < genOptions.numSamples; index++ {
+		if contentBuffers[index] != "" {
+			emitContent(index, contentBuffers[index])
+			contentBuffers[index] = ""
+		}
+	}
+
 	// Final chunk with the finish reason.
 	finish := "stop"
-	if completion >= genOptions.maxTokens {
+	if toolCallsEmitted {
+		finish = "tool_calls"
+	} else if completion >= genOptions.maxTokens && !stopped {
 		finish = "length"
 	}
 	writeSSE(writer, flusher, ChatCompletionChunk{

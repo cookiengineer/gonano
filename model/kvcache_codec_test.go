@@ -18,11 +18,14 @@ func populatedCache() *KVBuffer {
 
 	fill := tensors.NewRNG(7)
 	for layer := 0; layer < cache.layerCount; layer++ {
-		for index := range cache.keyCache[layer] {
-			for element := range cache.keyCache[layer][index].Data {
-				cache.keyCache[layer][index].Data[element] = fill.NormFloat32()
-				cache.valueCache[layer][index].Data[element] = fill.NormFloat32()
+		for head := 0; head < cache.keyValueHeadCount; head++ {
+			key := make([]float32, 3*cache.headDimension)
+			value := make([]float32, 3*cache.headDimension)
+			for element := range key {
+				key[element] = fill.NormFloat32()
+				value[element] = fill.NormFloat32()
 			}
+			cache.storage.appendRaw(layer, 0, head, 0, key, value)
 		}
 		if cache.tailHidden[layer] == nil {
 			continue
@@ -37,12 +40,21 @@ func populatedCache() *KVBuffer {
 				cache.tailKey[layer][index][element] = fill.NormFloat32()
 				cache.tailValue[layer][index][element] = fill.NormFloat32()
 			}
-			for element := range cache.compressedKey[layer][index].Data[:2*cache.headDimension] {
-				cache.compressedKey[layer][index].Data[element] = fill.NormFloat32()
-				cache.compressedValue[layer][index].Data[element] = fill.NormFloat32()
-			}
-			for element := range cache.indexerKey[layer][index].Data[:2*cache.indexerKeyWidth] {
-				cache.indexerKey[layer][index].Data[element] = fill.NormFloat32()
+		}
+		for head := 0; head < cache.keyValueHeadCount; head++ {
+			for entry := 0; entry < 2; entry++ {
+				key := make([]float32, cache.headDimension)
+				value := make([]float32, cache.headDimension)
+				for element := range key {
+					key[element] = fill.NormFloat32()
+					value[element] = fill.NormFloat32()
+				}
+				cache.storage.appendCompressed(layer, 0, head, entry, key, value)
+				indexerKey := make([]float32, cache.indexerKeyWidth)
+				for element := range indexerKey {
+					indexerKey[element] = fill.NormFloat32()
+				}
+				cache.storage.appendIndexer(layer, 0, head, entry, indexerKey)
 			}
 		}
 	}
@@ -75,13 +87,32 @@ func TestKVCacheCodecRoundTrip(t *testing.T) {
 
 	position := int(cache.sequenceLength)
 	for layer := 0; layer < cache.layerCount; layer++ {
-		for index := range cache.keyCache[layer] {
+		for head := 0; head < cache.keyValueHeadCount; head++ {
+			wantKey, wantValue := cache.storage.readRaw(layer, 0, head, position)
+			gotKey, gotValue := decoded.storage.readRaw(layer, 0, head, position)
 			for element := 0; element < position*cache.headDimension; element++ {
-				if decoded.keyCache[layer][index].Data[element] != cache.keyCache[layer][index].Data[element] {
-					t.Fatalf("key cache mismatch at layer %d index %d element %d", layer, index, element)
+				if gotKey[element] != wantKey[element] {
+					t.Fatalf("key cache mismatch at layer %d head %d element %d", layer, head, element)
 				}
-				if decoded.valueCache[layer][index].Data[element] != cache.valueCache[layer][index].Data[element] {
-					t.Fatalf("value cache mismatch at layer %d index %d element %d", layer, index, element)
+				if gotValue[element] != wantValue[element] {
+					t.Fatalf("value cache mismatch at layer %d head %d element %d", layer, head, element)
+				}
+			}
+			wantCompressedKey, wantCompressedValue := cache.storage.readCompressed(layer, 0, head, 2)
+			gotCompressedKey, gotCompressedValue := decoded.storage.readCompressed(layer, 0, head, 2)
+			for element := 0; element < 2*cache.headDimension; element++ {
+				if gotCompressedKey[element] != wantCompressedKey[element] {
+					t.Fatalf("compressed key mismatch at layer %d head %d", layer, head)
+				}
+				if gotCompressedValue[element] != wantCompressedValue[element] {
+					t.Fatalf("compressed value mismatch at layer %d head %d", layer, head)
+				}
+			}
+			wantIndexer := cache.storage.readIndexer(layer, 0, head, 2)
+			gotIndexer := decoded.storage.readIndexer(layer, 0, head, 2)
+			for element := 0; element < 2*cache.indexerKeyWidth; element++ {
+				if gotIndexer[element] != wantIndexer[element] {
+					t.Fatalf("indexer key mismatch at layer %d head %d", layer, head)
 				}
 			}
 		}
@@ -105,19 +136,6 @@ func TestKVCacheCodecRoundTrip(t *testing.T) {
 					t.Fatalf("tail value mismatch at layer %d index %d", layer, index)
 				}
 			}
-			for element := 0; element < 2*cache.headDimension; element++ {
-				if decoded.compressedKey[layer][index].Data[element] != cache.compressedKey[layer][index].Data[element] {
-					t.Fatalf("compressed key mismatch at layer %d index %d", layer, index)
-				}
-				if decoded.compressedValue[layer][index].Data[element] != cache.compressedValue[layer][index].Data[element] {
-					t.Fatalf("compressed value mismatch at layer %d index %d", layer, index)
-				}
-			}
-			for element := 0; element < 2*cache.indexerKeyWidth; element++ {
-				if decoded.indexerKey[layer][index].Data[element] != cache.indexerKey[layer][index].Data[element] {
-					t.Fatalf("indexer key mismatch at layer %d index %d", layer, index)
-				}
-			}
 		}
 	}
 	if decoded.previousEmbedding == nil || decoded.previousEmbedding.Numel() != cache.previousEmbedding.Numel() {
@@ -128,21 +146,19 @@ func TestKVCacheCodecRoundTrip(t *testing.T) {
 			t.Fatal("previous embedding mismatch after round-trip")
 		}
 	}
-
-	// The decoded cache must report the same allocated size.
-	if decoded.BytesAllocated() != cache.BytesAllocated() {
-		t.Fatalf("bytes allocated = %d, want %d", decoded.BytesAllocated(), cache.BytesAllocated())
-	}
 }
 
 func TestKVCacheCodecPlainRoundTrip(t *testing.T) {
 	cache := NewKVBuffer(2, 8, 1, 1, 4)
 	cache.Advance(2)
-	for index := range cache.keyCache[0] {
-		for element := range cache.keyCache[0][index].Data {
-			cache.keyCache[0][index].Data[element] = float32(element)
-			cache.valueCache[0][index].Data[element] = -float32(element)
+	for row := 0; row < 2; row++ {
+		key := make([]float32, 2*4)
+		value := make([]float32, 2*4)
+		for element := range key {
+			key[element] = float32(element + row*100)
+			value[element] = -float32(element + row*100)
 		}
+		cache.storage.appendRaw(0, row, 0, 0, key, value)
 	}
 	data, err := cache.MarshalBinary()
 	if err != nil {
@@ -155,10 +171,12 @@ func TestKVCacheCodecPlainRoundTrip(t *testing.T) {
 	if decoded.CompressionEnabled() {
 		t.Fatal("plain cache should not report compression")
 	}
-	for index := range cache.keyCache[0] {
+	for row := 0; row < 2; row++ {
+		wantKey, wantValue := cache.storage.readRaw(0, row, 0, 2)
+		gotKey, gotValue := decoded.storage.readRaw(0, row, 0, 2)
 		for element := 0; element < 2*4; element++ {
-			if decoded.keyCache[0][index].Data[element] != cache.keyCache[0][index].Data[element] {
-				t.Fatal("plain key cache mismatch")
+			if gotKey[element] != wantKey[element] || gotValue[element] != wantValue[element] {
+				t.Fatal("plain key/value cache mismatch")
 			}
 		}
 	}
@@ -204,40 +222,85 @@ func TestKVCacheCodecStrippedRoundTrip(t *testing.T) {
 	}
 	// Raw buffers are gone.
 	for layer := 0; layer < decoded.layerCount; layer++ {
-		for _, tensor := range decoded.keyCache[layer] {
-			for _, value := range tensor.Data {
-				if value != 0 {
+		for head := 0; head < decoded.keyValueHeadCount; head++ {
+			key, value := decoded.storage.readRaw(layer, 0, head, int(decoded.sequenceLength))
+			for _, entry := range key {
+				if entry != 0 {
 					t.Fatal("stripped key cache is not zeroed")
 				}
 			}
-		}
-		for _, tensor := range decoded.valueCache[layer] {
-			for _, value := range tensor.Data {
-				if value != 0 {
+			for _, entry := range value {
+				if entry != 0 {
 					t.Fatal("stripped value cache is not zeroed")
 				}
 			}
 		}
 	}
-	// Global compressed, indexer, and tail state survive.
+	// Global compressed, indexer and tail state survive.
 	for layer := 0; layer < cache.layerCount; layer++ {
-		if cache.compressedKey[layer] == nil {
+		if !cache.compressedAlloc[layer] {
 			continue
 		}
-		for index := range cache.compressedKey[layer] {
+		for head := 0; head < cache.keyValueHeadCount; head++ {
+			wantKey, wantValue := cache.storage.readCompressed(layer, 0, head, 2)
+			gotKey, gotValue := decoded.storage.readCompressed(layer, 0, head, 2)
 			for element := 0; element < 2*cache.headDimension; element++ {
-				if decoded.compressedKey[layer][index].Data[element] != cache.compressedKey[layer][index].Data[element] {
+				if gotKey[element] != wantKey[element] {
 					t.Fatal("compressed key lost after strip round-trip")
 				}
-				if decoded.compressedValue[layer][index].Data[element] != cache.compressedValue[layer][index].Data[element] {
+				if gotValue[element] != wantValue[element] {
 					t.Fatal("compressed value lost after strip round-trip")
 				}
 			}
+			wantIndexer := cache.storage.readIndexer(layer, 0, head, 2)
+			gotIndexer := decoded.storage.readIndexer(layer, 0, head, 2)
 			for element := 0; element < 2*cache.indexerKeyWidth; element++ {
-				if decoded.indexerKey[layer][index].Data[element] != cache.indexerKey[layer][index].Data[element] {
+				if gotIndexer[element] != wantIndexer[element] {
 					t.Fatal("indexer key lost after strip round-trip")
 				}
 			}
+		}
+	}
+}
+
+func TestKVCacheCodecRingRoundTrip(t *testing.T) {
+	cache := NewKVBuffer(1, 256, 2, 1, 4)
+	cache.EnableCompression(2, 4, 4, 16)
+	cache.EnableSWARings([]int{4, 0})
+	cache.Advance(20)
+	for position := 0; position < 20; position++ {
+		key := []float32{float32(position), float32(position + 1), float32(position + 2), float32(position + 3)}
+		value := []float32{float32(-position), float32(-position - 1), float32(-position - 2), float32(-position - 3)}
+		cache.appendRawKV(0, 0, 0, position, key, value)
+		cache.appendRawKV(1, 0, 0, position, key, value)
+	}
+	data, err := cache.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	decoded, err := UnmarshalKVBuffer(data)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !decoded.RingEnabled(0) || decoded.RingEnabled(1) {
+		t.Fatal("ring configuration lost after round-trip")
+	}
+	if decoded.ringSize != cache.ringSize {
+		t.Fatalf("ring size = %d, want %d", decoded.ringSize, cache.ringSize)
+	}
+	for element := range cache.ringKey[0][0][0] {
+		if decoded.ringKey[0][0][0][element] != cache.ringKey[0][0][0][element] {
+			t.Fatal("ring key mismatch after round-trip")
+		}
+		if decoded.ringValue[0][0][0][element] != cache.ringValue[0][0][0][element] {
+			t.Fatal("ring value mismatch after round-trip")
+		}
+	}
+	wantKey, wantValue := cache.storage.readRaw(1, 0, 0, 20)
+	gotKey, gotValue := decoded.storage.readRaw(1, 0, 0, 20)
+	for element := range wantKey {
+		if gotKey[element] != wantKey[element] || gotValue[element] != wantValue[element] {
+			t.Fatal("full-context raw cache mismatch after round-trip")
 		}
 	}
 }

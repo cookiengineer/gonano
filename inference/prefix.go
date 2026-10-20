@@ -64,16 +64,25 @@ func (cache *PrefixCache) Store(tokens []int, state *model.KVBuffer) {
 		return
 	}
 	clonedTokens := append([]int(nil), tokens...)
+	clonedState := state.Clone()
 	cache.mutex.Lock()
+	previous := cache.state
 	cache.tokens = clonedTokens
-	cache.state = state.Clone()
+	cache.state = clonedState
 	cache.mutex.Unlock()
+	if previous != nil {
+		previous.Release()
+	}
 }
 
 // Invalidate drops the cached snapshot.
 func (cache *PrefixCache) Invalidate() {
 	cache.mutex.Lock()
+	previous := cache.state
 	cache.tokens = nil
 	cache.state = nil
 	cache.mutex.Unlock()
+	if previous != nil {
+		previous.Release()
+	}
 }

@@ -131,9 +131,11 @@ func (cache *CacheManager) Store(tokens []int, state *model.KVBuffer) {
 		cache.removeEntryLocked(key, existing)
 	}
 	stored := state
+	owned := false
 	if cache.options.StripSWA && state.CompressionEnabled() {
 		stored = state.Clone()
 		stored.StripRaw()
+		owned = true
 	}
 	now := cache.now()
 	entry := &cacheEntry{
@@ -146,11 +148,20 @@ func (cache *CacheManager) Store(tokens []int, state *model.KVBuffer) {
 		path := filepath.Join(cache.options.DiskDir, key+".kv")
 		if err := saveKVFile(path, stored); err == nil {
 			entry.diskPath = path
+		} else if owned {
+			entry.state = stored
+			owned = false
 		} else {
 			entry.state = stored.Clone()
 		}
+	} else if owned {
+		entry.state = stored
+		owned = false
 	} else {
 		entry.state = stored.Clone()
+	}
+	if owned {
+		stored.Release()
 	}
 	cache.entries[key] = entry
 	cache.order = append(cache.order, key)
@@ -163,6 +174,9 @@ func (cache *CacheManager) Invalidate() {
 	cache.mutex.Lock()
 	defer cache.mutex.Unlock()
 	for key, entry := range cache.entries {
+		if entry.state != nil {
+			entry.state.Release()
+		}
 		if entry.diskPath != "" {
 			os.Remove(entry.diskPath)
 		}
@@ -202,6 +216,9 @@ func (cache *CacheManager) touchLocked(key string) {
 func (cache *CacheManager) removeEntryLocked(key string, entry *cacheEntry) {
 	delete(cache.entries, key)
 	cache.bytes -= entry.size
+	if entry.state != nil {
+		entry.state.Release()
+	}
 	if entry.diskPath != "" {
 		os.Remove(entry.diskPath)
 	}

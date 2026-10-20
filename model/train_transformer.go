@@ -116,7 +116,8 @@ func (model *Transformer) trainForward(indexes *tensors.Int32s, segments *tensor
 			}
 		}
 		var blockCtx *blockContext
-		activations, blockCtx = block.forwardTraining(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, 0, model.windowSizes[layerIndex], currentShare, segments)
+		layerCosine, layerSine := model.rotaryForLayer(layerIndex)
+		activations, blockCtx = block.forwardTraining(activations, valueEmbedding, layerCosine, layerSine, 0, model.windowSizes[layerIndex], currentShare, segments)
 		context.blockContexts = append(context.blockContexts, blockCtx)
 		if blockCtx.moeContext != nil {
 			context.auxLoss += blockCtx.moeContext.balanceLoss
@@ -208,7 +209,8 @@ func (model *Transformer) trainBackwardFromHidden(context *trainCtx, gradFinalNo
 		if layerIndex == backoutLayerIndex && gradBackoutActivations != nil {
 			layerGradient = tensors.Add(gradActivations, gradBackoutActivations)
 		}
-		gradBlockInput := model.blocks[layerIndex].backwardTraining(layerGradient, context.blockContexts[layerIndex], model.rotaryCosine, model.rotarySine, 0)
+		layerCosine, layerSine := model.rotaryForLayer(layerIndex)
+		gradBlockInput := model.blocks[layerIndex].backwardTraining(layerGradient, context.blockContexts[layerIndex], layerCosine, layerSine, 0)
 
 		if valueEmbeddingGradient := context.blockContexts[layerIndex].attentionContext.valueEmbeddingGradient; valueEmbeddingGradient != nil {
 			keyValueDimension := model.Config.NumKVHead * model.Config.HeadDim()
@@ -251,11 +253,16 @@ func (model *Transformer) trainBackwardFromHidden(context *trainCtx, gradFinalNo
 	// embedding table.
 	if context.suffixEmbedding != nil {
 		context.suffixEmbedding.EnsureGrad()
+		rows := context.suffixEmbedding.Numel() / embeddingDimension
 		for batch := 0; batch < batchSize; batch++ {
+			row := 0
+			if rows > 1 && batch < rows {
+				row = batch
+			}
 			for position := context.suffixStart; position < sequenceLength; position++ {
 				base := (batch*sequenceLength + position) * embeddingDimension
 				for dimension := 0; dimension < embeddingDimension; dimension++ {
-					context.suffixEmbedding.Grad[dimension] += gradRaw.Data[base+dimension]
+					context.suffixEmbedding.Grad[row*embeddingDimension+dimension] += gradRaw.Data[base+dimension]
 					gradRaw.Data[base+dimension] = 0
 				}
 			}

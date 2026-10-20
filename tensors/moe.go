@@ -13,6 +13,16 @@ func MoEGateTopK(logits, bias *Tensor, rows, experts, k int) (probs *Tensor, sel
 	return probs, selected, selectedWeights
 }
 
+// MoEGateTopKSqrtSoftplus computes the DeepSeek-V4.1 sqrtsoftplus/noaux_tc
+// router scores and the normalized top-k expert weights.
+func MoEGateTopKSqrtSoftplus(logits, bias *Tensor, rows, experts, k int) (scores *Tensor, selected *Int32s, selectedWeights *Tensor) {
+	scores = New(rows, experts)
+	selected = NewInt32s(rows, k)
+	selectedWeights = New(rows, k)
+	KernelBackend().MoEGateTopKSqrtSoftplus(logits.Data, bias.Data, scores.Data, selected.Data, selectedWeights.Data, rows, experts, k)
+	return scores, selected, selectedWeights
+}
+
 // GroupedMatMulTransposed computes one matmul per expert: with a packed weight
 // [experts, columns, inner], expert e computes destination_e = input_e @
 // weight_e^T. The input rows are grouped by expert in ascending expert order,

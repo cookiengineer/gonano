@@ -10,7 +10,7 @@ import (
 )
 
 // kvCacheMagic identifies a serialized KV cache buffer.
-const kvCacheMagic = "GONAKV\x00\x01"
+const kvCacheMagic = "GONAKV\x00\x03"
 
 // KV cache serialization flags.
 const (
@@ -19,6 +19,7 @@ const (
 	kvFlagPreviousEmbedding = 1 << 2
 	kvFlagRawStripped       = 1 << 3
 	kvFlagMLA               = 1 << 4
+	kvFlagRings             = 1 << 5
 )
 
 // Per-layer serialization flags.
@@ -32,11 +33,9 @@ const (
 var ErrInvalidKVCache = errors.New("model: invalid KV cache data")
 
 // MarshalBinary serializes the KV cache into a self-describing, versioned byte
-// slice. Only the used prefix of each key/value buffer is written, so a cache
-// persisted for prefix reuse costs its live size rather than its capacity.
-//
-// The format is used by the inference persistent cache tier to snapshot a
-// prefill to disk.
+// slice. Only the used prefix of each buffer is written, so a cache persisted
+// for prefix reuse costs its live size rather than its capacity. Paged caches
+// are serialized in their logical dense form.
 func (cache *KVBuffer) MarshalBinary() ([]byte, error) {
 	writer := &kvWriter{}
 	writer.buffer = append(writer.buffer, kvCacheMagic...)
@@ -53,11 +52,27 @@ func (cache *KVBuffer) MarshalBinary() ([]byte, error) {
 	writer.u32(uint32(cache.indexerKeyWidth))
 	writer.u32(uint32(cache.mlaLatentWidth))
 	writer.u32(uint32(cache.mlaRopeKeyWidth))
+	writer.u32(uint32(len(cache.layerRatios)))
+	for layer := 0; layer < len(cache.layerRatios); layer++ {
+		writer.u32(uint32(cache.layerRatios[layer]))
+		maxBlocks := 0
+		if layer < len(cache.maxBlocksByLayer) {
+			maxBlocks = cache.maxBlocksByLayer[layer]
+		}
+		writer.u32(uint32(maxBlocks))
+	}
+	writer.u32(uint32(cache.ringSize))
+	writer.u32(uint32(len(cache.ringWindow)))
+	for layer := 0; layer < len(cache.ringWindow); layer++ {
+		writer.u32(uint32(cache.ringWindow[layer]))
+	}
 
 	flags := uint32(0)
-	compression := cache.compressionRatio > 1
-	indexer := cache.indexerKey != nil
-	if cache.mlaLatent != nil {
+	compression := cache.compressionEnabled
+	indexer := cache.indexerEnabled
+	mla := cache.mlaEnabled
+	rawStripped := cache.RawStripped()
+	if mla {
 		flags |= kvFlagMLA
 	}
 	if compression {
@@ -69,20 +84,46 @@ func (cache *KVBuffer) MarshalBinary() ([]byte, error) {
 	if cache.previousEmbedding != nil {
 		flags |= kvFlagPreviousEmbedding
 	}
-	if cache.rawStripped {
+	if rawStripped {
 		flags |= kvFlagRawStripped
+	}
+	if cache.ringSize > 0 && !rawStripped {
+		flags |= kvFlagRings
 	}
 	writer.u32(flags)
 
 	headDimension := cache.headDimension
-	// A stripped snapshot omits the raw key/value buffers; bounded replay
-	// rebuilds the local sliding-window rows on load.
-	if !cache.rawStripped {
-		position := int(cache.sequenceLength)
+	position := int(cache.sequenceLength)
+	if !rawStripped {
 		for layer := 0; layer < cache.layerCount; layer++ {
-			for index := range cache.keyCache[layer] {
-				writer.f32s(cache.keyCache[layer][index].Data[:position*headDimension])
-				writer.f32s(cache.valueCache[layer][index].Data[:position*headDimension])
+			for index := 0; index < cache.batchSize*cache.keyValueHeadCount; index++ {
+				row := index / cache.keyValueHeadCount
+				head := index % cache.keyValueHeadCount
+				key, value := cache.storage.readRaw(layer, row, head, position)
+				writer.f32s(key)
+				writer.f32s(value)
+			}
+		}
+	}
+
+	if flags&kvFlagRings != 0 {
+		for layer := 0; layer < cache.layerCount; layer++ {
+			if !cache.RingEnabled(layer) {
+				continue
+			}
+			for row := 0; row < cache.batchSize; row++ {
+				for head := 0; head < cache.keyValueHeadCount; head++ {
+					key := make([]float32, cache.ringSize*cache.headDimension)
+					value := make([]float32, cache.ringSize*cache.headDimension)
+					if cache.ringKey != nil && cache.ringKey[layer] != nil && cache.ringKey[layer][row] != nil && cache.ringKey[layer][row][head] != nil {
+						copy(key, cache.ringKey[layer][row][head])
+					}
+					if cache.ringValue != nil && cache.ringValue[layer] != nil && cache.ringValue[layer][row] != nil && cache.ringValue[layer][row][head] != nil {
+						copy(value, cache.ringValue[layer][row][head])
+					}
+					writer.f32s(key)
+					writer.f32s(value)
+				}
 			}
 		}
 	}
@@ -93,10 +134,10 @@ func (cache *KVBuffer) MarshalBinary() ([]byte, error) {
 			if cache.tailHidden[layer] != nil {
 				layerFlags |= kvLayerTail
 			}
-			if cache.compressedKey[layer] != nil {
+			if layer < len(cache.compressedAlloc) && cache.compressedAlloc[layer] {
 				layerFlags |= kvLayerCompressed
 			}
-			if indexer && cache.indexerKey[layer] != nil {
+			if indexer && layer < len(cache.indexerAlloc) && cache.indexerAlloc[layer] {
 				layerFlags |= kvLayerIndexer
 			}
 			writer.u32(layerFlags)
@@ -120,30 +161,30 @@ func (cache *KVBuffer) MarshalBinary() ([]byte, error) {
 			if layerFlags&kvLayerCompressed != 0 {
 				for index := 0; index < cache.batchSize*cache.keyValueHeadCount; index++ {
 					batch := index / cache.keyValueHeadCount
+					head := index % cache.keyValueHeadCount
 					count := cache.compressedCount[layer][batch]
-					writer.f32s(cache.compressedKey[layer][index].Data[:count*headDimension])
-					writer.f32s(cache.compressedValue[layer][index].Data[:count*headDimension])
+					key, value := cache.storage.readCompressed(layer, batch, head, count)
+					writer.f32s(key)
+					writer.f32s(value)
 				}
 			}
 			if layerFlags&kvLayerIndexer != 0 {
 				width := cache.indexerKeyWidth
 				for index := 0; index < cache.batchSize*cache.keyValueHeadCount; index++ {
 					batch := index / cache.keyValueHeadCount
+					head := index % cache.keyValueHeadCount
 					count := cache.compressedCount[layer][batch]
-					writer.f32s(cache.indexerKey[layer][index].Data[:count*width])
+					writer.f32s(cache.storage.readIndexer(layer, batch, head, count)[:count*width])
 				}
 			}
 		}
 	}
 
-	if flags&kvFlagMLA != 0 {
-		position := int(cache.sequenceLength)
-		latentWidth := cache.mlaLatentWidth
-		ropeWidth := cache.mlaRopeKeyWidth
+	if mla {
 		for layer := 0; layer < cache.layerCount; layer++ {
 			for batch := 0; batch < cache.batchSize; batch++ {
-				writer.f32s(cache.mlaLatent[layer][batch].Data[:position*latentWidth])
-				writer.f32s(cache.mlaRopeKey[layer][batch].Data[:position*ropeWidth])
+				writer.f32s(cache.storage.readMLALatent(layer, batch, position))
+				writer.f32s(cache.storage.readMLARope(layer, batch, position))
 			}
 		}
 	}
@@ -176,6 +217,19 @@ func UnmarshalKVBuffer(data []byte) (*KVBuffer, error) {
 	indexerKeyWidth := int(reader.u32())
 	mlaLatentWidth := int(reader.u32())
 	mlaRopeKeyWidth := int(reader.u32())
+	layerRatioCount := int(reader.u32())
+	layerRatios := make([]int, layerRatioCount)
+	layerMaxBlocks := make([]int, layerRatioCount)
+	for layer := 0; layer < layerRatioCount; layer++ {
+		layerRatios[layer] = int(reader.u32())
+		layerMaxBlocks[layer] = int(reader.u32())
+	}
+	ringSize := int(reader.u32())
+	ringWindowCount := int(reader.u32())
+	ringWindows := make([]int, ringWindowCount)
+	for layer := 0; layer < ringWindowCount; layer++ {
+		ringWindows[layer] = int(reader.u32())
+	}
 	flags := reader.u32()
 	if reader.err != nil {
 		return nil, reader.err
@@ -190,55 +244,81 @@ func UnmarshalKVBuffer(data []byte) (*KVBuffer, error) {
 	cache := NewKVBuffer(batchSize, maximumSequenceLength, layerCount, keyValueHeadCount, headDimension)
 	cache.sequenceLength = sequenceLength
 	cache.rawStripped = flags&kvFlagRawStripped != 0
+	if ringWindowCount > 0 {
+		cache.EnableSWARings(ringWindows)
+		if ringSize > 0 {
+			cache.ringSize = ringSize
+		}
+	}
 
+	position := int(sequenceLength)
 	if !cache.rawStripped {
-		position := int(sequenceLength)
 		for layer := 0; layer < layerCount; layer++ {
-			for index := range cache.keyCache[layer] {
-				reader.f32s(cache.keyCache[layer][index].Data[:position*headDimension])
-				reader.f32s(cache.valueCache[layer][index].Data[:position*headDimension])
+			for index := 0; index < batchSize*keyValueHeadCount; index++ {
+				row := index / keyValueHeadCount
+				head := index % keyValueHeadCount
+				key := make([]float32, position*headDimension)
+				value := make([]float32, position*headDimension)
+				reader.f32s(key)
+				reader.f32s(value)
+				if !cache.RingEnabled(layer) {
+					cache.storage.appendRaw(layer, row, head, 0, key, value)
+				}
+			}
+		}
+	}
+
+	if flags&kvFlagRings != 0 {
+		cache.ringKey = make([][][][]float32, layerCount)
+		cache.ringValue = make([][][][]float32, layerCount)
+		for layer := 0; layer < layerCount; layer++ {
+			if !cache.RingEnabled(layer) {
+				continue
+			}
+			cache.ringKey[layer] = make([][][]float32, batchSize)
+			cache.ringValue[layer] = make([][][]float32, batchSize)
+			for row := 0; row < batchSize; row++ {
+				cache.ringKey[layer][row] = make([][]float32, keyValueHeadCount)
+				cache.ringValue[layer][row] = make([][]float32, keyValueHeadCount)
+				for head := 0; head < keyValueHeadCount; head++ {
+					key := make([]float32, cache.ringSize*headDimension)
+					value := make([]float32, cache.ringSize*headDimension)
+					reader.f32s(key)
+					reader.f32s(value)
+					cache.ringKey[layer][row][head] = key
+					cache.ringValue[layer][row][head] = value
+				}
 			}
 		}
 	}
 
 	compression := flags&kvFlagCompression != 0
 	if compression {
+		if len(layerRatios) != layerCount {
+			return nil, ErrInvalidKVCache
+		}
+		cache.EnableCompressionLayout(layerRatios, compressedEmbeddingDim, compressedKVWidth, layerMaxBlocks, nil)
 		cache.compressionRatio = compressionRatio
 		cache.compressedMaxBlocks = compressedMaxBlocks
-		cache.compressedEmbeddingDim = compressedEmbeddingDim
-		cache.compressedKVWidth = compressedKVWidth
 		if flags&kvFlagIndexer != 0 {
-			cache.indexerKeyWidth = indexerKeyWidth
-		}
-		cache.tailHidden = make([][][]float32, layerCount)
-		cache.tailKey = make([][][]float32, layerCount)
-		cache.tailValue = make([][][]float32, layerCount)
-		cache.tailLength = make([][]int, layerCount)
-		cache.compressedKey = make([][]*tensors.Tensor, layerCount)
-		cache.compressedValue = make([][]*tensors.Tensor, layerCount)
-		cache.compressedCount = make([][]int, layerCount)
-		if flags&kvFlagIndexer != 0 {
-			cache.indexerKey = make([][]*tensors.Tensor, layerCount)
+			cache.EnableIndexerKeysLayers(indexerKeyWidth, nil)
 		}
 		for layer := 0; layer < layerCount; layer++ {
 			layerFlags := reader.u32()
-			cache.tailLength[layer] = make([]int, batchSize)
-			cache.compressedCount[layer] = make([]int, batchSize)
+			cache.compressedAlloc[layer] = layerFlags&kvLayerCompressed != 0
+			if layer < len(cache.indexerAlloc) {
+				cache.indexerAlloc[layer] = layerFlags&kvLayerIndexer != 0
+			}
+			if layerFlags&kvLayerTail == 0 {
+				cache.tailHidden[layer] = nil
+				cache.tailKey[layer] = nil
+				cache.tailValue[layer] = nil
+			}
 			for batch := 0; batch < batchSize; batch++ {
 				cache.tailLength[layer][batch] = int(reader.i32())
 				cache.compressedCount[layer][batch] = int(reader.i32())
 			}
 			if layerFlags&kvLayerTail != 0 {
-				cache.tailHidden[layer] = make([][]float32, batchSize)
-				cache.tailKey[layer] = make([][]float32, batchSize*keyValueHeadCount)
-				cache.tailValue[layer] = make([][]float32, batchSize*keyValueHeadCount)
-				for batch := 0; batch < batchSize; batch++ {
-					cache.tailHidden[layer][batch] = make([]float32, compressionRatio*compressedEmbeddingDim)
-				}
-				for index := range cache.tailKey[layer] {
-					cache.tailKey[layer][index] = make([]float32, compressionRatio*headDimension)
-					cache.tailValue[layer][index] = make([]float32, compressionRatio*headDimension)
-				}
 				for batch := 0; batch < batchSize; batch++ {
 					used := cache.tailLength[layer][batch]
 					reader.f32s(cache.tailHidden[layer][batch][:used*compressedEmbeddingDim])
@@ -251,28 +331,32 @@ func UnmarshalKVBuffer(data []byte) (*KVBuffer, error) {
 				}
 			}
 			if layerFlags&kvLayerCompressed != 0 {
-				cache.compressedKey[layer] = make([]*tensors.Tensor, batchSize*keyValueHeadCount)
-				cache.compressedValue[layer] = make([]*tensors.Tensor, batchSize*keyValueHeadCount)
-				for index := range cache.compressedKey[layer] {
-					cache.compressedKey[layer][index] = tensors.New(compressedMaxBlocks, headDimension)
-					cache.compressedValue[layer][index] = tensors.New(compressedMaxBlocks, headDimension)
-				}
 				for index := 0; index < batchSize*keyValueHeadCount; index++ {
 					batch := index / keyValueHeadCount
+					head := index % keyValueHeadCount
 					count := cache.compressedCount[layer][batch]
-					reader.f32s(cache.compressedKey[layer][index].Data[:count*headDimension])
-					reader.f32s(cache.compressedValue[layer][index].Data[:count*headDimension])
+					key := make([]float32, count*headDimension)
+					value := make([]float32, count*headDimension)
+					reader.f32s(key)
+					reader.f32s(value)
+					for entry := 0; entry < count; entry++ {
+						cache.storage.appendCompressed(layer, batch, head, entry,
+							key[entry*headDimension:(entry+1)*headDimension],
+							value[entry*headDimension:(entry+1)*headDimension])
+					}
 				}
 			}
 			if layerFlags&kvLayerIndexer != 0 {
-				cache.indexerKey[layer] = make([]*tensors.Tensor, batchSize*keyValueHeadCount)
-				for index := range cache.indexerKey[layer] {
-					cache.indexerKey[layer][index] = tensors.New(compressedMaxBlocks, indexerKeyWidth)
-				}
+				width := cache.indexerKeyWidth
 				for index := 0; index < batchSize*keyValueHeadCount; index++ {
 					batch := index / keyValueHeadCount
+					head := index % keyValueHeadCount
 					count := cache.compressedCount[layer][batch]
-					reader.f32s(cache.indexerKey[layer][index].Data[:count*indexerKeyWidth])
+					keys := make([]float32, count*width)
+					reader.f32s(keys)
+					for entry := 0; entry < count; entry++ {
+						cache.storage.appendIndexer(layer, batch, head, entry, keys[entry*width:(entry+1)*width])
+					}
 				}
 			}
 		}
@@ -280,11 +364,16 @@ func UnmarshalKVBuffer(data []byte) (*KVBuffer, error) {
 
 	if flags&kvFlagMLA != 0 {
 		cache.EnableMLA(mlaLatentWidth, mlaRopeKeyWidth)
-		position := int(sequenceLength)
 		for layer := 0; layer < layerCount; layer++ {
 			for batch := 0; batch < batchSize; batch++ {
-				reader.f32s(cache.mlaLatent[layer][batch].Data[:position*mlaLatentWidth])
-				reader.f32s(cache.mlaRopeKey[layer][batch].Data[:position*mlaRopeKeyWidth])
+				latent := make([]float32, position*mlaLatentWidth)
+				rope := make([]float32, position*mlaRopeKeyWidth)
+				reader.f32s(latent)
+				reader.f32s(rope)
+				for token := 0; token < position; token++ {
+					cache.storage.appendMLALatent(layer, batch, token, latent[token*mlaLatentWidth:(token+1)*mlaLatentWidth])
+					cache.storage.appendMLARope(layer, batch, token, rope[token*mlaRopeKeyWidth:(token+1)*mlaRopeKeyWidth])
+				}
 			}
 		}
 	}
@@ -299,6 +388,9 @@ func UnmarshalKVBuffer(data []byte) (*KVBuffer, error) {
 	}
 	if reader.err != nil {
 		return nil, reader.err
+	}
+	if cache.rawStripped {
+		cache.storage.stripRaw()
 	}
 	return cache, nil
 }

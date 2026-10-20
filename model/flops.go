@@ -82,9 +82,13 @@ func (block *Block) moeParamCount() int {
 // SWAWindow is set, the local branch attends to at most SWAWindow recent
 // tokens. Without compression the historical per-layer window applies.
 func (model *Transformer) attentionLengths(layer, contextLength int) (global, local int) {
-	if model.Config.Compression() > 1 {
-		ratio := model.Config.Compression()
-		global = (contextLength + ratio - 1) / ratio
+	if model.Config.HasCompressionAt(layer) {
+		ratio := model.Config.LayerRatioAt(layer)
+		if ratio > 1 {
+			global = (contextLength + ratio - 1) / ratio
+		} else {
+			global = contextLength
+		}
 		if global < 1 {
 			global = 1
 		}
@@ -137,10 +141,10 @@ func (model *Transformer) EstimatePrefillFlops(numTokens int) float64 {
 	headCount := model.Config.NumHead
 	headDimension := model.Config.HeadDim()
 	attentionFlops := 0.0
-	ratio := model.Config.Compression()
 	for layer := 0; layer < model.Config.NumLayer; layer++ {
 		global, local := model.attentionLengths(layer, numTokens)
 		var globalPairs, localPairs float64
+		ratio := model.Config.LayerRatioAt(layer)
 		if ratio > 1 {
 			// Each compressed block holds `ratio` queries that attend to the
 			// strictly preceding compressed keys.
@@ -171,8 +175,6 @@ func (model *Transformer) estimatePrefillFlopsCED(numTokens int) float64 {
 	if window := config.SWAWindowSize(); window < replayTokens {
 		replayTokens = window
 	}
-	ratio := config.Compression()
-
 	matmulFlops := 0.0
 	for layer := 0; layer < config.NumLayer; layer++ {
 		block := model.blocks[layer]
@@ -225,6 +227,7 @@ func (model *Transformer) estimatePrefillFlopsCED(numTokens int) float64 {
 			continue
 		}
 		var globalPairs, localPairs float64
+		ratio := config.LayerRatioAt(layer)
 		if ratio > 1 {
 			blockCount := float64(global)
 			globalPairs = float64(ratio) * blockCount * (blockCount - 1) / 2
@@ -249,38 +252,36 @@ func (model *Transformer) WeightReadBytes() int {
 // layers (float32). For MLA it is the shared latent plus the decoupled rotary
 // key, which is smaller than two per-head key/value rows.
 func (model *Transformer) KVBytesPerToken() int {
-	if model.Config.MLAEnabled() {
-		perLayer := model.Config.MLALatent + model.Config.NumKVHead*model.Config.MLARotaryDimension()
-		return model.Config.NumLayer * perLayer * 4
-	}
 	headDimension := model.Config.HeadDim()
-	return model.Config.NumLayer * 2 * model.Config.NumKVHead * headDimension * 4
+	total := 0
+	for layer := 0; layer < model.Config.NumLayer; layer++ {
+		if model.Config.MLAEnabled() && !model.Config.CompressesAt(layer) {
+			perLayer := model.Config.MLALatent + model.Config.NumKVHead*model.Config.MLARotaryDimension()
+			total += perLayer * 4
+			continue
+		}
+		perToken := 2 * model.Config.NumKVHead * headDimension * 4
+		if ratio := model.Config.LayerRatioAt(layer); ratio > 1 {
+			perToken /= ratio
+		}
+		total += perToken
+	}
+	return total
 }
 
 // KVReadBytes returns the bytes of KV cache read by one decode step at the
 // given context length (sliding-window layers read only the recent window).
 func (model *Transformer) KVReadBytes(contextLength int) int {
 	headDimension := model.Config.HeadDim()
-	if model.Config.MLAEnabled() {
-		perToken := model.Config.MLALatent + model.Config.NumKVHead*model.Config.MLARotaryDimension()
-		total := 0
-		for _, windowSize := range model.windowSizes {
-			effectiveLength := contextLength
-			if window := windowSize[0]; window >= 0 && window < effectiveLength {
-				effectiveLength = window
-			}
-			total += perToken * 4 * effectiveLength
-		}
-		return total
-	}
 	total := 0
-	for _, windowSize := range model.windowSizes {
-		window := windowSize[0]
-		effectiveLength := contextLength
-		if window >= 0 && window < effectiveLength {
-			effectiveLength = window
+	for layer := 0; layer < model.Config.NumLayer; layer++ {
+		global, local := model.attentionLengths(layer, contextLength)
+		if model.Config.MLAEnabled() && !model.Config.CompressesAt(layer) {
+			perToken := model.Config.MLALatent + model.Config.NumKVHead*model.Config.MLARotaryDimension()
+			total += perToken * 4 * (global + local)
+			continue
 		}
-		total += 2 * model.Config.NumKVHead * headDimension * 4 * effectiveLength
+		total += 2 * model.Config.NumKVHead * headDimension * 4 * (global + local)
 	}
 	return total
 }
@@ -328,7 +329,7 @@ func ScalingParamsForConfig(config Config) int64 {
 	if rank := config.QueryRank(); rank > 0 {
 		queryParams = 2 * embeddingDimension * rank
 	}
-	kvParams := 2 * embeddingDimension * embeddingDimension
+	kvParams := 2 * embeddingDimension * config.NumKVHead * config.HeadDim()
 	if rank := config.KVRank(); rank > 0 {
 		kvParams = 3 * embeddingDimension * rank
 	}
@@ -354,7 +355,7 @@ func EstimateFlopsPerTokenForConfig(config Config) float64 {
 	if rank := config.QueryRank(); rank > 0 {
 		queryParams = 2 * embeddingDimension * rank
 	}
-	kvParams := 2 * embeddingDimension * embeddingDimension
+	kvParams := 2 * embeddingDimension * config.NumKVHead * config.HeadDim()
 	if rank := config.KVRank(); rank > 0 {
 		kvParams = 3 * embeddingDimension * rank
 	}

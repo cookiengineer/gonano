@@ -12,9 +12,10 @@ type Preset string
 
 const (
 	// PresetFlash is the recommended DeepSeek-V4.1-Flash long-context stack:
-	// HCA KV compression, CSA sparse attention with the hierarchical indexer,
-	// cross-layer KV/index reuse, the local sliding window, the causal
-	// encoder-decoder split, SwiGLU DeepSeekMoE, grouped-query attention,
+	// a per-layer C1/C2 compression layout with a sliding-window-only encoder
+	// and an explicit YOCO boundary, CSA sparse attention with the hierarchical
+	// indexer, cross-layer KV/index reuse, the local sliding window, the causal
+	// encoder-decoder split, SwiGLU DeepSeekMoE, single-KV-head attention,
 	// head-wise Muon, and partial RoPE.
 	PresetFlash Preset = "flash"
 	// PresetLatent uses absorbed Multi-head Latent Attention instead of the
@@ -41,9 +42,10 @@ const (
 	DefaultDepth = 20
 	// DefaultVocabSize is the target vocabulary size (padded to a multiple of 64).
 	DefaultVocabSize = 131072
-	// DefaultHeadDim is the attention head width. 64 keeps the query head count
-	// even at even depths, so grouped-query attention applies.
-	DefaultHeadDim = 64
+	// DefaultHeadDim is the attention head width. 128 leaves room for the V4.1
+	// 64-dim rotary slice plus a meaningful MLA content/latent width, while
+	// keeping the CPU-focused default practical.
+	DefaultHeadDim = 128
 )
 
 // ParsePreset resolves a preset name. The empty string selects DefaultPreset.
@@ -90,12 +92,83 @@ func ConfigForPreset(preset Preset, depth, vocabSize, aspectRatio, headDim, seqL
 	return config
 }
 
-// applyFlashPreset turns on the DeepSeek-V4.1-Flash long-context stack.
+// V41LayerRatios returns the default DeepSeek-V4.1 layer layout: a
+// sliding-window-only encoder, one C1 boundary layer, and a C2-compressed
+// decoder. The C1 layer starts the YOCO consumer half.
+func V41LayerRatios(numLayers int) []int {
+	if numLayers <= 0 {
+		return nil
+	}
+	split := numLayers / 2
+	ratios := make([]int, numLayers)
+	for layer := 0; layer < numLayers; layer++ {
+		switch {
+		case layer < split:
+			ratios[layer] = 0
+		case layer == split:
+			ratios[layer] = 1
+		default:
+			ratios[layer] = 2
+		}
+	}
+	if numLayers == 1 {
+		ratios[0] = 1
+	}
+	return ratios
+}
+
+// applyFlashPreset turns on the DeepSeek-V4.1-Flash long-context stack. The
+// flash preset is the small CPU-focused V4.1 layout: per-layer C1/C2
+// compression with a sliding-window encoder and an explicit YOCO boundary.
 func (configuration *Config) applyFlashPreset() {
 	configuration.applyDefaultGroupedQuery()
-	configuration.HeadWiseMuon = true
-	if configuration.Compression() <= 1 {
-		configuration.CompressionRatio = 4
+	// V4.1 uses a single key/value head per layer (absorbed MLA geometry). The
+	// MLA projections themselves are enabled by the V4.1 composition work; the
+	// head ratio is already correct for it.
+	if configuration.NumHead > 1 {
+		configuration.NumKVHead = 1
+	}
+	configuration.HeadWiseMuon = false
+	configuration.AttentionSink = true
+	if configuration.MoEScoring == "" {
+		configuration.MoEScoring = "sqrtsoftplus"
+	}
+	if configuration.MoETopKMethod == "" {
+		configuration.MoETopKMethod = "noaux_tc"
+	}
+	configuration.MoENormTopKProb = true
+	// noaux_tc does not use the auxiliary sequence-level balance loss.
+	configuration.MoEBalanceWeight = -1
+	if configuration.NumNextNPredictLayers <= 0 {
+		configuration.NumNextNPredictLayers = 1
+	}
+	if len(configuration.DFlashTargetLayerIDs) == 0 {
+		configuration.DFlashTargetLayerIDs = []int{configuration.NumLayer - 1}
+	}
+	if configuration.DFlashBlockSize <= 0 {
+		configuration.DFlashBlockSize = 5
+	}
+	if configuration.DFlashNoiseToken <= 0 {
+		configuration.DFlashNoiseToken = configuration.PaddedVocab() - 1
+	}
+	if configuration.DFlashMarkovRank <= 0 {
+		configuration.DFlashMarkovRank = configuration.EmbedDim / 4
+		if configuration.DFlashMarkovRank < 4 {
+			configuration.DFlashMarkovRank = 4
+		}
+		if configuration.DFlashMarkovRank > 32 {
+			configuration.DFlashMarkovRank = 32
+		}
+	}
+	if configuration.MLALatent <= 0 {
+		configuration.MLALatent = configuration.HeadDim() - configuration.MLARotaryDimension()
+		if configuration.MLALatent <= 0 {
+			configuration.MLALatent = configuration.HeadDim() / 2
+		}
+	}
+	if !configuration.LayeredCompression() && configuration.CompressionRatio <= 1 {
+		configuration.CompressionRatios = V41LayerRatios(configuration.NumLayer)
+		configuration.CompressionRatio = 0
 	}
 	if configuration.SparseTopK <= 0 {
 		configuration.SparseTopK = 8
@@ -110,9 +183,12 @@ func (configuration *Config) applyFlashPreset() {
 		configuration.SWAWindow = 128
 	}
 	if configuration.NumLayer >= 2 {
-		// CED splices the backbone into equal encoder/decoder halves and needs
-		// at least two layers; a single-layer model keeps global attention.
+		// CED/YOCO splices the backbone into encoder and consumer halves. The
+		// first C1 layer is the consumer boundary unless the caller set one.
 		configuration.CED = true
+		if configuration.PrefillLayer <= 0 {
+			configuration.PrefillLayer = configuration.NumLayer / 2
+		}
 	}
 	configuration.enableMoE()
 }
@@ -122,6 +198,37 @@ func (configuration *Config) applyFlashPreset() {
 func (configuration *Config) applyLatentPreset() {
 	configuration.applyDefaultGroupedQuery()
 	configuration.HeadWiseMuon = false
+	configuration.AttentionSink = true
+	if configuration.MoEScoring == "" {
+		configuration.MoEScoring = "sqrtsoftplus"
+	}
+	if configuration.MoETopKMethod == "" {
+		configuration.MoETopKMethod = "noaux_tc"
+	}
+	configuration.MoENormTopKProb = true
+	// noaux_tc does not use the auxiliary sequence-level balance loss.
+	configuration.MoEBalanceWeight = -1
+	if configuration.NumNextNPredictLayers <= 0 {
+		configuration.NumNextNPredictLayers = 1
+	}
+	if len(configuration.DFlashTargetLayerIDs) == 0 {
+		configuration.DFlashTargetLayerIDs = []int{configuration.NumLayer - 1}
+	}
+	if configuration.DFlashBlockSize <= 0 {
+		configuration.DFlashBlockSize = 5
+	}
+	if configuration.DFlashNoiseToken <= 0 {
+		configuration.DFlashNoiseToken = configuration.PaddedVocab() - 1
+	}
+	if configuration.DFlashMarkovRank <= 0 {
+		configuration.DFlashMarkovRank = configuration.EmbedDim / 4
+		if configuration.DFlashMarkovRank < 4 {
+			configuration.DFlashMarkovRank = 4
+		}
+		if configuration.DFlashMarkovRank > 32 {
+			configuration.DFlashMarkovRank = 32
+		}
+	}
 	if configuration.MLALatent <= 0 {
 		configuration.MLALatent = configuration.EmbedDim / 2
 	}

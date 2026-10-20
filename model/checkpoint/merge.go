@@ -2,6 +2,7 @@ package checkpoint
 
 import (
 	"fmt"
+	"reflect"
 
 	"github.com/cookiengineer/gonano/tensors"
 )
@@ -84,7 +85,7 @@ func MergeFiles(paths []string, weights []float32, outPath string) error {
 		parameterSets[index] = parameters
 	}
 	for index := 1; index < len(paths); index++ {
-		if metas[index].ModelConfig != metas[0].ModelConfig {
+		if !reflect.DeepEqual(metas[index].ModelConfig, metas[0].ModelConfig) {
 			return fmt.Errorf("checkpoint: %s and %s have different model configs", paths[0], paths[index])
 		}
 	}

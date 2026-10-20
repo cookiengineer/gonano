@@ -184,6 +184,9 @@ func (attention *CausalSelfAttention) forwardTraining(input, valueEmbedding, cos
 			}
 		}
 	}
+	if attention.sink != nil {
+		applyAttentionSink(outputHeadMajor, logSumExp, attention.sink, batchSize, attention.queryHeadCount, sequenceLength, headDimension)
+	}
 	context.logSumExp = logSumExp
 	context.outputHeadMajor = outputHeadMajor
 
@@ -212,7 +215,7 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 	// branch, so both are backpropagated with the merged log-sum-exp and the
 	// merged row correction dO . O.
 	var rowCorrection *tensors.Tensor
-	if attention.usesCompression() && attention.swaWindow > 0 {
+	if (attention.usesCompression() && attention.swaWindow > 0) || attention.sink != nil {
 		rowCorrection = tensors.New(batchSize, attention.queryHeadCount, sequenceLength)
 		rowCount := batchSize * attention.queryHeadCount * sequenceLength
 		for row := 0; row < rowCount; row++ {
@@ -223,6 +226,9 @@ func (attention *CausalSelfAttention) backwardTraining(input *tensors.Tensor, ou
 			}
 			rowCorrection.Data[row] = float32(dot)
 		}
+	}
+	if attention.sink != nil {
+		accumulateAttentionSinkGradient(attention.sink, rowCorrection, context.logSumExp, batchSize, attention.queryHeadCount, sequenceLength)
 	}
 	if attention.usesCompression() {
 		share := context.share
@@ -452,6 +458,21 @@ func accumulateTensor(destination, source *tensors.Tensor) *tensors.Tensor {
 // decoder's global key through the QK norm, RoPE, and the key projection. It
 // returns the gradient with respect to the encoder hidden state.
 func (attention *CausalSelfAttention) cedKeyProjectionBackward(encoderHidden *tensors.Tensor, context *attentionContext, gradientKeyHeadMajor, cosine, sine *tensors.Tensor, positionOffset int) *tensors.Tensor {
+	if attention.mla != nil {
+		mla := attention.mla
+		batchSize, sequenceLength := encoderHidden.Shape[0], encoderHidden.Shape[1]
+		gradientSequence := toBatchSequenceLayout(gradientKeyHeadMajor)
+		negatedSine := negateSineTable(sine)
+		gradientPreRope := ApplyRotary(gradientSequence, cosine, negatedSine, positionOffset)
+		keyContent := tensors.New(batchSize, sequenceLength, mla.kvHeadCount, mla.contentDim)
+		keyRope := tensors.New(batchSize, sequenceLength, mla.kvHeadCount, mla.ropeDim)
+		splitHeads(gradientPreRope, keyContent, keyRope, mla.kvHeadCount, mla.contentDim, mla.ropeDim)
+		kvLatent := mla.KVDown.Forward(encoderHidden)
+		gradientKVLatent := mla.KeyUp.Backward(kvLatent, keyContent.Reshape(batchSize, sequenceLength, mla.kvHeadCount*mla.contentDim))
+		gradientInput := mla.KVDown.Backward(encoderHidden, gradientKVLatent)
+		gradientInput = tensors.Add(gradientInput, mla.KeyRope.Backward(encoderHidden, keyRope.Reshape(batchSize, sequenceLength, mla.kvHeadCount*mla.ropeDim)))
+		return gradientInput
+	}
 	gradient := tensors.Scale(gradientKeyHeadMajor, qkScale)
 	gradientSequence := toBatchSequenceLayout(gradient)
 	gradientPreNorm := normalizeLastDimBackward(context.cedKeyRotary, gradientSequence)
@@ -470,6 +491,12 @@ func (attention *CausalSelfAttention) cedKeyProjectionBackward(encoderHidden *te
 // global value projection, returning the gradient with respect to the encoder
 // hidden state. It is the value-side counterpart of cedKeyProjectionBackward.
 func (attention *CausalSelfAttention) cedValueProjectionBackward(encoderHidden, gradientValueSequence *tensors.Tensor) *tensors.Tensor {
+	if attention.mla != nil {
+		mla := attention.mla
+		kvLatent := mla.KVDown.Forward(encoderHidden)
+		gradientLatent := mla.ValueUp.Backward(kvLatent, gradientValueSequence)
+		return mla.KVDown.Backward(encoderHidden, gradientLatent)
+	}
 	if attention.kvDown != nil {
 		latent := attention.kvDown.Forward(encoderHidden)
 		gradientLatent := attention.valueProjection.Backward(latent, gradientValueSequence)

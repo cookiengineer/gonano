@@ -121,6 +121,20 @@ func (attention *CausalSelfAttention) mlaProjectHeads(input *tensors.Tensor) (qu
 	return query, key, value, queryLatent, kvLatent
 }
 
+// mlaProjectKeyValue builds the MLA key and value from the hidden state without
+// computing the query. It is used by the CED global projection and by the
+// compressed attention path.
+func (attention *CausalSelfAttention) mlaProjectKeyValue(input *tensors.Tensor) (key, value *tensors.Tensor) {
+	mla := attention.mla
+	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
+	kvLatent := mla.KVDown.Forward(input)
+	keyContent := mla.KeyUp.Forward(kvLatent).Reshape(batchSize, sequenceLength, mla.kvHeadCount, mla.contentDim)
+	keyRope := mla.KeyRope.Forward(input).Reshape(batchSize, sequenceLength, mla.kvHeadCount, mla.ropeDim)
+	key = concatHeads(keyContent, keyRope, mla.kvHeadCount, mla.contentDim, mla.ropeDim)
+	value = mla.ValueUp.Forward(kvLatent).Reshape(batchSize, sequenceLength, mla.kvHeadCount, mla.valueDim)
+	return key, value
+}
+
 // mlaProjectBackward backpropagates the query, key, and value gradients through
 // the MLA up-projections into the hidden state.
 func (attention *CausalSelfAttention) mlaProjectBackward(context *attentionContext, gradientQuery, gradientKey, gradientValue, input *tensors.Tensor) *tensors.Tensor {
@@ -199,10 +213,10 @@ func (attention *CausalSelfAttention) mlaForwardInference(input, cosine, sine *t
 
 	queryLatent := mla.QueryDown.Forward(input)
 	queryContent := mla.QueryUp.Forward(queryLatent).Reshape(batchSize, sequenceLength, queryHeads, contentDim)
-	queryRope := ApplyRotary(mla.QueryRope.Forward(input).Reshape(batchSize, sequenceLength, queryHeads, ropeDim), cosine, sine, positionOffset)
+	queryRope := applyRotaryForCache(mla.QueryRope.Forward(input).Reshape(batchSize, sequenceLength, queryHeads, ropeDim), cosine, sine, positionOffset, cache)
 
 	kvLatent := mla.KVDown.Forward(input)
-	keyRope := ApplyRotary(mla.KeyRope.Forward(input).Reshape(batchSize, sequenceLength, kvHeads, ropeDim), cosine, sine, positionOffset)
+	keyRope := applyRotaryForCache(mla.KeyRope.Forward(input).Reshape(batchSize, sequenceLength, kvHeads, ropeDim), cosine, sine, positionOffset, cache)
 
 	for batch := 0; batch < batchSize; batch++ {
 		for row := 0; row < sequenceLength; row++ {
@@ -213,20 +227,41 @@ func (attention *CausalSelfAttention) mlaForwardInference(input, cosine, sine *t
 		}
 	}
 
-	count := cache.Position() + sequenceLength
+	maxCount := 0
+	for batch := 0; batch < batchSize; batch++ {
+		if count := cache.PositionAt(batch) + sequenceLength; count > maxCount {
+			maxCount = count
+		}
+	}
 	output := tensors.New(batchSize, sequenceLength, queryHeads*valueDim)
 	keyUp := mla.KeyUp.Weight.Data
 	valueUp := mla.ValueUp.Weight.Data
 
+	pagedDecode := cache.IsPaged() && sequenceLength == 1
+	if pagedDecode {
+		for batch := 0; batch < batchSize; batch++ {
+			if window[0] < cache.PositionAt(batch)+sequenceLength {
+				pagedDecode = false
+				break
+			}
+		}
+	}
 	query := make([]float32, sequenceLength*headDim)
-	key := make([]float32, count*headDim)
-	value := make([]float32, count*headDim)
+	var key, value []float32
+	if !pagedDecode {
+		key = make([]float32, maxCount*headDim)
+		value = make([]float32, maxCount*headDim)
+	}
 	attentionOut := make([]float32, sequenceLength*headDim)
 	logSumExp := make([]float32, sequenceLength)
 
 	for batch := 0; batch < batchSize; batch++ {
-		latentCache := cache.MLALatent(layer, batch, count)
-		ropeCache := cache.MLARopeKey(layer, batch, count)
+		count := cache.PositionAt(batch) + sequenceLength
+		var latentCache, ropeCache []float32
+		if !pagedDecode {
+			latentCache = cache.MLALatent(layer, batch, count)
+			ropeCache = cache.MLARopeKey(layer, batch, count)
+		}
 		for queryHead := 0; queryHead < queryHeads; queryHead++ {
 			kvHead := queryHead / headRatio
 
@@ -246,20 +281,24 @@ func (attention *CausalSelfAttention) mlaForwardInference(input, cosine, sine *t
 				copy(query[queryBase+latentDim:queryBase+headDim], queryRope.Data[ropeBase:ropeBase+ropeDim])
 			}
 
-			// K = [c_kv | k_rope], V = [c_kv | 0].
-			for token := 0; token < count; token++ {
-				base := token * headDim
-				copy(key[base:base+latentDim], latentCache[token*latentDim:(token+1)*latentDim])
-				ropeBase := token*kvHeads*ropeDim + kvHead*ropeDim
-				copy(key[base+latentDim:base+headDim], ropeCache[ropeBase:ropeBase+ropeDim])
-				copy(value[base:base+latentDim], latentCache[token*latentDim:(token+1)*latentDim])
-				for index := base + latentDim; index < base+headDim; index++ {
-					value[index] = 0
+			if pagedDecode {
+				pagedMLAAttention(mla, cache, layer, batch, queryHead, kvHead, count, query[:headDim], attentionOut[:headDim], logSumExp[:1])
+			} else {
+				// K = [c_kv | k_rope], V = [c_kv | 0].
+				for token := 0; token < count; token++ {
+					base := token * headDim
+					copy(key[base:base+latentDim], latentCache[token*latentDim:(token+1)*latentDim])
+					ropeBase := token*kvHeads*ropeDim + kvHead*ropeDim
+					copy(key[base+latentDim:base+headDim], ropeCache[ropeBase:ropeBase+ropeDim])
+					copy(value[base:base+latentDim], latentCache[token*latentDim:(token+1)*latentDim])
+					for index := base + latentDim; index < base+headDim; index++ {
+						value[index] = 0
+					}
 				}
-			}
 
-			tensors.AttentionForward(query, key, value, attentionOut, logSumExp,
-				sequenceLength, count, headDim, positionOffset, window[0])
+				tensors.AttentionForward(query, key[:count*headDim], value[:count*headDim], attentionOut, logSumExp,
+					sequenceLength, count, headDim, cache.PositionAt(batch), window[0])
+			}
 
 			for token := 0; token < sequenceLength; token++ {
 				outputBase := ((batch*sequenceLength+token)*queryHeads + queryHead) * valueDim

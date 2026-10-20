@@ -41,6 +41,9 @@ func main() {
 	prefixCacheSize := flag.Int("prefix-cache-size", 8, "KV prefix cache entries (0 disables)")
 	prefixCacheDir := flag.String("prefix-cache-dir", "", "persist the KV prefix cache to this directory")
 	prefixCacheTTL := flag.Duration("prefix-cache-ttl", 0, "KV prefix cache entry TTL (0 = no expiry)")
+	prefillChunk := flag.Int("prefill-chunk", 0, "maximum prompt tokens per prefill forward (0 = whole prompt)")
+	schedulerMaxActive := flag.Int("scheduler-max-active", 0, "enable the batched scheduler with this many active rows (0 = single-request engine)")
+	schedulerPreempt := flag.Bool("scheduler-preempt", false, "allow the scheduler to preempt and recompute running requests when KV blocks run out")
 	flag.Parse()
 
 	logger := logging.Default(slog.LevelInfo)
@@ -50,7 +53,7 @@ func main() {
 
 	// Domain bank mode: route each request to the relevant domain models.
 	if *bankPath != "" {
-		serveBank(logger, *bankPath, *routerPath, *tokenizerPath, *baseDir, *addr, *modelName, *maxDomains, float32(*minDomainScore), *routeScope)
+		serveBank(logger, *bankPath, *routerPath, *tokenizerPath, *baseDir, *addr, *modelName, *maxDomains, float32(*minDomainScore), *routeScope, *schedulerMaxActive, *prefillChunk, *prefixCacheSize, *prefixCacheDir, *schedulerPreempt)
 		return
 	}
 
@@ -79,7 +82,19 @@ func main() {
 	tools.Register(nowTool{})
 
 	httpServer := server.NewServer(model, tokenizer, tools, *modelName)
-	if *prefixCacheSize > 0 || *prefixCacheDir != "" {
+	httpServer.Engine.PrefillChunk = *prefillChunk
+	defer httpServer.Close()
+	if *schedulerMaxActive > 0 {
+		httpServer.SchedulerPrefixEntries = *prefixCacheSize
+		if *schedulerPreempt {
+			httpServer.SchedulerPreemption = inference.PreemptLongest
+		}
+		httpServer.StartScheduler(*schedulerMaxActive, *prefillChunk)
+		if *prefixCacheDir != "" {
+			logger.Warn("scheduler enabled; on-disk engine prefix cache is not used")
+		}
+		logger.Info("scheduler enabled", "max_active", *schedulerMaxActive, "prefix_entries", *prefixCacheSize)
+	} else if *prefixCacheSize > 0 || *prefixCacheDir != "" {
 		httpServer.Engine.Cache = inference.NewCacheManager(inference.CacheOptions{
 			MaxEntries: *prefixCacheSize,
 			TTL:        *prefixCacheTTL,
@@ -94,7 +109,7 @@ func main() {
 }
 
 // serveBank starts the server in domain-bank mode.
-func serveBank(logger *slog.Logger, bankPath, routerPath, tokenizerPath, baseDir, addr, modelName string, maxDomains int, minDomainScore float32, routeScope string) {
+func serveBank(logger *slog.Logger, bankPath, routerPath, tokenizerPath, baseDir, addr, modelName string, maxDomains int, minDomainScore float32, routeScope string, schedulerMaxActive, prefillChunk, prefixCacheSize int, prefixCacheDir string, schedulerPreempt bool) {
 	manifest, err := bank.LoadManifest(bankPath)
 	if err != nil {
 		logger.Error("load bank manifest", "err", err)
@@ -143,6 +158,17 @@ func serveBank(logger *slog.Logger, bankPath, routerPath, tokenizerPath, baseDir
 	httpServer.MaxDomains = maxDomains
 	httpServer.MinDomainScore = minDomainScore
 	httpServer.RouteScope = routeScope
+	defer httpServer.Close()
+	if schedulerMaxActive > 0 {
+		if schedulerPreempt {
+			httpServer.SchedulerPreemption = inference.PreemptLongest
+		}
+		httpServer.EnableDomainSchedulers(schedulerMaxActive, prefillChunk, prefixCacheSize)
+		if prefixCacheDir != "" {
+			logger.Warn("domain schedulers enabled; on-disk engine prefix cache is not used")
+		}
+		logger.Info("domain schedulers enabled", "max_active", schedulerMaxActive, "prefix_entries", prefixCacheSize)
+	}
 
 	logger.Info("serving domain bank", "addr", addr, "domains", manifest.IDs(), "max_domains", maxDomains, "route_scope", routeScope)
 	if err := http.ListenAndServe(addr, httpServer.Handler()); err != nil {

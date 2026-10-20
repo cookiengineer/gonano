@@ -38,6 +38,10 @@ type Transformer struct {
 	valueEmbeds map[int]*layers.Embedding // layer -> embedding (ResFormer)
 
 	rotaryCosine, rotarySine *tensors.Tensor // [rotarySeqLen, rotaryDim/2]
+	// rotaryCosineLayers and rotarySineLayers hold the per-layer tables so
+	// compressed layers can use a different frequency base.
+	rotaryCosineLayers []*tensors.Tensor
+	rotarySineLayers   []*tensors.Tensor
 
 	// auxGradientScale scales the sequence-level balance-loss gradient so it is
 	// averaged over the same gradient-accumulation window as the main loss. It
@@ -51,23 +55,43 @@ func NewTransformer(config Config) *Transformer {
 	config.ApplyMoEDefaults()
 	config.Validate()
 	paddedVocabulary := config.PaddedVocab()
-	rotaryCosine, rotarySine := precomputeRotary(config.SequenceLen*rotaryOvercompute, config.RotaryDimension())
+	rotaryLength := config.SequenceLen * rotaryOvercompute
+	rotaryDimension := config.RotaryDimension()
+	scaling := config.ropeScalingConfig()
+	defaultTheta := config.EffectiveRopeTheta()
+	rotaryCosine, rotarySine := precomputeRotaryScaled(rotaryLength, rotaryDimension, defaultTheta, scaling)
+	tables := map[float64][2]*tensors.Tensor{defaultTheta: {rotaryCosine, rotarySine}}
+	rotaryCosineLayers := make([]*tensors.Tensor, config.NumLayer)
+	rotarySineLayers := make([]*tensors.Tensor, config.NumLayer)
+	for layer := 0; layer < config.NumLayer; layer++ {
+		theta := config.RopeThetaForLayer(layer)
+		table, ok := tables[theta]
+		if !ok {
+			layerCosine, layerSine := precomputeRotaryScaled(rotaryLength, rotaryDimension, theta, scaling)
+			table = [2]*tensors.Tensor{layerCosine, layerSine}
+			tables[theta] = table
+		}
+		rotaryCosineLayers[layer] = table[0]
+		rotarySineLayers[layer] = table[1]
+	}
 
 	model := &Transformer{
-		Config:         config,
-		paddedVocab:    paddedVocabulary,
-		windowSizes:    config.WindowSizes(),
-		tokenEmbedding: layers.NewEmbedding(paddedVocabulary, config.EmbedDim),
-		blocks:         make([]*Block, config.NumLayer),
-		lmHead:         layers.NewLinear(config.EmbedDim, paddedVocabulary),
-		residLambdas:   tensors.New(config.NumLayer),
-		x0Lambdas:      tensors.New(config.NumLayer),
-		smearGate:      layers.NewLinear(smearGateChannels, 1),
-		smearLambda:    tensors.New(1),
-		backoutLambda:  tensors.New(1),
-		valueEmbeds:    make(map[int]*layers.Embedding),
-		rotaryCosine:   rotaryCosine,
-		rotarySine:     rotarySine,
+		Config:             config,
+		paddedVocab:        paddedVocabulary,
+		windowSizes:        config.WindowSizes(),
+		tokenEmbedding:     layers.NewEmbedding(paddedVocabulary, config.EmbedDim),
+		blocks:             make([]*Block, config.NumLayer),
+		lmHead:             layers.NewLinear(config.EmbedDim, paddedVocabulary),
+		residLambdas:       tensors.New(config.NumLayer),
+		x0Lambdas:          tensors.New(config.NumLayer),
+		smearGate:          layers.NewLinear(smearGateChannels, 1),
+		smearLambda:        tensors.New(1),
+		backoutLambda:      tensors.New(1),
+		valueEmbeds:        make(map[int]*layers.Embedding),
+		rotaryCosine:       rotaryCosine,
+		rotarySine:         rotarySine,
+		rotaryCosineLayers: rotaryCosineLayers,
+		rotarySineLayers:   rotarySineLayers,
 	}
 	for layerIndex := 0; layerIndex < config.NumLayer; layerIndex++ {
 		hasValue := !config.MLAEnabled() && hasValueEmbedding(layerIndex, config.NumLayer)
@@ -81,6 +105,14 @@ func NewTransformer(config Config) *Transformer {
 
 // NumLayers returns the number of transformer blocks.
 func (model *Transformer) NumLayers() int { return model.Config.NumLayer }
+
+// rotaryForLayer returns the layer's rotary tables.
+func (model *Transformer) rotaryForLayer(layer int) (*tensors.Tensor, *tensors.Tensor) {
+	if layer >= 0 && layer < len(model.rotaryCosineLayers) {
+		return model.rotaryCosineLayers[layer], model.rotarySineLayers[layer]
+	}
+	return model.rotaryCosine, model.rotarySine
+}
 
 // PaddedVocab returns the padded vocabulary size.
 func (model *Transformer) PaddedVocab() int { return model.paddedVocab }
@@ -209,7 +241,7 @@ func (model *Transformer) InitWeights(rng *tensors.RNG) {
 // autoregressive inference (KV-cache). Loss computation is intentionally kept
 // out of the model; callers use tensors.CrossEntropy on the returned logits.
 func (model *Transformer) Forward(indexes *tensors.Int32s, cache *KVBuffer) *tensors.Tensor {
-	logits, _ := model.forward(indexes, cache, false, nil, 0)
+	logits, _, _ := model.forward(indexes, cache, false, nil, 0, nil)
 	return logits
 }
 
@@ -217,7 +249,19 @@ func (model *Transformer) Forward(indexes *tensors.Int32s, cache *KVBuffer) *ten
 // [B,T,EmbedDim] that feeds lm_head. It is used to train the DSpark confidence
 // head.
 func (model *Transformer) ForwardHidden(indexes *tensors.Int32s, cache *KVBuffer) (logits, hidden *tensors.Tensor) {
-	return model.forward(indexes, cache, false, nil, 0)
+	logits, hidden, _ = model.forward(indexes, cache, false, nil, 0, nil)
+	return logits, hidden
+}
+
+// ForwardHiddenAtLayers is ForwardHidden that also captures the backbone
+// activations used by DFlash training at layerIDs. The returned tensor has
+// shape [B,T,len(layerIDs)*EmbedDim] and uses the same layer semantics as
+// TargetHiddenFromContext: a non-final layer L captures the residual state at
+// the start of layer L+1, and the final layer captures the pre-final-norm
+// state after the backout subtraction.
+func (model *Transformer) ForwardHiddenAtLayers(indexes *tensors.Int32s, cache *KVBuffer, layerIDs []int) (logits, captured *tensors.Tensor) {
+	logits, _, captured = model.forward(indexes, cache, false, nil, 0, layerIDs)
+	return logits, captured
 }
 
 // ForwardHiddenSuffix is ForwardHidden with the embeddings of positions
@@ -226,7 +270,8 @@ func (model *Transformer) ForwardHidden(indexes *tensors.Int32s, cache *KVBuffer
 // learned draft-mask positions and read the parallel next-token predictions for
 // those positions in a single causal forward pass (DeepSeek-V4.1 §2.4.3).
 func (model *Transformer) ForwardHiddenSuffix(indexes *tensors.Int32s, cache *KVBuffer, suffixEmbedding *tensors.Tensor, suffixStart int) (logits, hidden *tensors.Tensor) {
-	return model.forward(indexes, cache, false, suffixEmbedding, suffixStart)
+	logits, hidden, _ = model.forward(indexes, cache, false, suffixEmbedding, suffixStart, nil)
+	return logits, hidden
 }
 
 // ReplaySWA runs the model over a suffix of an already-filled cache to rebuild
@@ -237,25 +282,45 @@ func (model *Transformer) ForwardHiddenSuffix(indexes *tensors.Int32s, cache *KV
 // that the cache's raw buffers for [position, position+len(indexes)) are
 // refilled.
 func (model *Transformer) ReplaySWA(indexes *tensors.Int32s, cache *KVBuffer) {
-	model.forward(indexes, cache, true, nil, 0)
+	model.forward(indexes, cache, true, nil, 0, nil)
+	cache.MarkRawRebuilt()
 }
 
-func (model *Transformer) forward(indexes *tensors.Int32s, cache *KVBuffer, replay bool, suffixEmbedding *tensors.Tensor, suffixStart int) (*tensors.Tensor, *tensors.Tensor) {
+func (model *Transformer) forward(indexes *tensors.Int32s, cache *KVBuffer, replay bool, suffixEmbedding *tensors.Tensor, suffixStart int, captureLayers []int) (*tensors.Tensor, *tensors.Tensor, *tensors.Tensor) {
 	batchSize, sequenceLength := indexes.Shape[0], indexes.Shape[1]
 	if sequenceLength > model.Config.SequenceLen {
 		panic("model: sequence longer than rotary cache")
 	}
-	// MLA inference requires the latent cache. A cache-less full forward (used
-	// by evaluation and distillation on a whole sequence) gets a scratch cache.
-	if cache == nil && model.Config.MLAEnabled() {
+	// MLA and compressed inference require cache state. A cache-less full
+	// forward (used by evaluation and distillation on a whole sequence) gets a
+	// scratch cache with the same mixed layout as the model.
+	if cache == nil && (model.Config.MLAEnabled() || model.Config.AnyCompression()) {
 		cache = NewKVBuffer(batchSize, sequenceLength, model.Config.NumLayer, model.Config.NumKVHead, model.Config.HeadDim())
-		cache.EnableMLA(model.Config.MLALatent, model.Config.NumKVHead*model.Config.MLARotaryDimension())
+		if model.Config.MLAEnabled() {
+			cache.EnableMLA(model.Config.MLALatent, model.Config.NumKVHead*model.Config.MLARotaryDimension())
+		}
+		model.enableCompressionCache(cache, sequenceLength)
 	}
 
 	activations := model.tokenEmbedding.Forward(indexes) // [B,T,C]
 	activations = normalizeLastDim(activations)
 	if suffixEmbedding != nil && suffixStart < sequenceLength {
 		applySuffixEmbedding(activations, suffixEmbedding, suffixStart)
+	}
+
+	embeddingDimension := model.Config.EmbedDim
+	var captured *tensors.Tensor
+	captureSlots := make(map[int][]int)
+	var finalSlots []int
+	if len(captureLayers) > 0 {
+		captured = tensors.New(batchSize, sequenceLength, len(captureLayers)*embeddingDimension)
+		for slot, layer := range captureLayers {
+			if layer >= 0 && layer < model.Config.NumLayer-1 {
+				captureSlots[layer+1] = append(captureSlots[layer+1], slot)
+			} else {
+				finalSlots = append(finalSlots, slot)
+			}
+		}
 	}
 
 	positionOffset := 0
@@ -274,7 +339,7 @@ func (model *Transformer) forward(indexes *tensors.Int32s, cache *KVBuffer, repl
 		smearAdd(activations, gate)
 	default:
 		previousEmbedding := cache.PrevEmbedding()
-		cache.SetPrevEmbedding(lastTokenEmbedding(activations))
+		cache.SetPreviousEmbeddingRows(lastTokenEmbedding(activations))
 		if sequenceLength > 1 {
 			gate := model.smearGate.Forward(sliceChannels(activations, 1, sequenceLength, smearGateChannels))
 			gate = tensors.Scale(tensors.Sigmoid(gate), model.smearLambda.Data[0])
@@ -309,6 +374,11 @@ func (model *Transformer) forward(indexes *tensors.Int32s, cache *KVBuffer, repl
 		if model.Config.CEDEnabled() && layerIndex == model.Config.CEDSplit() {
 			encoderHidden = activations
 		}
+		if captured != nil {
+			if slots := captureSlots[layerIndex]; len(slots) > 0 {
+				captureHiddenSlots(captured, activations, slots, embeddingDimension)
+			}
+		}
 		activations = combineResidual(activations, initialResidual, model.residLambdas.Data[layerIndex], model.x0Lambdas.Data[layerIndex])
 		var valueEmbedding *tensors.Tensor
 		if embedding, ok := model.valueEmbeds[layerIndex]; ok {
@@ -320,7 +390,8 @@ func (model *Transformer) forward(indexes *tensors.Int32s, cache *KVBuffer, repl
 				currentShare.encoderHidden = encoderHidden
 			}
 		}
-		activations = block.Forward(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, positionOffset, model.windowSizes[layerIndex], cache, layerIndex, currentShare)
+		layerCosine, layerSine := model.rotaryForLayer(layerIndex)
+		activations = block.Forward(activations, valueEmbedding, layerCosine, layerSine, positionOffset, model.windowSizes[layerIndex], cache, layerIndex, currentShare)
 		if layerIndex == backoutLayerIndex {
 			backoutActivation = activations.Clone()
 		}
@@ -333,12 +404,50 @@ func (model *Transformer) forward(indexes *tensors.Int32s, cache *KVBuffer, repl
 	if backoutActivation != nil {
 		activations = tensors.AddScaled(activations, backoutActivation, -model.backoutLambda.Data[0])
 	}
+	if captured != nil && len(finalSlots) > 0 {
+		captureHiddenSlots(captured, activations, finalSlots, embeddingDimension)
+	}
 	activations = normalizeLastDim(activations)
 
 	logits := model.lmHead.Forward(activations) // [B,T,paddedVocab]
 	logits = trimVocab(logits, model.paddedVocab, model.Config.VocabSize)
 	logits = tensors.Softcap(logits, softcap)
-	return logits.Reshape(batchSize, sequenceLength, model.Config.VocabSize), activations
+	return logits.Reshape(batchSize, sequenceLength, model.Config.VocabSize), activations, captured
+}
+
+// captureHiddenSlots copies one hidden state into the requested slot positions.
+func captureHiddenSlots(destination, source *tensors.Tensor, slots []int, dimension int) {
+	tokenCount := source.Shape[0] * source.Shape[1]
+	width := destination.Shape[2]
+	for token := 0; token < tokenCount; token++ {
+		sourceBase := token * dimension
+		for _, slot := range slots {
+			destinationBase := token*width + slot*dimension
+			copy(destination.Data[destinationBase:destinationBase+dimension], source.Data[sourceBase:sourceBase+dimension])
+		}
+	}
+}
+
+// enableCompressionCache allocates the per-layer compressed and indexer tiers
+// for a cache sized to capacity tokens.
+func (model *Transformer) enableCompressionCache(cache *KVBuffer, capacity int) {
+	config := model.Config
+	if !config.AnyCompression() {
+		return
+	}
+	compressionMask := make([]bool, config.NumLayer)
+	indexerMask := make([]bool, config.NumLayer)
+	for layer := 0; layer < config.NumLayer; layer++ {
+		compressionMask[layer] = config.OwnsCompressed(layer)
+		indexerMask[layer] = config.OwnsIndexer(layer)
+	}
+	kvWidth := config.NumKVHead * config.HeadDim()
+	cache.EnableCompressionLayout(config.LayerRatios(), config.EmbedDim, kvWidth, config.CompressedMaxBlocks(capacity), compressionMask)
+	if config.AnySparse() {
+		dim, heads := config.indexerDefaults()
+		cache.EnableIndexerKeysLayers(dim*heads, indexerMask)
+	}
+	cache.EnableSWARings(config.RingWindows())
 }
 
 // applySuffixEmbedding overwrites rows [suffixStart, T) of a [B, T, C]
@@ -352,8 +461,13 @@ func applySuffixEmbedding(activations, suffixEmbedding *tensors.Tensor, suffixSt
 	if len(suffixEmbedding.Data) < channels {
 		return
 	}
-	source := suffixEmbedding.Data[:channels]
+	rows := suffixEmbedding.Numel() / channels
 	for batch := 0; batch < batchSize; batch++ {
+		sourceRow := 0
+		if rows > 1 && batch < rows {
+			sourceRow = batch
+		}
+		source := suffixEmbedding.Data[sourceRow*channels : (sourceRow+1)*channels]
 		for position := suffixStart; position < sequenceLength; position++ {
 			base := (batch*sequenceLength + position) * channels
 			copy(activations.Data[base:base+channels], source)
@@ -392,7 +506,8 @@ func (model *Transformer) PrefillCED(indexes *tensors.Int32s, cache *KVBuffer) *
 		if config.ReuseModeAt(layerIndex) == ReuseFull {
 			currentShare = &compressionShare{producer: layerIndex}
 		}
-		activations = model.blocks[layerIndex].Forward(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, 0, model.windowSizes[layerIndex], cache, layerIndex, currentShare)
+		layerCosine, layerSine := model.rotaryForLayer(layerIndex)
+		activations = model.blocks[layerIndex].Forward(activations, valueEmbedding, layerCosine, layerSine, 0, model.windowSizes[layerIndex], cache, layerIndex, currentShare)
 	}
 	encoderHidden := activations
 
@@ -400,9 +515,13 @@ func (model *Transformer) PrefillCED(indexes *tensors.Int32s, cache *KVBuffer) *
 	// encoder hidden state, and reindex layers' indexer key caches.
 	for layerIndex := split; layerIndex < config.NumLayer; layerIndex++ {
 		attention := model.blocks[layerIndex].attention
+		if !attention.usesCompression() {
+			continue
+		}
 		switch {
 		case attention.reuseMode == ReuseFull:
-			keyHead, valueHead, _ := attention.cedGlobalKeyValue(encoderHidden, model.rotaryCosine, model.rotarySine, 0)
+			layerCosine, layerSine := model.rotaryForLayer(layerIndex)
+			keyHead, valueHead, _ := attention.cedGlobalKeyValue(encoderHidden, layerCosine, layerSine, 0)
 			keySequence := toBatchSequenceLayout(keyHead)
 			valueSequence := toBatchSequenceLayout(valueHead)
 			attention.appendGlobalTail(cache, layerIndex, encoderHidden, keySequence, valueSequence, batchSize, sequenceLength, embeddingDimension, headDimension)
@@ -431,7 +550,8 @@ func (model *Transformer) PrefillCED(indexes *tensors.Int32s, cache *KVBuffer) *
 		if config.ReuseModeAt(layerIndex) == ReuseFull {
 			currentShare = &compressionShare{producer: layerIndex, replay: true}
 		}
-		activations = model.blocks[layerIndex].Forward(activations, valueEmbedding, model.rotaryCosine, model.rotarySine, replayStart, model.windowSizes[layerIndex], cache, layerIndex, currentShare)
+		layerCosine, layerSine := model.rotaryForLayer(layerIndex)
+		activations = model.blocks[layerIndex].Forward(activations, valueEmbedding, layerCosine, layerSine, replayStart, model.windowSizes[layerIndex], cache, layerIndex, currentShare)
 		if layerIndex == backoutLayerIndex {
 			backoutActivation = activations.Clone()
 		}
@@ -463,7 +583,7 @@ func (model *Transformer) embedAndSmear(indexes *tensors.Int32s, cache *KVBuffer
 		return activations
 	}
 	previousEmbedding := cache.PrevEmbedding()
-	cache.SetPrevEmbedding(lastTokenEmbedding(activations))
+	cache.SetPreviousEmbeddingRows(lastTokenEmbedding(activations))
 	if sequenceLength > 1 {
 		gate := model.smearGate.Forward(sliceChannels(activations, 1, sequenceLength, smearGateChannels))
 		gate = tensors.Scale(tensors.Sigmoid(gate), model.smearLambda.Data[0])

@@ -93,8 +93,9 @@ type CausalSelfAttention struct {
 
 	// compressor is non-nil when HCA-style dense KV compression is enabled;
 	// it merges every compressionRatio key/value rows into one entry.
-	compressor       *ChannelCompressor
-	compressionRatio int
+	compressor         *ChannelCompressor
+	compressionRatio   int
+	compressionEnabled bool
 	// indexer is non-nil when CSA-style sparse selection is enabled on top of
 	// compression; sparseTopK is the number of blocks each query attends to.
 	indexer           *SparseIndexer
@@ -124,13 +125,16 @@ type CausalSelfAttention struct {
 	// mla, when non-nil, replaces the standard query/key/value projections with
 	// the absorbed Multi-head Latent Attention parameters.
 	mla *MLAttention
+
+	// sink is the optional per-query-head attention-sink logit [NumHead].
+	sink *tensors.Tensor
 }
 
 // usesCompression reports whether the layer takes the compressed-attention
 // path. This is true for full, reindex, and reuse layers whenever a compression
 // ratio is configured.
 func (attention *CausalSelfAttention) usesCompression() bool {
-	return attention.compressionRatio > 1
+	return attention.compressionEnabled
 }
 
 // projectQuery computes the query from the attention input, applying the
@@ -161,6 +165,11 @@ func (attention *CausalSelfAttention) projectKeyValue(input *tensors.Tensor) (ke
 // hidden state.
 func (attention *CausalSelfAttention) cedGlobalKeyValue(encoderHidden, cosine, sine *tensors.Tensor, positionOffset int) (keyHeadMajor, valueHeadMajor, keyRotary *tensors.Tensor) {
 	batchSize, sequenceLength := encoderHidden.Shape[0], encoderHidden.Shape[1]
+	if attention.mla != nil {
+		key, value := attention.mlaProjectKeyValue(encoderHidden)
+		key = ApplyRotary(key, cosine, sine, positionOffset)
+		return toBatchHeadLayout(key), toBatchHeadLayout(value), key
+	}
 	key, value := attention.projectKeyValue(encoderHidden)
 	key = key.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
 	value = value.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
@@ -188,25 +197,33 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool, layer 
 	if hasValueEmbedding {
 		attention.valueEmbeddingGate = layers.NewLinear(veGateChannels, configuration.NumKVHead)
 	}
+	if configuration.AttentionSink {
+		attention.sink = tensors.New(configuration.NumHead)
+		for head := 0; head < configuration.NumHead; head++ {
+			attention.sink.Data[head] = configuration.AttentionSinkInit
+		}
+	}
 	if configuration.MLAEnabled() {
 		attention.mla = newMLAttention(configuration)
-		return attention
-	}
-	if rank := configuration.QueryRank(); rank > 0 {
-		attention.queryDown = layers.NewLinear(configuration.EmbedDim, rank)
-		attention.queryProjection = layers.NewLinear(rank, configuration.NumHead*headDimension)
 	} else {
-		attention.queryProjection = layers.NewLinear(configuration.EmbedDim, configuration.NumHead*headDimension)
+		if rank := configuration.QueryRank(); rank > 0 {
+			attention.queryDown = layers.NewLinear(configuration.EmbedDim, rank)
+			attention.queryProjection = layers.NewLinear(rank, configuration.NumHead*headDimension)
+		} else {
+			attention.queryProjection = layers.NewLinear(configuration.EmbedDim, configuration.NumHead*headDimension)
+		}
+		if rank := configuration.KVRank(); rank > 0 {
+			attention.kvDown = layers.NewLinear(configuration.EmbedDim, rank)
+			attention.keyProjection = layers.NewLinear(rank, configuration.NumKVHead*headDimension)
+			attention.valueProjection = layers.NewLinear(rank, configuration.NumKVHead*headDimension)
+		} else {
+			attention.keyProjection = layers.NewLinear(configuration.EmbedDim, configuration.NumKVHead*headDimension)
+			attention.valueProjection = layers.NewLinear(configuration.EmbedDim, configuration.NumKVHead*headDimension)
+		}
 	}
-	if rank := configuration.KVRank(); rank > 0 {
-		attention.kvDown = layers.NewLinear(configuration.EmbedDim, rank)
-		attention.keyProjection = layers.NewLinear(rank, configuration.NumKVHead*headDimension)
-		attention.valueProjection = layers.NewLinear(rank, configuration.NumKVHead*headDimension)
-	} else {
-		attention.keyProjection = layers.NewLinear(configuration.EmbedDim, configuration.NumKVHead*headDimension)
-		attention.valueProjection = layers.NewLinear(configuration.EmbedDim, configuration.NumKVHead*headDimension)
-	}
-	if ratio := configuration.Compression(); ratio > 1 {
+	if configuration.HasCompressionAt(layer) {
+		ratio := configuration.LayerRatioAt(layer)
+		attention.compressionEnabled = true
 		attention.compressionRatio = ratio
 		attention.sparseTopK = configuration.SparseTopK
 		attention.swaWindow = configuration.SWAWindowSize()
@@ -216,7 +233,7 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool, layer 
 		if attention.reuseMode == ReuseFull {
 			attention.compressor = NewChannelCompressor(configuration.EmbedDim, headDimension, ratio)
 		}
-		if configuration.SparseTopK > 0 && attention.reuseMode != ReuseReuse {
+		if configuration.SparseAt(layer) && attention.reuseMode != ReuseReuse {
 			dim, heads := configuration.indexerDefaults()
 			attention.indexerLossWeight = configuration.IndexerWeight()
 			attention.indexerPool = configuration.IndexerPool
@@ -233,14 +250,19 @@ func NewCausalSelfAttention(configuration Config, hasValueEmbedding bool, layer 
 // (left, right) sliding window; cache, when non-nil, stores and reads KV. The
 // result has shape [batch, sequence, embedding].
 func (attention *CausalSelfAttention) Forward(input, valueEmbedding, cosine, sine *tensors.Tensor, positionOffset int, window [2]int, cache *KVBuffer, layer int, share *compressionShare) *tensors.Tensor {
-	if attention.mla != nil {
+	if attention.mla != nil && !attention.usesCompression() {
 		return attention.mlaForwardInference(input, cosine, sine, positionOffset, window, cache, layer)
 	}
 	batchSize, sequenceLength := input.Shape[0], input.Shape[1]
-	query := attention.projectQuery(input).Reshape(batchSize, sequenceLength, attention.queryHeadCount, attention.headDimension)
-	keyProjected, valueProjected := attention.projectKeyValue(input)
-	key := keyProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
-	value := valueProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+	var query, key, value *tensors.Tensor
+	if attention.mla != nil {
+		query, key, value, _, _ = attention.mlaProjectHeads(input)
+	} else {
+		query = attention.projectQuery(input).Reshape(batchSize, sequenceLength, attention.queryHeadCount, attention.headDimension)
+		keyProjected, valueProjected := attention.projectKeyValue(input)
+		key = keyProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+		value = valueProjected.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
+	}
 
 	if valueEmbedding != nil {
 		valueEmbeddingHeads := valueEmbedding.Reshape(batchSize, sequenceLength, attention.keyValueHeadCount, attention.headDimension)
@@ -249,11 +271,13 @@ func (attention *CausalSelfAttention) Forward(input, valueEmbedding, cosine, sin
 		value = addGateTimesValueEmbedding(value, gate, valueEmbeddingHeads)
 	}
 
-	query = ApplyRotary(query, cosine, sine, positionOffset)
-	key = ApplyRotary(key, cosine, sine, positionOffset)
+	query = applyRotaryForCache(query, cosine, sine, positionOffset, cache)
+	key = applyRotaryForCache(key, cosine, sine, positionOffset, cache)
 
-	query = tensors.Scale(normalizeLastDim(query), qkScale)
-	key = tensors.Scale(normalizeLastDim(key), qkScale)
+	if attention.mla == nil {
+		query = tensors.Scale(normalizeLastDim(query), qkScale)
+		key = tensors.Scale(normalizeLastDim(key), qkScale)
+	}
 
 	if attention.usesCompression() {
 		if cache == nil {
@@ -280,33 +304,58 @@ func (attention *CausalSelfAttention) Forward(input, valueEmbedding, cosine, sin
 
 	headRatio := attention.queryHeadCount / attention.keyValueHeadCount
 	outputHeadMajor := tensors.New(batchSize, attention.queryHeadCount, sequenceLength, attention.headDimension)
+	var logSumExp *tensors.Tensor
+	if attention.sink != nil {
+		logSumExp = tensors.New(batchSize, attention.queryHeadCount, sequenceLength)
+	}
 	headDimension := attention.headDimension
 	kvHeadCount := attention.keyValueHeadCount
 
-	// Collect the full KV prefix once per (batch, kv-head). Writing once here
-	// (rather than once per query head) also avoids concurrent duplicate writes
-	// to the same cache slot when grouped-query attention shares a KV head.
+	// Collect the KV rows once per (batch, kv-head). Ring layers keep only the
+	// local window and build a bounded prefix for the current chunk; full
+	// layers read the whole paged prefix.
+	useRing := cache != nil && cache.RingEnabled(layer)
+	usePagedDecode := cache != nil && sequenceLength == 1 && !useRing && cache.IsPaged()
+	if usePagedDecode {
+		for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+			if window[0] < cache.PositionAt(batchIndex)+sequenceLength {
+				usePagedDecode = false
+				break
+			}
+		}
+	}
 	keyValueFull := make([]keyValueSlice, batchSize*kvHeadCount)
+	keyLength := sequenceLength
 	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
+		rowPosition := positionOffset
+		if cache != nil {
+			rowPosition = cache.PositionAt(batchIndex)
+		}
 		for keyValueHead := 0; keyValueHead < kvHeadCount; keyValueHead++ {
 			slot := batchIndex*kvHeadCount + keyValueHead
 			keyNew := headSlice(keyHeadMajor.Data, slot, sequenceLength, headDimension)
 			valueNew := headSlice(valueHeadMajor.Data, slot, sequenceLength, headDimension)
-			if cache != nil {
+			switch {
+			case useRing:
+				keyLocal, valueLocal, relative := cache.LocalPrefix(layer, batchIndex, keyValueHead, rowPosition, sequenceLength, window[0], 0, keyNew, valueNew)
+				cache.appendRawKV(layer, batchIndex, keyValueHead, rowPosition, keyNew, valueNew)
+				keyValueFull[slot] = keyValueSlice{key: keyLocal, value: valueLocal, length: len(keyLocal) / headDimension, offset: relative}
+			case usePagedDecode:
+				cache.appendRawKV(layer, batchIndex, keyValueHead, rowPosition, keyNew, valueNew)
+				keyValueFull[slot] = keyValueSlice{}
+			case cache != nil:
 				// Write k/v into the cache and read the full prefix back.
 				keyFull, valueFull := cache.writeKeyValue(layer, batchIndex, keyValueHead, keyNew, valueNew)
-				keyValueFull[slot] = keyValueSlice{key: keyFull, value: valueFull}
-			} else {
-				keyValueFull[slot] = keyValueSlice{key: keyNew, value: valueNew}
+				rowLength := rowPosition + sequenceLength
+				keyValueFull[slot] = keyValueSlice{key: keyFull, value: valueFull, length: rowLength, offset: rowPosition}
+				if rowLength > keyLength {
+					keyLength = rowLength
+				}
+			default:
+				keyValueFull[slot] = keyValueSlice{key: keyNew, value: valueNew, length: sequenceLength, offset: positionOffset}
 			}
 		}
 	}
-
-	keyLength := sequenceLength
-	if cache != nil {
-		keyLength = cache.Position() + sequenceLength
-	}
-	splits := attentionSplitCount(keyLength, batchSize*attention.queryHeadCount, parallel.Default().Workers())
 
 	parallel.KernelPool().For(0, batchSize*attention.queryHeadCount, func(index int) {
 		batchIndex := index / attention.queryHeadCount
@@ -315,18 +364,45 @@ func (attention *CausalSelfAttention) Forward(input, valueEmbedding, cosine, sin
 
 		queryHeadData := headSlice(queryHeadMajor.Data, index, sequenceLength, headDimension)
 		outputHeadData := headSlice(outputHeadMajor.Data, index, sequenceLength, headDimension)
+		var lse []float32
+		if logSumExp != nil {
+			lse = headSlice(logSumExp.Data, index, sequenceLength, 1)
+		}
+		if usePagedDecode {
+			var statistic []float32
+			if lse != nil {
+				statistic = lse
+			} else {
+				statistic = make([]float32, 1)
+			}
+			pagedRawAttention(cache, layer, batchIndex, keyValueHead, cache.PositionAt(batchIndex)+1, queryHeadData, outputHeadData, statistic)
+			return
+		}
 		full := keyValueFull[batchIndex*kvHeadCount+keyValueHead]
-		attentionForwardCombined(queryHeadData, full.key, full.value, outputHeadData, nil, sequenceLength, keyLength, headDimension, positionOffset, window[0], splits)
+		length := full.length
+		if length == 0 {
+			length = keyLength
+		}
+		offset := full.offset
+		splits := attentionSplitCount(length, batchSize*attention.queryHeadCount, parallel.Default().Workers())
+		attentionForwardCombined(queryHeadData, full.key, full.value, outputHeadData, lse, sequenceLength, length, headDimension, offset, window[0], splits)
 	})
+	if attention.sink != nil {
+		applyAttentionSink(outputHeadMajor, logSumExp, attention.sink, batchSize, attention.queryHeadCount, sequenceLength, headDimension)
+	}
 
 	output := toBatchSequenceLayout(outputHeadMajor).Reshape(batchSize, sequenceLength, attention.queryHeadCount*attention.headDimension)
 	return attention.outputProjection.Forward(output)
 }
 
 // keyValueSlice is a (key, value) pair of matching [length, headDim] buffers.
+// length and offset describe the position of the first query within the
+// buffer; zero values mean the caller's defaults.
 type keyValueSlice struct {
-	key   []float32
-	value []float32
+	key    []float32
+	value  []float32
+	length int
+	offset int
 }
 
 // attentionSplitK tuning. Split-K only helps when the key dimension is long

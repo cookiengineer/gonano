@@ -2,6 +2,7 @@ package model
 
 import (
 	"math"
+	"reflect"
 	"testing"
 
 	"github.com/cookiengineer/gonano/tensors"
@@ -46,7 +47,7 @@ func TestPresetDenseIsNoOp(t *testing.T) {
 	before := ConfigForDepth(2, 16, 16, 32, 32, "SSSL")
 	after := before
 	after.ApplyPreset(PresetDense)
-	if after != before {
+	if !reflect.DeepEqual(after, before) {
 		t.Fatalf("dense preset changed the config: %+v -> %+v", before, after)
 	}
 	if before.MoEEnabled() {
@@ -58,8 +59,22 @@ func TestPresetFlashEnablesLongContextStack(t *testing.T) {
 	config := ConfigForDepth(6, 16, 16, 32, 128, "SSSL")
 	config.ApplyPreset(PresetFlash)
 	config.Validate()
-	if config.CompressionRatio != 4 || config.Compression() != 4 {
-		t.Fatalf("compression = %d", config.CompressionRatio)
+	if !config.LayeredCompression() || len(config.CompressionRatios) != config.NumLayer {
+		t.Fatalf("compression layout = %v", config.CompressionRatios)
+	}
+	split := config.CEDSplit()
+	for layer, ratio := range config.CompressionRatios {
+		switch {
+		case layer < split && ratio != 0:
+			t.Fatalf("encoder layer %d ratio = %d, want 0", layer, ratio)
+		case layer == split && ratio != 1:
+			t.Fatalf("boundary layer %d ratio = %d, want 1", layer, ratio)
+		case layer > split && ratio != 2:
+			t.Fatalf("decoder layer %d ratio = %d, want 2", layer, ratio)
+		}
+	}
+	if config.PrefillLayer != split {
+		t.Fatalf("PrefillLayer = %d, want %d", config.PrefillLayer, split)
 	}
 	if config.SparseTopK != 8 || config.IndexerPool != 8 {
 		t.Fatalf("sparse = %d pool = %d, want 8/8", config.SparseTopK, config.IndexerPool)
@@ -70,14 +85,17 @@ func TestPresetFlashEnablesLongContextStack(t *testing.T) {
 	if config.SWAWindow != 128 || !config.CED {
 		t.Fatalf("SWA = %d CED = %v, want 128/true", config.SWAWindow, config.CED)
 	}
-	if !config.HeadWiseMuon {
-		t.Fatal("flash preset should enable head-wise Muon")
+	if config.HeadWiseMuon {
+		t.Fatal("flash preset must not enable head-wise Muon with MLA")
+	}
+	if !config.MLAEnabled() {
+		t.Fatal("flash preset should enable absorbed MLA")
 	}
 	if !config.MoEEnabled() {
 		t.Fatal("flash preset should enable MoE")
 	}
-	if config.NumKVHead == config.NumHead && config.NumHead%2 == 0 {
-		t.Fatal("flash preset should enable grouped-query attention")
+	if config.NumKVHead != 1 {
+		t.Fatalf("NumKVHead = %d, want 1", config.NumKVHead)
 	}
 }
 
@@ -150,7 +168,7 @@ func TestConfigForPresetDefaultsToFlash(t *testing.T) {
 		t.Fatalf("default preset = %q, want %q", preset, DefaultPreset)
 	}
 	config := ConfigForPreset(preset, 2, 16, 16, 32, 32, "SSSL")
-	if !config.MoEEnabled() || config.Compression() <= 1 || !config.CED {
+	if !config.MoEEnabled() || !config.AnyCompression() || !config.CED {
 		t.Fatal("default preset should be the flash long-context stack")
 	}
 }

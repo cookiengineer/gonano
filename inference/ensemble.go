@@ -62,17 +62,23 @@ func (ensemble *Ensemble) normalizedWeights() []float32 {
 // newCacheForModel allocates a KV buffer sized for a model's config, including
 // the MLA and compressed/indexer tiers that config needs.
 func newCacheForModel(config model.Config, batch, capacity int) *model.KVBuffer {
-	cache := model.NewKVBuffer(batch, capacity, config.NumLayer, config.NumKVHead, config.HeadDim())
+	return newCacheForModelWithManager(nil, config, batch, capacity)
+}
+
+// newCacheForModelWithManager is newCacheForModel backed by a shared block
+// manager, allowing prefilled rows to be adopted by a batched decode cache.
+func newCacheForModelWithManager(manager *model.KVBlockManager, config model.Config, batch, capacity int) *model.KVBuffer {
+	return newCacheForModelWithPools(manager, nil, config, batch, capacity)
+}
+
+// newCacheForModelWithPools is newCacheForModelWithManager with a shared block
+// data pool, so prefilled rows can be adopted by a batched decode cache.
+func newCacheForModelWithPools(manager *model.KVBlockManager, pools *model.KVBlockPools, config model.Config, batch, capacity int) *model.KVBuffer {
+	cache := model.NewPagedKVBufferWithPools(manager, pools, batch, capacity, config.NumLayer, config.NumKVHead, config.HeadDim())
 	if config.MLAEnabled() {
 		cache.EnableMLA(config.MLALatent, config.NumKVHead*config.MLARotaryDimension())
 	}
-	if ratio := config.Compression(); ratio > 1 {
-		kvWidth := config.NumKVHead * config.HeadDim()
-		cache.EnableCompressionLayers(ratio, config.EmbedDim, kvWidth, capacity/ratio+1, compressionAllocMask(config))
-		if config.SparseTopK > 0 {
-			cache.EnableIndexerKeysLayers(indexerKeyWidth(config), indexerAllocMask(config))
-		}
-	}
+	enableCacheCompression(config, cache, capacity)
 	return cache
 }
 
@@ -82,6 +88,7 @@ func (ensemble *Ensemble) prefillModel(member ModelWeight, tokens []int, numSamp
 	config := member.Model.Config
 	inputs := tensors.NewInt32sWithData([]int{1, len(tokens)}, toI32(tokens))
 	prefillCache := newCacheForModel(config, 1, len(tokens))
+	defer prefillCache.Release()
 	var logits *tensors.Tensor
 	if config.CEDEnabled() {
 		logits = member.Model.PrefillCED(inputs, prefillCache)
@@ -110,6 +117,13 @@ func (ensemble *Ensemble) GenerateWith(tokens []int, numSamples, maxTokens int, 
 		vocab := ensemble.Models[0].Model.Config.VocabSize
 
 		caches := make([]*model.KVBuffer, len(ensemble.Models))
+		defer func() {
+			for _, cache := range caches {
+				if cache != nil {
+					cache.Release()
+				}
+			}
+		}()
 		combined := make([]float32, numSamples*vocab)
 		for index, member := range ensemble.Models {
 			cache, last := ensemble.prefillModel(member, tokens, numSamples, maxTokens)
@@ -189,7 +203,7 @@ func (ensemble *Ensemble) GenerateWith(tokens []int, numSamples, maxTokens int, 
 					state.toolCallTokens = nil
 				case nextToken == toolEnd && state.inToolCall:
 					state.inToolCall = false
-					if len(state.toolCallTokens) > 0 && ensemble.Tools != nil {
+					if !options.ExternalTools && len(state.toolCallTokens) > 0 && ensemble.Tools != nil {
 						expression := ensemble.Tokenizer.Decode(state.toolCallTokens)
 						if result, ok := ensemble.Tools.Execute(expression); ok {
 							resultTokens := ensemble.Tokenizer.Encode(result)

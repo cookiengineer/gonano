@@ -35,12 +35,11 @@ func scheduledLength(confidences []float32, threshold float32) int {
 }
 
 // speculativeEligible reports whether a request can use exact greedy
-// speculative decoding. Speculation is limited to single-row, greedy,
-// uncompressed models and must be enabled explicitly, because it does not run
-// the tool-call state machine.
+// speculative decoding. Speculation is limited to single-row, greedy requests
+// and must be enabled explicitly, because it does not run the tool-call state
+// machine. Compressed and MLA targets are supported through cache rollback.
 func (engine *Engine) speculativeEligible(numSamples int, temperature float32) bool {
-	return engine.Speculative && (engine.DSpark != nil || engine.Drafter != nil) &&
-		engine.Model.Config.Compression() == 1 &&
+	return engine.Speculative && (engine.DFlash != nil || engine.DSpark != nil || engine.Drafter != nil) &&
 		numSamples == 1 && temperature <= 0
 }
 
@@ -48,6 +47,16 @@ func (engine *Engine) speculativeEligible(numSamples int, temperature float32) b
 // produces exactly the same tokens as greedy decoding with the target model,
 // but verifies up to DraftLength drafted tokens per target-model forward.
 func (engine *Engine) speculativeGenerate(tokens []int, maxTokens int, yield func([]int, []int) bool) {
+	config := engine.Model.Config
+	cache := newCacheForModel(config, 1, config.SequenceLen)
+	defer cache.Release()
+	engine.speculativeGenerateWithCache(tokens, maxTokens, cache, yield)
+}
+
+// speculativeGenerateWithCache runs the speculative loop against an existing
+// empty cache. The scheduler's solo path uses it so the request stays inside the
+// shared block budget.
+func (engine *Engine) speculativeGenerateWithCache(tokens []int, maxTokens int, cache *model.KVBuffer, yield func([]int, []int) bool) {
 	config := engine.Model.Config
 	vocabSize := config.VocabSize
 	if len(tokens) == 0 {
@@ -58,9 +67,16 @@ func (engine *Engine) speculativeGenerate(tokens []int, maxTokens int, yield fun
 		draftLength = defaultDraftLength
 	}
 
-	cache := model.NewKVBuffer(1, config.SequenceLen, config.NumLayer, config.NumKVHead, config.HeadDim())
 	prefill := tensors.NewInt32sWithData([]int{1, len(tokens)}, toI32(tokens))
-	logits := engine.Model.Forward(prefill, cache)
+	var logits *tensors.Tensor
+	var lastHidden *tensors.Tensor
+	if engine.DFlash != nil {
+		var hidden *tensors.Tensor
+		logits, hidden = engine.Model.ForwardHiddenAtLayers(prefill, cache, engine.DFlash.TargetIDs)
+		lastHidden = lastHiddenRow(hidden)
+	} else {
+		logits = engine.Model.Forward(prefill, cache)
+	}
 	lastLogits := logits.Data[(len(tokens)-1)*vocabSize : len(tokens)*vocabSize]
 
 	assistantEnd := engine.Tokenizer.EncodeSpecial("<|assistant_end|>")
@@ -105,7 +121,18 @@ func (engine *Engine) speculativeGenerate(tokens []int, maxTokens int, yield fun
 		candidates = append(candidates, first)
 		if draftCount > 0 {
 			draftContext := append(append([]int(nil), sequence...), first)
-			if engine.DSpark != nil {
+			switch {
+			case engine.DFlash != nil:
+				drafted, confidences := engine.DFlash.Draft(draftContext, lastHidden, draftCount)
+				candidates = append(candidates, drafted...)
+				threshold := engine.ConfidenceThreshold
+				if threshold <= 0 {
+					threshold = defaultConfidenceThreshold
+				}
+				if limit := scheduledLength(confidences, threshold); limit < len(candidates) {
+					candidates = candidates[:limit]
+				}
+			case engine.DSpark != nil:
 				drafted, confidences := engine.DSpark.Draft(draftContext, draftCount)
 				candidates = append(candidates, drafted...)
 				threshold := engine.ConfidenceThreshold
@@ -115,15 +142,22 @@ func (engine *Engine) speculativeGenerate(tokens []int, maxTokens int, yield fun
 				if limit := scheduledLength(confidences, threshold); limit < len(candidates) {
 					candidates = candidates[:limit]
 				}
-			} else {
+			default:
 				candidates = append(candidates, engine.Drafter.DraftTokens(draftContext, draftCount)...)
 			}
 		}
 		blockSize = len(candidates)
 
 		basePosition := cache.Position()
+		mark := cache.Mark()
 		candidateIDs := tensors.NewInt32sWithData([]int{1, blockSize}, toI32(candidates))
-		verified := engine.Model.Forward(candidateIDs, cache)
+		var verified *tensors.Tensor
+		var verifiedHidden *tensors.Tensor
+		if engine.DFlash != nil {
+			verified, verifiedHidden = engine.Model.ForwardHiddenAtLayers(candidateIDs, cache, engine.DFlash.TargetIDs)
+		} else {
+			verified = engine.Model.Forward(candidateIDs, cache)
+		}
 
 		// Accept the longest prefix of drafted tokens that matches the target
 		// model's greedy tokens. The first candidate came from the target model
@@ -133,6 +167,23 @@ func (engine *Engine) speculativeGenerate(tokens []int, maxTokens int, yield fun
 			matched++
 		}
 		accepted := 1 + matched
+		if accepted < blockSize {
+			// Rejected drafts may have completed compression blocks or advanced
+			// the MLA latent state, so restore the pre-verification snapshot and
+			// replay only the accepted prefix. This keeps the cache exactly
+			// consistent with a non-speculative decode.
+			cache.Rollback(mark)
+			acceptedIDs := tensors.NewInt32sWithData([]int{1, accepted}, toI32(candidates[:accepted]))
+			var replayHidden *tensors.Tensor
+			if engine.DFlash != nil {
+				_, replayHidden = engine.Model.ForwardHiddenAtLayers(acceptedIDs, cache, engine.DFlash.TargetIDs)
+				lastHidden = lastHiddenRow(replayHidden)
+			} else {
+				engine.Model.Forward(acceptedIDs, cache)
+			}
+		} else if engine.DFlash != nil && verifiedHidden != nil {
+			lastHidden = hiddenRow(verifiedHidden, accepted-1)
+		}
 		cache.SetPosition(basePosition + accepted)
 		engine.Model.SetPreviousEmbeddingForToken(cache, candidates[accepted-1])
 
@@ -154,6 +205,34 @@ func (engine *Engine) speculativeGenerate(tokens []int, maxTokens int, yield fun
 		pending = next
 		hasPending = true
 	}
+}
+
+// lastHiddenRow returns the last sequence row of a [1, T, D] hidden tensor.
+func lastHiddenRow(hidden *tensors.Tensor) *tensors.Tensor {
+	if hidden == nil {
+		return nil
+	}
+	dim := hidden.Shape[len(hidden.Shape)-1]
+	rows := hidden.Numel() / dim
+	return hiddenRow(hidden, rows-1)
+}
+
+// hiddenRow returns row `row` of a [1, T, D] hidden tensor as [1, 1, D].
+func hiddenRow(hidden *tensors.Tensor, row int) *tensors.Tensor {
+	if hidden == nil {
+		return nil
+	}
+	dim := hidden.Shape[len(hidden.Shape)-1]
+	rows := hidden.Numel() / dim
+	if row < 0 {
+		row = 0
+	}
+	if row >= rows {
+		row = rows - 1
+	}
+	output := tensors.New(1, 1, dim)
+	copy(output.Data, hidden.Data[row*dim:(row+1)*dim])
+	return output
 }
 
 // argmaxRow returns the argmax of row `row` of a [1, rows, vocab] tensor.

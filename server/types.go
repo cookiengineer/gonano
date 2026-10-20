@@ -48,6 +48,7 @@ type ChatCompletionRequest struct {
 	Messages    []ChatMessage `json:"messages"`
 	Temperature *float32      `json:"temperature,omitempty"`
 	TopP        *float32      `json:"top_p,omitempty"`
+	MinP        *float32      `json:"min_p,omitempty"`
 	TopK        int           `json:"top_k,omitempty"`
 	N           int           `json:"n,omitempty"`
 	Stream      bool          `json:"stream,omitempty"`
@@ -55,6 +56,8 @@ type ChatCompletionRequest struct {
 	Stop        []string      `json:"stop,omitempty"`
 	Tools       []ToolDef     `json:"tools,omitempty"`
 	Seed        *uint64       `json:"seed,omitempty"`
+	Logprobs    bool          `json:"logprobs,omitempty"`
+	TopLogprobs int           `json:"top_logprobs,omitempty"`
 	// ReasoningEffort optionally selects a reasoning-effort level b in [1,100]
 	// by prepending the effort instruction to the system prompt
 	// (DeepSeek-V4.1 §5.1.4).
@@ -68,6 +71,15 @@ type ChatCompletionRequest struct {
 	// ThinkingStyle optionally selects a reasoning-trace style instruction
 	// (for example "logical"). Only used when Thinking is enabled.
 	ThinkingStyle string `json:"thinking_style,omitempty"`
+	// ResponseFormat requests JSON mode. The json_object type constrains
+	// decoding to a complete JSON value.
+	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
+}
+
+// ResponseFormat mirrors OpenAI's response_format field.
+type ResponseFormat struct {
+	Type       string `json:"type"`
+	JSONSchema any    `json:"json_schema,omitempty"`
 }
 
 // Usage reports token counts.
@@ -85,11 +97,30 @@ type ResponseMessage struct {
 	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
+// ChatTopLogprob is one alternative token in a top-logprobs list.
+type ChatTopLogprob struct {
+	Token   string  `json:"token"`
+	Logprob float32 `json:"logprob"`
+}
+
+// ChatLogprob is the log-probability of one emitted token.
+type ChatLogprob struct {
+	Token       string           `json:"token"`
+	Logprob     float32          `json:"logprob"`
+	TopLogprobs []ChatTopLogprob `json:"top_logprobs,omitempty"`
+}
+
+// ChoiceLogprobs mirrors OpenAI's choice.logprobs object.
+type ChoiceLogprobs struct {
+	Content []ChatLogprob `json:"content"`
+}
+
 // Choice is one completion choice.
 type Choice struct {
 	Index        int             `json:"index"`
 	Message      ResponseMessage `json:"message"`
 	FinishReason string          `json:"finish_reason"`
+	Logprobs     *ChoiceLogprobs `json:"logprobs,omitempty"`
 }
 
 // ChatCompletionResponse is the body of a chat completion response.
@@ -112,9 +143,10 @@ type StreamDelta struct {
 
 // StreamChoice is one choice in a streamed chunk.
 type StreamChoice struct {
-	Index        int         `json:"index"`
-	Delta        StreamDelta `json:"delta"`
-	FinishReason *string     `json:"finish_reason"`
+	Index        int             `json:"index"`
+	Delta        StreamDelta     `json:"delta"`
+	FinishReason *string         `json:"finish_reason"`
+	Logprobs     *ChoiceLogprobs `json:"logprobs,omitempty"`
 }
 
 // ChatCompletionChunk is one SSE data frame of a streamed response.

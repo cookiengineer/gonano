@@ -41,10 +41,6 @@ func TestMLAConfigValidation(t *testing.T) {
 		name   string
 		mutate func(*Config)
 	}{
-		{"compression", func(config *Config) { config.CompressionRatio = 2 }},
-		{"ced", func(config *Config) { config.CED = true; config.CompressionRatio = 2; config.SWAWindow = 3 }},
-		{"sparse", func(config *Config) { config.SparseTopK = 2; config.CompressionRatio = 2 }},
-		{"reuse", func(config *Config) { config.ReusePattern = "F"; config.CompressionRatio = 2 }},
 		{"low-rank", func(config *Config) { config.KVLatentDim = 8 }},
 		{"head-wise-muon", func(config *Config) { config.HeadWiseMuon = true }},
 		{"full-rotary", func(config *Config) { config.MLARotaryDims = config.HeadDim() }},

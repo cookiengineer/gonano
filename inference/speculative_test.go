@@ -154,8 +154,8 @@ func TestSpeculativeEligibility(t *testing.T) {
 	compressedEngine := NewEngine(compressed, compressedTokenizer)
 	compressedEngine.Drafter = model.NewDrafter(compressed)
 	compressedEngine.Speculative = true
-	if compressedEngine.speculativeEligible(1, 0) {
-		t.Fatal("compressed models must not speculate")
+	if !compressedEngine.speculativeEligible(1, 0) {
+		t.Fatal("compressed models should speculate with cache rollback")
 	}
 }
 
@@ -251,4 +251,103 @@ func TestDSparkDrafterDenseForMoEBackbone(t *testing.T) {
 		dspark.Drafter.Config.VocabSize != backbone.Config.VocabSize {
 		t.Fatal("DSpark trunk must keep the backbone embedding and vocabulary")
 	}
+}
+
+// TestSpeculativeDFlashMatchesGreedy verifies DFlash/MTP drafting preserves
+// exact greedy target output.
+func TestSpeculativeDFlashMatchesGreedy(t *testing.T) {
+	backbone, _, tokenizerImpl := testSpeculativeModel()
+	config := backbone.Config
+	config.NumNextNPredictLayers = 1
+	config.DFlashBlockSize = 3
+	config.DFlashTargetLayerIDs = []int{config.NumLayer - 1}
+	config.DFlashNoiseToken = config.VocabSize - 1
+	config.DFlashMarkovRank = 8
+	backbone.Config = config
+	dflash := model.NewDFlash(backbone)
+	dflash.InitWeights(tensors.NewRNG(77))
+
+	engine := NewEngine(backbone, tokenizerImpl)
+	engine.DFlash = dflash
+	engine.Speculative = true
+	engine.DraftLength = 3
+
+	prompt := []int{1, 5, 2, 8, 3, 7}
+	got, _ := engine.GenerateBatch(prompt, 1, 12, 0, 0, 0)
+	assertSameTokens(t, got[0][len(prompt):], greedyReference(backbone, prompt, 12))
+}
+
+func greedyReferenceCompressed(transformer *model.Transformer, prompt []int, maxTokens int) []int {
+	cache := newCacheForModel(transformer.Config, 1, transformer.Config.SequenceLen)
+	ids := tensors.NewInt32sWithData([]int{1, len(prompt)}, toI32(prompt))
+	logits := transformer.Forward(ids, cache)
+	vocab := transformer.Config.VocabSize
+	last := logits.Data[(len(prompt)-1)*vocab : len(prompt)*vocab]
+	output := make([]int, 0, maxTokens)
+	for index := 0; index < maxTokens; index++ {
+		token := argmaxSlice(last)
+		output = append(output, token)
+		next := tensors.NewInt32sWithData([]int{1, 1}, []int32{int32(token)})
+		logits = transformer.Forward(next, cache)
+		last = logits.Data
+	}
+	return output
+}
+
+// TestSpeculativeDFlashCompressedMatchesGreedy covers DFlash on the full
+// V4.1 stack (MLA + compression + SWA + sparse).
+func TestSpeculativeDFlashCompressedMatchesGreedy(t *testing.T) {
+	config := model.ConfigForPreset(model.PresetFlash, 4, 32, 16, 32, 64, "SSSL")
+	backbone := model.NewTransformer(config)
+	backbone.InitWeights(tensors.NewRNG(42))
+	perturbSpeculative(backbone, 11)
+	dflash := model.NewDFlash(backbone)
+	dflash.InitWeights(tensors.NewRNG(77))
+
+	engine := NewEngine(backbone, testSpeculativeTokenizer())
+	engine.DFlash = dflash
+	engine.Speculative = true
+	engine.DraftLength = 3
+
+	prompt := []int{1, 5, 2, 8, 3, 7}
+	got, _ := engine.GenerateBatch(prompt, 1, 10, 0, 0, 1)
+	assertSameTokens(t, got[0][len(prompt):], greedyReferenceCompressed(backbone, prompt, 10))
+}
+
+// TestSpeculativeCompressedMatchesGreedy covers the rollback path with a plain
+// drafter on a compressed target.
+func TestSpeculativeCompressedMatchesGreedy(t *testing.T) {
+	backbone, tokenizerImpl := testPrefixEngineModel()
+	drafter := model.NewDrafter(backbone)
+	drafter.InitWeights(tensors.NewRNG(99))
+	engine := NewEngine(backbone, tokenizerImpl)
+	engine.Drafter = drafter
+	engine.Speculative = true
+	engine.DraftLength = 3
+
+	prompt := []int{1, 5, 2, 8, 3, 7}
+	got, _ := engine.GenerateBatch(prompt, 1, 10, 0, 0, 1)
+	assertSameTokens(t, got[0][len(prompt):], greedyReferenceCompressed(backbone, prompt, 10))
+}
+
+func TestSpeculativeDFlashMultiLayerHiddenMatchesGreedy(t *testing.T) {
+	backbone, _, tokenizerImpl := testSpeculativeModel()
+	config := backbone.Config
+	config.NumNextNPredictLayers = 1
+	config.DFlashBlockSize = 3
+	config.DFlashTargetLayerIDs = []int{0, config.NumLayer - 1}
+	config.DFlashNoiseToken = config.VocabSize - 1
+	config.DFlashMarkovRank = 8
+	backbone.Config = config
+	dflash := model.NewDFlash(backbone)
+	dflash.InitWeights(tensors.NewRNG(77))
+
+	engine := NewEngine(backbone, tokenizerImpl)
+	engine.DFlash = dflash
+	engine.Speculative = true
+	engine.DraftLength = 3
+
+	prompt := []int{1, 5, 2, 8, 3, 7}
+	got, _ := engine.GenerateBatch(prompt, 1, 12, 0, 0, 0)
+	assertSameTokens(t, got[0][len(prompt):], greedyReference(backbone, prompt, 12))
 }

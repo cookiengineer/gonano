@@ -203,6 +203,22 @@ func TestMoEGateTopK(t *testing.T) {
 	kerneltest.AssertSlicesClose(t, weights, []float32{1.0 / 3, 1.0 / 3}, 1e-6, 1e-6)
 }
 
+func TestMoEGateTopKSqrtSoftplus(t *testing.T) {
+	backend := scalar.New()
+	logits := []float32{0, 0, 0}
+	bias := []float32{0, 1, 2}
+	scores := make([]float32, 3)
+	selected := make([]int32, 2)
+	weights := make([]float32, 2)
+	backend.MoEGateTopKSqrtSoftplus(logits, bias, scores, selected, weights, 1, 3, 2)
+	wantScore := float32(math.Sqrt(math.Log(2)))
+	kerneltest.AssertSlicesClose(t, scores, []float32{wantScore, wantScore, wantScore}, 1e-6, 1e-6)
+	if selected[0] != 2 || selected[1] != 1 {
+		t.Fatalf("selection = %v, want [2 1]", selected)
+	}
+	kerneltest.AssertSlicesClose(t, weights, []float32{0.5, 0.5}, 1e-6, 1e-6)
+}
+
 func TestTopKIndices(t *testing.T) {
 	backend := scalar.New()
 	// Row 0 has distinct scores; row 1 ties 0.5 between expert 0 and 2 and

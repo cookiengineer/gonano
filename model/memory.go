@@ -26,7 +26,10 @@ func TotalParamsForConfig(config Config) int64 {
 	vocabulary := int64(config.PaddedVocab())
 	embeddingDimension := int64(config.EmbedDim)
 	kvWidth := int64(config.NumKVHead) * int64(config.HeadDim())
-	valueEmbeddings := int64((config.NumLayer+1)/2) * vocabulary * kvWidth
+	valueEmbeddings := int64(0)
+	if !config.MLAEnabled() {
+		valueEmbeddings = int64((config.NumLayer+1)/2) * vocabulary * kvWidth
+	}
 	tokenEmbedding := vocabulary * embeddingDimension
 	// resid_lambdas, x0_lambdas, smear_gate, smear_lambda, backout_lambda.
 	scalars := int64(2*config.NumLayer + 24 + 1 + 1)

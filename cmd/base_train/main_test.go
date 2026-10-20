@@ -2,6 +2,7 @@ package main
 
 import (
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/cookiengineer/gonano/model"
@@ -32,7 +33,7 @@ func TestLoadInitialCheckpoint(t *testing.T) {
 	if meta.Step != 7 {
 		t.Errorf("step = %d, want 7", meta.Step)
 	}
-	if meta.ModelConfig != configuration {
+	if !reflect.DeepEqual(meta.ModelConfig, configuration) {
 		t.Errorf("config mismatch:\n got %+v\nwant %+v", meta.ModelConfig, configuration)
 	}
 	if len(params) == 0 {

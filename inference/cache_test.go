@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/cookiengineer/gonano/model"
+	"github.com/cookiengineer/gonano/tensors"
 )
 
 func TestCacheManagerLookupStore(t *testing.T) {
@@ -227,5 +228,31 @@ func TestStripSWAReplayRuns(t *testing.T) {
 		if token < 0 || token >= transformer.Config.VocabSize {
 			t.Fatalf("token %d out of range", token)
 		}
+	}
+}
+
+func TestCacheManagerInvalidateReleasesPagedBlocks(t *testing.T) {
+	manager := model.NewKVBlockManager(32)
+	config := model.Config{
+		SequenceLen: 16, VocabSize: 16, NumLayer: 1, NumHead: 2, NumKVHead: 2,
+		EmbedDim: 32, WindowPattern: "L",
+	}
+	transformer := model.NewTransformer(config)
+	transformer.InitWeights(tensors.NewRNG(1))
+	cache := model.NewPagedKVBuffer(manager, 1, config.SequenceLen, config.NumLayer, config.NumKVHead, config.HeadDim())
+	transformer.Forward(tensors.NewInt32sWithData([]int{1, 4}, []int32{1, 2, 3, 4}), cache)
+	if manager.InUse() == 0 {
+		t.Fatal("forward did not allocate blocks")
+	}
+	managerCache := NewCacheManager(CacheOptions{})
+	managerCache.Store([]int{1, 2, 3, 4}, cache)
+	managerCache.Store([]int{1, 2, 3, 5}, cache)
+	cache.Release()
+	if manager.InUse() == 0 {
+		t.Fatal("cache entries did not retain shared blocks")
+	}
+	managerCache.Invalidate()
+	if manager.InUse() != 0 {
+		t.Fatalf("invalidate leaked %d blocks", manager.InUse())
 	}
 }

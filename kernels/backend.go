@@ -131,6 +131,11 @@ type MoE interface {
 	// selectedWeights holds the corresponding softmax affinity (the routed
 	// output weight).
 	MoEGateTopK(logits, bias, probs []float32, selected []int32, selectedWeights []float32, rowCount, expertCount, k int)
+	// MoEGateTopKSqrtSoftplus is the DeepSeek-V4.1 sqrtsoftplus/noaux_tc gate.
+	// scores holds sqrt(softplus(logits)) for every expert, selection uses
+	// scores + bias, and selectedWeights holds the selected scores normalized
+	// to sum to one over the top-k experts.
+	MoEGateTopKSqrtSoftplus(logits, bias, scores []float32, selected []int32, selectedWeights []float32, rowCount, expertCount, k int)
 	// GroupedMatMulTransposed computes per-expert destination = input @ weight^T
 	// for a packed weight [expertCount, columnCount, innerCount]. The input rows
 	// are grouped by expert in ascending expert order: expert e contributes

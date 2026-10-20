@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/cookiengineer/gonano/model"
@@ -139,7 +140,7 @@ func TestExportGGUFRoundtrip(tester *testing.T) {
 	if meta.Step != 11 {
 		tester.Fatalf("step = %d, want 11", meta.Step)
 	}
-	if meta.ModelConfig != config {
+	if !reflect.DeepEqual(meta.ModelConfig, config) {
 		tester.Fatalf("config = %+v, want %+v", meta.ModelConfig, config)
 	}
 

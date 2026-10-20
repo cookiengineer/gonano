@@ -40,6 +40,9 @@ func (model *Transformer) NamedParameters() map[string]*tensors.Tensor {
 		if block.attention.valueEmbeddingGate != nil {
 			parameters[fmt.Sprintf("transformer.h.%d.attn.ve_gate.weight", layerIndex)] = block.attention.valueEmbeddingGate.Weight
 		}
+		if block.attention.sink != nil {
+			parameters[fmt.Sprintf("transformer.h.%d.attn.sink", layerIndex)] = block.attention.sink
+		}
 		if block.attention.compressor != nil {
 			parameters[fmt.Sprintf("transformer.h.%d.attn.compress_logits.weight", layerIndex)] = block.attention.compressor.logitWeight.Weight
 			parameters[fmt.Sprintf("transformer.h.%d.attn.compress_bias", layerIndex)] = block.attention.compressor.bias

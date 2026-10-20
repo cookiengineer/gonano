@@ -642,6 +642,44 @@ func TestGroupedMatMulTransposedParity(t *testing.T) {
 	}
 }
 
+// TestMoEGateTopKSqrtSoftplusParity verifies the sqrtsoftplus/noaux_tc gate
+// against the scalar reference.
+func TestMoEGateTopKSqrtSoftplusParity(t *testing.T) {
+	simdBackend := simdbackend.New()
+	scalarBackend := scalar.New()
+	cases := []struct{ rows, experts, k int }{
+		{1, 2, 1},
+		{3, 4, 2},
+		{5, 8, 8},
+		{7, 33, 3},
+	}
+	for _, testCase := range cases {
+		logits := make([]float32, testCase.rows*testCase.experts)
+		for index := range logits {
+			logits[index] = float32(math.Sin(float64(index)*1.3)) * 2
+		}
+		bias := make([]float32, testCase.experts)
+		for index := range bias {
+			bias[index] = float32(index%5)*0.1 - 0.2
+		}
+		gotScores := make([]float32, len(logits))
+		wantScores := make([]float32, len(logits))
+		gotSelected := make([]int32, testCase.rows*testCase.k)
+		wantSelected := make([]int32, testCase.rows*testCase.k)
+		gotWeights := make([]float32, testCase.rows*testCase.k)
+		wantWeights := make([]float32, testCase.rows*testCase.k)
+		simdBackend.MoEGateTopKSqrtSoftplus(logits, bias, gotScores, gotSelected, gotWeights, testCase.rows, testCase.experts, testCase.k)
+		scalarBackend.MoEGateTopKSqrtSoftplus(logits, bias, wantScores, wantSelected, wantWeights, testCase.rows, testCase.experts, testCase.k)
+		kerneltest.AssertSlicesClose(t, gotScores, wantScores, 1e-5, 1e-6)
+		kerneltest.AssertSlicesClose(t, gotWeights, wantWeights, 1e-5, 1e-6)
+		for index := range gotSelected {
+			if gotSelected[index] != wantSelected[index] {
+				t.Fatalf("selection mismatch at %d: got %d, want %d", index, gotSelected[index], wantSelected[index])
+			}
+		}
+	}
+}
+
 // TestTopKIndicesParity verifies the vectorized top-k selection against the
 // scalar reference, including tied scores and k equal to the row width, so the
 // exact tie-break must agree.

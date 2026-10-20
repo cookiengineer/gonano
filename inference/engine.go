@@ -31,6 +31,19 @@ type GenerateOptions struct {
 	// ThinkingBudget caps the number of reasoning tokens. Zero or negative
 	// lets the model decide when to stop.
 	ThinkingBudget int
+	// TopP and MinP are optional probability filters applied after top-k.
+	TopP float32
+	MinP float32
+	// Constraint optionally masks sampling to a byte-level grammar.
+	Constraint Constraint
+	// Logprobs requests per-token log-probabilities. OnLogprobs receives one
+	// entry per sample for every generated token.
+	Logprobs    bool
+	TopLogprobs int
+	OnLogprobs  func([]TokenLogprob)
+	// ExternalTools disables server-side tool execution. The caller is
+	// responsible for parsing the emitted tool call and supplying the result.
+	ExternalTools bool
 }
 
 // Engine performs batched autoregressive generation with a KV cache and a
@@ -49,6 +62,11 @@ type Engine struct {
 	// (DeepSeek-V4.1 §3.2.1). It takes precedence over Prefix. It is ignored
 	// for CED models.
 	Cache *CacheManager
+	// BlockPrefix, when non-nil, enables block-aligned prefix sharing. Snapshots
+	// are taken at complete 128-token boundaries and their KV blocks are shared
+	// through copy-on-write refcounts. It is checked before Cache and Prefix and
+	// is ignored for CED models.
+	BlockPrefix *BlockPrefixCache
 	// SWACache, when non-nil, is a small short-TTL cache of full KV snapshots
 	// (including sliding-window state) checked before Cache. It is the paper's
 	// host-DRAM SWA pool: a hit avoids the bounded replay a stripped Cache entry
@@ -61,16 +79,24 @@ type Engine struct {
 	// the DSpark heads: the confidence head schedules how many drafted tokens
 	// are verified. It takes precedence over Drafter.
 	DSpark *model.DSpark
+	// DFlash, when set alongside Speculative, enables DFlash/MTP speculative
+	// decoding conditioned on the target model's final hidden state. It takes
+	// precedence over DSpark and Drafter.
+	DFlash *model.DFlash
 	// ConfidenceThreshold is the minimum confidence for a drafted token to be
 	// verified. Zero uses the default of 0.5.
 	ConfidenceThreshold float32
-	// Speculative enables speculative decoding when Drafter is set. It only
-	// applies to single-row greedy requests on uncompressed models and does not
-	// run the tool-call state machine.
+	// Speculative enables speculative decoding when a drafter is set. It only
+	// applies to single-row greedy requests and does not run the tool-call state
+	// machine. Compressed and MLA targets are supported through cache rollback.
 	Speculative bool
 	// DraftLength is the number of tokens the drafter proposes per round.
 	// Values below 2 use the default of 5.
 	DraftLength int
+	// PrefillChunk bounds the number of prompt tokens processed per prefill
+	// forward. Zero processes the whole prompt at once. It is ignored for CED,
+	// whose encoder must see the full prompt.
+	PrefillChunk int
 }
 
 // prefixCacheStore is the common interface of the single-entry PrefixCache and
@@ -111,7 +137,7 @@ func (engine *Engine) Generate(tokens []int, numSamples, maxTokens int, temperat
 // emitted, forces the closing <|think_end|> token so it cannot run unbounded.
 func (engine *Engine) GenerateWith(tokens []int, numSamples, maxTokens int, temperature float32, topK int, seed uint64, options GenerateOptions) func(yield func([]int, []int) bool) {
 	return func(yield func([]int, []int) bool) {
-		if engine.speculativeEligible(numSamples, temperature) {
+		if options.Constraint == nil && !options.Logprobs && engine.speculativeEligible(numSamples, temperature) {
 			engine.speculativeGenerate(tokens, maxTokens, yield)
 			return
 		}
@@ -125,7 +151,13 @@ func (engine *Engine) GenerateWith(tokens []int, numSamples, maxTokens int, temp
 		// is checked first; a stripped persistent entry triggers bounded replay.
 		var prefillCache *model.KVBuffer
 		matched := 0
-		if !config.CEDEnabled() && swaStore != nil {
+		if !config.CEDEnabled() && engine.BlockPrefix != nil {
+			if cached, hit := engine.BlockPrefix.Lookup(tokens); cached != nil {
+				prefillCache = cached
+				matched = hit
+			}
+		}
+		if prefillCache == nil && !config.CEDEnabled() && swaStore != nil {
 			if cached, hit := swaStore.Lookup(tokens); cached != nil {
 				prefillCache = cached
 				matched = hit
@@ -149,26 +181,48 @@ func (engine *Engine) GenerateWith(tokens []int, numSamples, maxTokens int, temp
 			if config.MLAEnabled() {
 				prefillCache.EnableMLA(config.MLALatent, config.NumKVHead*config.MLARotaryDimension())
 			}
-			if ratio := config.Compression(); ratio > 1 {
-				kvWidth := config.NumKVHead * headDim
-				prefillCache.EnableCompressionLayers(ratio, config.EmbedDim, kvWidth, capacity/ratio+1, compressionAllocMask(config))
-				if config.SparseTopK > 0 {
-					prefillCache.EnableIndexerKeysLayers(indexerKeyWidth(config), indexerAllocMask(config))
-				}
-			}
+			enableCacheCompression(config, prefillCache, capacity)
 		}
+		defer prefillCache.Release()
 		inputTokens := tokens
 		if matched > 0 {
 			inputTokens = tokens[matched:]
 		}
 		inputIDs := tensors.NewInt32sWithData([]int{1, len(inputTokens)}, toI32(inputTokens))
 		var logits *tensors.Tensor
-		if config.CEDEnabled() {
+		switch {
+		case config.CEDEnabled():
 			// The causal encoder-decoder prefill runs the encoder over the full
 			// prompt and replays only the last window tokens through the
 			// decoder; the returned logits cover that replay.
 			logits = engine.Model.PrefillCED(inputIDs, prefillCache)
-		} else {
+		case engine.PrefillChunk > 0 || engine.BlockPrefix != nil:
+			// Chunked prefill keeps peak prefill activation memory bounded for
+			// long prompts. When block prefix sharing is enabled, chunks stop at
+			// 128-token boundaries so a snapshot can be stored there.
+			for start := 0; start < len(inputTokens); {
+				end := len(inputTokens)
+				if engine.PrefillChunk > 0 && start+engine.PrefillChunk < end {
+					end = start + engine.PrefillChunk
+				}
+				if engine.BlockPrefix != nil {
+					position := prefillCache.Position()
+					boundary := ((position / model.KVBlockSize) + 1) * model.KVBlockSize
+					if boundary > position && boundary-position < end-start {
+						end = start + (boundary - position)
+					}
+				}
+				chunk := tensors.NewInt32sWithData([]int{1, end - start}, toI32(inputTokens[start:end]))
+				logits = engine.Model.Forward(chunk, prefillCache)
+				start = end
+				if engine.BlockPrefix != nil {
+					position := prefillCache.Position()
+					if position > 0 && position%model.KVBlockSize == 0 {
+						engine.BlockPrefix.Store(tokens[:position], prefillCache)
+					}
+				}
+			}
+		default:
 			logits = engine.Model.Forward(inputIDs, prefillCache) // [1, T, vocab]
 		}
 		if !config.CEDEnabled() {
@@ -199,13 +253,8 @@ func (engine *Engine) GenerateWith(tokens []int, numSamples, maxTokens int, temp
 		if config.MLAEnabled() {
 			decodeCache.EnableMLA(config.MLALatent, config.NumKVHead*config.MLARotaryDimension())
 		}
-		if ratio := config.Compression(); ratio > 1 {
-			kvWidth := config.NumKVHead * headDim
-			decodeCache.EnableCompressionLayers(ratio, config.EmbedDim, kvWidth, cacheLen/ratio+1, compressionAllocMask(config))
-			if config.SparseTopK > 0 {
-				decodeCache.EnableIndexerKeysLayers(indexerKeyWidth(config), indexerAllocMask(config))
-			}
-		}
+		enableCacheCompression(config, decodeCache, cacheLen)
+		defer decodeCache.Release()
 		model.PrefillFrom(decodeCache, prefillCache)
 
 		// 3) Row states.
@@ -236,6 +285,14 @@ func (engine *Engine) GenerateWith(tokens []int, numSamples, maxTokens int, temp
 		}
 
 		randomGenerator := tensors.NewRNG(seed)
+		var constraints []Constraint
+		if options.Constraint != nil {
+			constraints = make([]Constraint, numSamples)
+			for index := range constraints {
+				constraints[index] = options.Constraint.Clone()
+			}
+		}
+		stopIDs := []int{assistantEnd, bosToken}
 
 		generated := 0
 		for {
@@ -253,7 +310,25 @@ func (engine *Engine) GenerateWith(tokens []int, numSamples, maxTokens int, temp
 				return
 			}
 
-			nextIDs := SampleNextToken(logitsTensor, randomGenerator, temperature, topK) // [numSamples]
+			allowedRows := make([][]bool, 0, numSamples)
+			if constraints != nil {
+				allowedRows = make([][]bool, numSamples)
+				for index := range constraints {
+					allowedRows[index] = ConstraintMaskCached(engine.Tokenizer, constraints[index], vocab, stopIDs)
+				}
+			}
+			nextIDs := SampleNextTokenWithOptions(logitsTensor, randomGenerator, SamplingOptions{
+				Temperature: temperature, TopK: topK, TopP: options.TopP, MinP: options.MinP,
+				AllowedRows: allowedRows,
+			}) // [numSamples]
+			if options.Logprobs && options.OnLogprobs != nil {
+				logprobs := make([]TokenLogprob, numSamples)
+				for index := 0; index < numSamples; index++ {
+					row := logitsTensor.Data[index*vocab : (index+1)*vocab]
+					logprobs[index] = computeTokenLogprob(row, int(nextIDs.Data[index]), temperature, options.TopLogprobs)
+				}
+				options.OnLogprobs(logprobs)
+			}
 
 			tokenColumn := make([]int, numSamples)
 			tokenMask := make([]int, numSamples)
@@ -272,6 +347,9 @@ func (engine *Engine) GenerateWith(tokens []int, numSamples, maxTokens int, temp
 					nextToken = int(nextIDs.Data[index])
 				}
 				tokenColumn[index] = nextToken
+				if constraints != nil && !engine.Tokenizer.IsSpecial(nextToken) {
+					constraints[index].Advance(engine.Tokenizer.DecodeSingleTokenBytes(nextToken))
+				}
 				state.currentTokens = append(state.currentTokens, nextToken)
 				if nextToken == assistantEnd || nextToken == bosToken {
 					state.completed = true
@@ -282,7 +360,7 @@ func (engine *Engine) GenerateWith(tokens []int, numSamples, maxTokens int, temp
 					state.toolCallTokens = nil
 				case nextToken == toolEnd && state.inToolCall:
 					state.inToolCall = false
-					if len(state.toolCallTokens) > 0 {
+					if !options.ExternalTools && len(state.toolCallTokens) > 0 {
 						expression := engine.Tokenizer.Decode(state.toolCallTokens)
 						if result, ok := engine.Tools.Execute(expression); ok {
 							resultTokens := engine.Tokenizer.Encode(result)
@@ -369,6 +447,19 @@ func (engine *Engine) GenerateBatchWith(tokens []int, numSamples, maxTokens int,
 }
 
 // indexerKeyWidth returns the cached indexer key width for a config.
+// enableCacheCompression allocates the per-layer compressed and indexer tiers
+// for a cache sized to capacity tokens.
+func enableCacheCompression(config model.Config, cache *model.KVBuffer, capacity int) {
+	if config.AnyCompression() {
+		kvWidth := config.NumKVHead * config.HeadDim()
+		cache.EnableCompressionLayout(config.LayerRatios(), config.EmbedDim, kvWidth, config.CompressedMaxBlocks(capacity), compressionAllocMask(config))
+		if config.AnySparse() {
+			cache.EnableIndexerKeysLayers(indexerKeyWidth(config), indexerAllocMask(config))
+		}
+	}
+	cache.EnableSWARings(config.RingWindows())
+}
+
 func indexerKeyWidth(config model.Config) int {
 	dim := config.IndexerDim
 	if dim <= 0 {
